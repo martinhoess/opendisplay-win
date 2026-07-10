@@ -1,0 +1,10 @@
+build/
+out/
+*.obj
+*.pdb
+*.ilk
+*.exe
+.vs/
+CMakeUserPresets.json
+__pycache__/
+*.pyc
