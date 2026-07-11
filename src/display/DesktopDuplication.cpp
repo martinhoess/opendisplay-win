@@ -1,7 +1,9 @@
 #include "display/DesktopDuplication.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <thread>
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -11,6 +13,12 @@ using Microsoft::WRL::ComPtr;
 namespace od {
 
 namespace {
+
+// Backoff after a failed capture so a persistently-erroring duplication (or a
+// desktop still mid-reconfigure) can't spin the capture loop at full CPU —
+// AcquireNextFrame only paces us via its timeout on the *success/timeout*
+// path, not on errors.
+constexpr int kRecoveryBackoffMs = 100;
 
 inline uint8_t Clamp8(int v)
 {
@@ -130,31 +138,50 @@ void DesktopDuplication::Close()
     device_.Reset();
 }
 
+bool DesktopDuplication::Reopen()
+{
+    std::wstring name = deviceName_; // Close() keeps it, but copy defensively
+    Close();
+    return Open(name);
+}
+
 bool DesktopDuplication::CaptureFrameNv12(std::vector<uint8_t>& nv12, int timeoutMs)
 {
-    if (!duplication_)
-        return false;
+    // The duplication may have been torn down by an earlier frame (topology
+    // change, access loss). Try to rebuild before giving up — and if it still
+    // can't be rebuilt (desktop mid-reconfigure), back off briefly and drop
+    // this frame rather than dying permanently or busy-looping on Open().
+    if (!duplication_) {
+        if (!Reopen()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(kRecoveryBackoffMs));
+            return false;
+        }
+    }
 
     DXGI_OUTDUPL_FRAME_INFO info{};
     ComPtr<IDXGIResource> resource;
     HRESULT hr = duplication_->AcquireNextFrame(timeoutMs, &info, &resource);
     if (hr == DXGI_ERROR_WAIT_TIMEOUT)
         return false;
-    if (hr == DXGI_ERROR_ACCESS_LOST) {
-        // Common after a lock-screen/power-state change; the duplication
-        // interface is permanently dead once this happens and must be
-        // recreated from scratch (staging texture too, in case format/size
-        // changed while we were locked out).
-        fprintf(stderr, "AcquireNextFrame: access lost, reacquiring duplication\n");
-        std::wstring name = deviceName_;
-        Close();
-        Open(name);
-        return false;
-    }
     if (FAILED(hr)) {
-        fprintf(stderr, "AcquireNextFrame failed: 0x%08lx\n", hr);
+        // The duplication is dead — recreate it. This covers ACCESS_LOST
+        // (0x887A0026, e.g. lock screen / power state) *and* INVALID_CALL
+        // (0x887A0001), which is what AcquireNextFrame returns after the
+        // desktop topology changes, e.g. dragging this monitor to a new
+        // position in Display Settings. Previously only ACCESS_LOST was
+        // handled, so a rearrange left the duplication permanently dead.
+        if (!reportedLoss_) {
+            fprintf(stderr, "AcquireNextFrame lost (0x%08lx), rebuilding duplication\n", hr);
+            reportedLoss_ = true;
+        }
+        Reopen();
+        // Back off whether or not Reopen() succeeded: if it failed the next
+        // call's top handles it, but if it succeeded yet AcquireNextFrame keeps
+        // failing immediately, this is what stops a full-CPU spin.
+        std::this_thread::sleep_for(std::chrono::milliseconds(kRecoveryBackoffMs));
         return false;
     }
+    reportedLoss_ = false;
 
     // The cursor's shape and position arrive via the frame info, independent
     // of whether the desktop image itself changed (a mouse-only move still

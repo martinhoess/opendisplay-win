@@ -42,12 +42,19 @@ private:
     void UpdatePointer(const DXGI_OUTDUPL_FRAME_INFO& info);
     void CompositePointer(uint8_t* bgra, uint32_t stride) const;
 
+    // Tears down and recreates the duplication (and its D3D device) for the
+    // remembered output. Called after the duplication is invalidated by a
+    // desktop topology change / access loss. Returns false if it can't be
+    // rebuilt right now (e.g. the desktop is still mid-reconfigure).
+    bool Reopen();
+
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
     Microsoft::WRL::ComPtr<IDXGIOutputDuplication> duplication_;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> staging_;
 
-    std::wstring deviceName_; // remembered for reacquiring after DXGI_ERROR_ACCESS_LOST
+    std::wstring deviceName_; // remembered so the duplication can be rebuilt after it's lost
+    bool reportedLoss_ = false; // throttles the "lost, rebuilding" log to once per teardown
     uint32_t width_ = 0;
     uint32_t height_ = 0;
 
