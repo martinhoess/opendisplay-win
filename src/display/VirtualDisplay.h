@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -50,6 +51,15 @@ private:
     bool QueryMonitorRect();
     void KeepAliveLoop();
 
+    // Persist the monitor's desktop position ourselves (HKCU): the parsec-vdd
+    // monitor gets a fresh identity/UID on every add, so Windows can't
+    // remember its arrangement across app restarts — it would snap back to a
+    // default every launch. We save the position and reapply it, and poll for
+    // the user dragging it in Display Settings to keep the saved value current.
+    bool LoadSavedPosition(int& x, int& y) const;
+    void SavePosition(int x, int y) const;
+    void PollPosition(POINT& lastKnown);
+
     HANDLE device_ = nullptr;
     int displayIndex_ = -1;
     std::thread keepAliveThread_;
@@ -59,6 +69,7 @@ private:
     uint32_t targetHeight_ = 0;
     uint32_t targetHz_ = 60;
 
+    mutable std::mutex stateMutex_; // guards deviceName_ (written by main, read by keepalive poll)
     RECT monitorRect_{};
     std::wstring deviceName_;
 };

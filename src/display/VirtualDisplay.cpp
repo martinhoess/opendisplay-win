@@ -3,6 +3,7 @@
 #include "parsec-vdd.h"
 
 #include <chrono>
+#include <climits>
 #include <cstdio>
 
 namespace od {
@@ -24,6 +25,37 @@ bool WaitUntil(Predicate pred, int timeoutMs, int pollMs = 150)
         waited += pollMs;
     }
     return pred();
+}
+
+// Looks up the desktop rect of the monitor with the given GDI device name
+// (e.g. L"\\.\DISPLAY3"). Returns false if no such monitor is currently
+// attached. Shared by QueryMonitorRect and the position poll.
+bool GetMonitorRectByName(const std::wstring& name, RECT& out)
+{
+    struct Ctx {
+        const std::wstring* name;
+        RECT rect;
+        bool found;
+    } ctx{&name, {}, false};
+
+    EnumDisplayMonitors(
+        nullptr, nullptr,
+        [](HMONITOR hMon, HDC, LPRECT, LPARAM lp) -> BOOL {
+            auto* ctx = reinterpret_cast<Ctx*>(lp);
+            MONITORINFOEXW info{};
+            info.cbSize = sizeof(info);
+            if (GetMonitorInfoW(hMon, &info) && *ctx->name == info.szDevice) {
+                ctx->rect = info.rcMonitor;
+                ctx->found = true;
+                return FALSE;
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&ctx));
+
+    if (ctx.found)
+        out = ctx.rect;
+    return ctx.found;
 }
 
 } // namespace
@@ -66,8 +98,18 @@ void VirtualDisplay::Close()
 
 void VirtualDisplay::KeepAliveLoop()
 {
+    POINT lastKnownPos{INT_MIN, INT_MIN}; // INT_MIN = "not observed yet"
+    int tick = 0;
+
     while (keepAliveRunning_) {
         parsec_vdd::VddUpdate(device_);
+
+        // ~once a second, notice if the user dragged the monitor and persist it.
+        if (++tick >= 20) {
+            tick = 0;
+            PollPosition(lastKnownPos);
+        }
+
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 }
@@ -145,39 +187,40 @@ bool VirtualDisplay::FindMonitorGeometry()
         return false;
     }
 
-    deviceName_ = adapter.DeviceName;
-    bool attached = (adapter.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0;
+    std::wstring name = adapter.DeviceName;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        deviceName_ = name;
+    }
 
+    // Restore the position the user last left the monitor at (persisted by the
+    // keepalive poll). First run has none, so fall back to the right edge of
+    // the virtual desktop and save that as the initial position.
+    int posX = 0, posY = 0;
+    if (!LoadSavedPosition(posX, posY)) {
+        posX = GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        posY = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        SavePosition(posX, posY);
+    }
+
+    // Apply position + resolution in one shot, every add. The monitor's
+    // identity changes on each add so Windows never has the position right on
+    // its own — we always place it. If it's already correct this is a no-op.
     DEVMODEW mode{};
     mode.dmSize = sizeof(mode);
+    mode.dmFields = DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL | DM_DISPLAYFREQUENCY;
+    mode.dmPosition.x = posX;
+    mode.dmPosition.y = posY;
+    mode.dmPelsWidth = targetWidth_;
+    mode.dmPelsHeight = targetHeight_;
+    mode.dmBitsPerPel = 32;
+    mode.dmDisplayFrequency = targetHz_;
 
-    if (!attached) {
-        int x = GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN);
-        int y = GetSystemMetrics(SM_YVIRTUALSCREEN);
-
-        mode.dmFields = DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL | DM_DISPLAYFREQUENCY;
-        mode.dmPosition.x = x;
-        mode.dmPosition.y = y;
-        mode.dmPelsWidth = targetWidth_;
-        mode.dmPelsHeight = targetHeight_;
-        mode.dmBitsPerPel = 32;
-        mode.dmDisplayFrequency = targetHz_;
-
-        ChangeDisplaySettingsExW(deviceName_.c_str(), &mode, nullptr, CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
-        LONG r = ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
-        if (r != DISP_CHANGE_SUCCESSFUL) {
-            fprintf(stderr, "ChangeDisplaySettingsEx (attach) failed: %ld\n", r);
-            return false;
-        }
-    } else if (EnumDisplaySettingsW(deviceName_.c_str(), ENUM_CURRENT_SETTINGS, &mode)) {
-        if (mode.dmPelsWidth != targetWidth_ || mode.dmPelsHeight != targetHeight_) {
-            mode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
-            mode.dmPelsWidth = targetWidth_;
-            mode.dmPelsHeight = targetHeight_;
-            mode.dmDisplayFrequency = targetHz_;
-            ChangeDisplaySettingsExW(deviceName_.c_str(), &mode, nullptr, CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
-            ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
-        }
+    ChangeDisplaySettingsExW(name.c_str(), &mode, nullptr, CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
+    LONG r = ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
+    if (r != DISP_CHANGE_SUCCESSFUL) {
+        fprintf(stderr, "ChangeDisplaySettingsEx failed: %ld\n", r);
+        return false;
     }
 
     return WaitUntil([&] { return QueryMonitorRect(); }, 3000);
@@ -185,32 +228,70 @@ bool VirtualDisplay::FindMonitorGeometry()
 
 bool VirtualDisplay::QueryMonitorRect()
 {
-    struct Ctx {
-        const std::wstring* name;
-        RECT rect;
-        bool found;
-    } ctx{&deviceName_, {}, false};
+    RECT r{};
+    if (!GetMonitorRectByName(deviceName_, r))
+        return false;
+    monitorRect_ = r;
+    return true;
+}
 
-    EnumDisplayMonitors(
-        nullptr, nullptr,
-        [](HMONITOR hMon, HDC, LPRECT, LPARAM lp) -> BOOL {
-            auto* ctx = reinterpret_cast<Ctx*>(lp);
-            MONITORINFOEXW info{};
-            info.cbSize = sizeof(info);
-            if (GetMonitorInfoW(hMon, &info) && *ctx->name == info.szDevice) {
-                ctx->rect = info.rcMonitor;
-                ctx->found = true;
-                return FALSE;
-            }
-            return TRUE;
-        },
-        reinterpret_cast<LPARAM>(&ctx));
-
-    if (!ctx.found)
+bool VirtualDisplay::LoadSavedPosition(int& x, int& y) const
+{
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\opendisplay-win", 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
         return false;
 
-    monitorRect_ = ctx.rect;
-    return true;
+    auto getDword = [&](const wchar_t* name, int& out) {
+        DWORD value = 0, size = sizeof(value), type = 0;
+        bool ok = RegQueryValueExW(key, name, nullptr, &type, reinterpret_cast<BYTE*>(&value), &size) == ERROR_SUCCESS &&
+                  type == REG_DWORD;
+        if (ok)
+            out = static_cast<int>(value); // round-trips negative coords via the bit pattern
+        return ok;
+    };
+
+    bool ok = getDword(L"monitorX", x) && getDword(L"monitorY", y);
+    RegCloseKey(key);
+    return ok;
+}
+
+void VirtualDisplay::SavePosition(int x, int y) const
+{
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\opendisplay-win", 0, nullptr, REG_OPTION_NON_VOLATILE,
+                        KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS)
+        return;
+
+    DWORD vx = static_cast<DWORD>(x), vy = static_cast<DWORD>(y);
+    RegSetValueExW(key, L"monitorX", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&vx), sizeof(vx));
+    RegSetValueExW(key, L"monitorY", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&vy), sizeof(vy));
+    RegCloseKey(key);
+}
+
+void VirtualDisplay::PollPosition(POINT& lastKnown)
+{
+    std::wstring name;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        name = deviceName_;
+    }
+    if (name.empty())
+        return; // no monitor yet
+
+    RECT r{};
+    if (!GetMonitorRectByName(name, r))
+        return; // monitor not currently attached (e.g. mid-reconfigure)
+
+    if (lastKnown.x == INT_MIN) {
+        lastKnown = {r.left, r.top}; // first observation is the baseline, don't re-save it
+        return;
+    }
+    if (r.left != lastKnown.x || r.top != lastKnown.y) {
+        // The user dragged the monitor in Display Settings — remember it so the
+        // next launch restores this position instead of the default.
+        SavePosition(r.left, r.top);
+        lastKnown = {r.left, r.top};
+    }
 }
 
 } // namespace od
