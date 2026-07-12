@@ -18,6 +18,9 @@ add_executable(opendisplay-win
   src/display/DesktopDuplication.cpp
   src/input/InputInjector.cpp
   src/app/SenderApp.cpp
+  src/app/Config.cpp
+  src/app/TrayApp.cpp
+  src/app/resources.rc
 )
 
 target_include_directories(opendisplay-win PRIVATE
@@ -37,6 +40,8 @@ target_link_libraries(opendisplay-win PRIVATE
   mfuuid
   setupapi
   cfgmgr32
+  shell32
+  gdi32
 )
 
 target_compile_definitions(opendisplay-win PRIVATE
@@ -48,6 +53,12 @@ target_compile_definitions(opendisplay-win PRIVATE
 
 # M2+ needs admin rights: writing the parsec-vdd custom-resolution registry
 # key under HKLM requires elevation (verified: fails silently otherwise).
+#
+# GUI subsystem so the tray app doesn't flash a console window, but keep
+# mainCRTStartup as the entry point so we still have a normal main(argc, argv)
+# (populated from the command line) for the headless CLI mode.
 target_link_options(opendisplay-win PRIVATE
   "/MANIFESTUAC:level='requireAdministrator' uiAccess='false'"
+  "/SUBSYSTEM:WINDOWS"
+  "/ENTRY:mainCRTStartup"
 )

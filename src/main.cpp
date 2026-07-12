@@ -1,8 +1,61 @@
 #include <cstdio>
+#include <cstdlib>
+#include <fcntl.h>
+#include <io.h>
+#include <string>
 
 #include <winsock2.h>
 
+#include <mfapi.h>
+
+#pragma comment(lib, "mfplat.lib")
+
 #include "app/SenderApp.h"
+#include "app/TrayApp.h"
+
+namespace {
+
+// Route diagnostics to %APPDATA%\opendisplay-win\log.txt. Under the GUI
+// subsystem there is no console to print to, and a file gives persistent logs
+// regardless of how the app was launched.
+void RedirectLogToFile()
+{
+    char* appdata = nullptr;
+    size_t len = 0;
+    if (_dupenv_s(&appdata, &len, "APPDATA") != 0 || appdata == nullptr)
+        return;
+    std::string dir = std::string(appdata) + "\\opendisplay-win";
+    free(appdata);
+
+    CreateDirectoryA(dir.c_str(), nullptr); // no-op if it already exists
+    std::string logPath = dir + "\\log.txt";
+
+    // Under the GUI subsystem there is no console, so stdout/stderr have no
+    // valid fd to redirect. Bind them to NUL first to give them real fds, then
+    // dup our log handle over those. (freopen straight to the log would work
+    // too but opens exclusive — this keeps the log tailable while running.)
+    FILE* f = nullptr;
+    freopen_s(&f, "NUL", "w", stdout);
+    freopen_s(&f, "NUL", "w", stderr);
+
+    HANDLE h = CreateFileA(logPath.c_str(), GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return;
+    int fd = _open_osfhandle(reinterpret_cast<intptr_t>(h), _O_WRONLY | _O_TEXT);
+    if (fd == -1) {
+        CloseHandle(h);
+        return;
+    }
+    _dup2(fd, _fileno(stdout));
+    _dup2(fd, _fileno(stderr));
+    _close(fd); // the dup'd copies on stdout/stderr keep the file open
+    setvbuf(stdout, nullptr, _IONBF, 0); // unbuffered so a live stream shows immediately
+    setvbuf(stderr, nullptr, _IONBF, 0);
+}
+
+} // namespace
 
 int main(int argc, char** argv)
 {
@@ -14,29 +67,17 @@ int main(int argc, char** argv)
     // stable position persistence and correct input mapping on scaled displays.
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-    // stdout is fully buffered (not line-buffered) once redirected to a file
-    // or pipe, so status printf()s otherwise only show up after ~4KB or on
-    // exit — useless for watching a long-running stream live.
-    setvbuf(stdout, nullptr, _IONBF, 0);
+    // Keep COM (MTA) and Media Foundation alive for the whole process. The
+    // per-connection H264Encoder does its own CoInitialize/MFStartup on its
+    // worker thread and the matching CoUninitialize/MFShutdown on Stop(); with
+    // this process-wide reference those only *decrement* the refcounts instead
+    // of tearing the subsystems down while DXGI/MF background threads are still
+    // attached — which crashed the app on Disconnect. Intentionally never
+    // released (process-lifetime).
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
 
-    if (argc < 2) {
-        fprintf(stderr, "usage: %s <ipad-ip>\n", argv[0]);
-        return 1;
-    }
-
-    // One connection per iPad: refuse a second instance targeting the same IP
-    // (they'd fight over the iPad's single listening socket and over the
-    // virtual display, producing a reconnect storm). The mutex name embeds the
-    // IP, so *different* iPads get different names and can run simultaneously —
-    // deliberately not a global single-instance lock.
-    std::wstring lockName = L"Global\\opendisplay-win-";
-    for (const char* p = argv[1]; *p; ++p)
-        lockName += (*p == '.' || *p == ':') ? L'_' : static_cast<wchar_t>(*p);
-    HANDLE instanceLock = CreateMutexW(nullptr, FALSE, lockName.c_str());
-    if (instanceLock != nullptr && GetLastError() == ERROR_ALREADY_EXISTS) {
-        fprintf(stderr, "another opendisplay-win is already connected to %s\n", argv[1]);
-        return 1;
-    }
+    RedirectLogToFile();
 
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
@@ -44,9 +85,18 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    od::SenderApp app(argv[1]);
-    app.Run(); // blocks forever, reconnecting on drop
+    int rc = 0;
+    if (argc >= 2) {
+        // Headless CLI mode: stream to the given IP until killed (handy for
+        // testing/scripting; logging goes to the inherited/redirected stdout).
+        // The per-iPad connection guard lives in SenderApp.
+        od::SenderApp app;
+        app.RunBlocking(argv[1], 9000);
+    } else {
+        // No IP argument: run the tray GUI (settings, connect/disconnect).
+        rc = od::RunTray(GetModuleHandleW(nullptr));
+    }
 
     WSACleanup();
-    return 0;
+    return rc;
 }

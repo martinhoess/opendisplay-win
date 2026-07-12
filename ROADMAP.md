@@ -111,17 +111,11 @@ component-mapping, some ours:
 
 Found while building/testing the PoC; none block current use, but worth tracking.
 
-- **Input mapping is stale after a *live* monitor move.** Dragging the virtual
-  monitor in Display Settings mid-session updates the saved position (the
-  keepalive poll) but not the input-mapping rect, so touches land at the old
-  spot until the next reconnect rebuilds the pipeline. Fix: have the poll push
-  the new rect through to the `InputInjector`.
-- **No per-iPad connection guard.** Two instances pointed at the same iPad fight
-  over its single listening socket (a reconnect storm) and over the virtual
-  display. Add a lock keyed by target IP (e.g. a named mutex per IP) so only one
-  connection exists per iPad — while still allowing *different* iPads to be
-  driven at once (see "Multiple iPads" above). Deliberately **not** a global
-  single-instance lock.
+- **Disconnect/Exit can block briefly on an unreachable iPad.** `Stop()` joins
+  the worker thread, but a blocking `connect()` isn't interruptible — if the
+  configured iPad is powered off / off the network (SYN timeout ~20s), the tray
+  UI freezes until the connect fails. Fix: a non-blocking connect with a short
+  timeout (select/WSAPoll) so Stop is always prompt.
 - **Ghost monitor devices accumulate.** Each `VddAddDisplay` leaves a
   non-present `DISPLAY\PSCCDD0\…&UIDnnn` behind (the UID changes every add).
   Cosmetic; a startup cleanup is possible but risky, and the own-driver work

@@ -19,7 +19,6 @@ namespace od {
 
 namespace {
 
-constexpr uint16_t kPort = 9000;
 constexpr uint32_t kFps = 60;
 constexpr uint32_t kBitrateBps = 30'000'000;
 constexpr int kSendTimeoutMs = 500;      // backpressure: how long to wait for the socket before dropping a frame
@@ -35,11 +34,80 @@ uint32_t EvenClamp(int32_t v, uint32_t fallback)
 
 } // namespace
 
-void SenderApp::Run()
+SenderApp::~SenderApp()
 {
+    Stop();
+}
+
+void SenderApp::Start(std::string ip, uint16_t port)
+{
+    if (running_.exchange(true))
+        return; // already running
+
+    stopRequested_ = false;
+    worker_ = std::thread([this, ip = std::move(ip), port] { RunLoop(ip, port); });
+}
+
+void SenderApp::Stop()
+{
+    stopRequested_ = true;
+
+    // Unblock the worker if it's parked in Connect's socket / a blocking
+    // ReadFrame: closing the socket makes those calls fail promptly.
+    {
+        std::lock_guard<std::mutex> lock(connMutex_);
+        if (activeConn_ != nullptr)
+            activeConn_->Close();
+    }
+
+    if (worker_.joinable())
+        worker_.join();
+
+    running_ = false;
+    stopRequested_ = false;
+    state_ = State::Idle;
+}
+
+void SenderApp::RunBlocking(std::string ip, uint16_t port)
+{
+    running_ = true;
+    RunLoop(std::move(ip), port);
+    running_ = false;
+}
+
+void SenderApp::InterruptibleSleep(int ms)
+{
+    // Poll the stop flag in short slices so Stop() doesn't wait a full delay.
+    constexpr int slice = 100;
+    for (int waited = 0; waited < ms && !stopRequested_; waited += slice)
+        std::this_thread::sleep_for(std::chrono::milliseconds(slice));
+}
+
+void SenderApp::RunLoop(std::string ip, uint16_t port)
+{
+    // One connection per iPad, machine-wide: a per-IP named mutex. A second
+    // instance (CLI or tray) aimed at the same iPad backs off instead of
+    // fighting over its single listening socket and the virtual display.
+    // Different IPs get different names, so multiple iPads run fine.
+    std::wstring lockName = L"Global\\opendisplay-win-";
+    for (char c : ip)
+        lockName += (c == '.' || c == ':') ? L'_' : static_cast<wchar_t>(c);
+    HANDLE ipLock = CreateMutexW(nullptr, FALSE, lockName.c_str());
+    if (ipLock != nullptr && GetLastError() == ERROR_ALREADY_EXISTS) {
+        fprintf(stderr, "another opendisplay-win is already connected to %s\n", ip.c_str());
+        CloseHandle(ipLock);
+        state_ = State::Idle;
+        return;
+    }
+
+    // Declaration order matters for teardown: H264Encoder's ctor initializes
+    // COM (MTA) + Media Foundation for this thread and its dtor uninitializes
+    // them. Locals are destroyed in reverse, so the encoder is declared FIRST
+    // (destroyed LAST) — otherwise DesktopDuplication's D3D11/DXGI COM objects
+    // would be released after CoUninitialize(), an access violation on Stop().
+    H264Encoder encoder;
     VirtualDisplay vdisp;
     DesktopDuplication dup;
-    H264Encoder encoder;
     InputInjector input;
     std::mutex pipelineMutex;
 
@@ -67,19 +135,38 @@ void SenderApp::Run()
         return true;
     };
 
-    while (true) {
-        printf("connecting to %s:%u ...\n", ip_.c_str(), kPort);
-        auto conn = Connection::Connect(ip_, kPort);
+    // RAII: publish the current connection so Stop() can close it, and clear it
+    // before the connection is destroyed (dtors run in reverse declaration
+    // order, so declare this *after* the connection it points at).
+    struct ActiveConn {
+        SenderApp* self;
+        ActiveConn(SenderApp* s, Connection* c) : self(s)
+        {
+            std::lock_guard<std::mutex> lock(s->connMutex_);
+            s->activeConn_ = c;
+        }
+        ~ActiveConn()
+        {
+            std::lock_guard<std::mutex> lock(self->connMutex_);
+            self->activeConn_ = nullptr;
+        }
+    };
+
+    while (!stopRequested_) {
+        state_ = State::Connecting;
+        printf("connecting to %s:%u ...\n", ip.c_str(), port);
+        auto conn = Connection::Connect(ip, port);
         if (!conn) {
             fprintf(stderr, "connect failed, retrying in %dms\n", kReconnectDelayMs);
-            std::this_thread::sleep_for(std::chrono::milliseconds(kReconnectDelayMs));
+            InterruptibleSleep(kReconnectDelayMs);
             continue;
         }
+        ActiveConn activeConn(this, &*conn);
         printf("connected, waiting for hello...\n");
 
         HelloMsg hello;
         bool gotHello = false;
-        while (!gotHello) {
+        while (!gotHello && !stopRequested_) {
             auto frame = conn->ReadFrame();
             if (!frame)
                 break;
@@ -91,10 +178,8 @@ void SenderApp::Run()
                 gotHello = true;
             }
         }
-        if (!gotHello) {
-            fprintf(stderr, "disconnected before hello, reconnecting\n");
+        if (!gotHello)
             continue;
-        }
 
         uint32_t width = EvenClamp(hello.pixelsWide, 1920);
         uint32_t height = EvenClamp(hello.pixelsHigh, 1080);
@@ -107,14 +192,18 @@ void SenderApp::Run()
         }
         if (!pipelineOk) {
             conn->Close();
-            std::this_thread::sleep_for(std::chrono::milliseconds(kReconnectDelayMs));
+            InterruptibleSleep(kReconnectDelayMs);
             continue;
         }
+
+        width_ = width;
+        height_ = height;
+        state_ = State::Streaming;
 
         std::atomic<bool> running{true};
 
         std::thread reader([&] {
-            while (running) {
+            while (running && !stopRequested_) {
                 auto frame = conn->ReadFrame();
                 if (!frame) {
                     running = false;
@@ -139,7 +228,10 @@ void SenderApp::Run()
                         printf("hello again: %dx%d -> rebuilding pipeline at %ux%u\n", msg->hello.pixelsWide,
                                msg->hello.pixelsHigh, w, h);
                         std::lock_guard<std::mutex> lock(pipelineMutex);
-                        if (!buildPipeline(w, h)) {
+                        if (buildPipeline(w, h)) {
+                            width_ = w;
+                            height_ = h;
+                        } else {
                             fprintf(stderr, "pipeline rebuild failed, disconnecting\n");
                             running = false;
                         }
@@ -174,7 +266,7 @@ void SenderApp::Run()
         auto lastSend = std::chrono::steady_clock::now();
         auto lastChange = std::chrono::steady_clock::now() - std::chrono::milliseconds(kActiveTailMs);
 
-        while (running) {
+        while (running && !stopRequested_) {
             std::vector<EncodedFrame> encoded;
             {
                 // Only capture+encode need the pipeline lock (they touch dup
@@ -243,8 +335,14 @@ void SenderApp::Run()
 
         conn->Close();
         reader.join();
-        printf("disconnected, reconnecting\n");
+        width_ = 0;
+        height_ = 0;
+        printf("disconnected%s\n", stopRequested_ ? "" : ", reconnecting");
     }
+
+    if (ipLock != nullptr)
+        CloseHandle(ipLock);
+    state_ = State::Idle;
 }
 
 } // namespace od

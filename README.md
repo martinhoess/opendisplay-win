@@ -9,7 +9,7 @@ protocol, so the iOS app needs no changes.
 > **Status: proof-of-concept / prototype.** It works end to end — real desktop
 > on the iPad, touch and scroll driving the mouse, live cursor — but it is a
 > single-purpose spike, not a polished product: WiFi only, one iPad, manual IP
-> entry, hardcoded settings, minimal UI (a console window). Expect rough edges.
+> entry, hardcoded stream settings, a minimal tray UI. Expect rough edges.
 
 ## How it works
 
@@ -67,12 +67,24 @@ cmake --build build --config Release
 
 ## Run
 
+Launched **without arguments** it runs as a **tray app**: a notification-area
+icon whose status dot is green when connected, red when configured but not, grey
+when no iPad is set. Right-click for Connect/Disconnect/Settings/Exit; Settings
+holds the iPad IP, port, and auto-connect. Config is saved to
+`%APPDATA%\opendisplay-win\config.json`; a log goes to `log.txt` next to it.
+
+```
+build\Release\opendisplay-win.exe
+```
+
+Launched **with an IP** it runs **headless** (no UI), handy for testing/scripting:
+
 ```
 build\Release\opendisplay-win.exe <ipad-ip>
 ```
 
-The iPad receiver app must already be running (listening on port 9000). The
-sender streams until you close it, reconnecting automatically on drops.
+Either way the iPad receiver app must already be running (listening on port
+9000); the sender reconnects automatically on drops.
 
 ## Testing without an iPad
 
