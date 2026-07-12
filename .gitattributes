@@ -1,0 +1,10 @@
+# Normalize line endings to LF in the repo and on checkout (MSVC is fine with
+# LF), so Windows checkouts don't churn CRLF and warn on every commit.
+* text=auto eol=lf
+
+# Binary assets — never touch.
+*.png binary
+*.jpg binary
+*.ico binary
+*.h264 binary
+*.mp4 binary

@@ -24,7 +24,9 @@ namespace od {
 namespace {
 
 // Best-effort ICodecAPI setter — hardware MFTs don't all support every knob,
-// and that's fine (spec only requires the *behavior*, not every switch).
+// and that's fine (we only require the resulting *behavior*, not every switch).
+// Failures are expected and intentionally silent: e.g. NVENC rejects setting
+// the B-picture count to 0 (E_INVALIDARG) yet emits no B-frames anyway.
 void TrySetUInt32(ICodecAPI* api, const GUID& key, ULONG value)
 {
     if (!api) return;
@@ -32,9 +34,7 @@ void TrySetUInt32(ICodecAPI* api, const GUID& key, ULONG value)
     VariantInit(&v);
     v.vt = VT_UI4;
     v.ulVal = value;
-    HRESULT hr = api->SetValue(&key, &v);
-    if (FAILED(hr))
-        fprintf(stderr, "ICodecAPI::SetValue(UI4=%lu) failed: 0x%08lx\n", value, hr);
+    api->SetValue(&key, &v);
 }
 
 void TrySetBool(ICodecAPI* api, const GUID& key, bool value)
@@ -44,9 +44,7 @@ void TrySetBool(ICodecAPI* api, const GUID& key, bool value)
     VariantInit(&v);
     v.vt = VT_BOOL;
     v.boolVal = value ? VARIANT_TRUE : VARIANT_FALSE;
-    HRESULT hr = api->SetValue(&key, &v);
-    if (FAILED(hr))
-        fprintf(stderr, "ICodecAPI::SetValue(BOOL=%d) failed: 0x%08lx\n", value, hr);
+    api->SetValue(&key, &v);
 }
 
 } // namespace

@@ -24,6 +24,20 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    // One connection per iPad: refuse a second instance targeting the same IP
+    // (they'd fight over the iPad's single listening socket and over the
+    // virtual display, producing a reconnect storm). The mutex name embeds the
+    // IP, so *different* iPads get different names and can run simultaneously —
+    // deliberately not a global single-instance lock.
+    std::wstring lockName = L"Global\\opendisplay-win-";
+    for (const char* p = argv[1]; *p; ++p)
+        lockName += (*p == '.' || *p == ':') ? L'_' : static_cast<wchar_t>(*p);
+    HANDLE instanceLock = CreateMutexW(nullptr, FALSE, lockName.c_str());
+    if (instanceLock != nullptr && GetLastError() == ERROR_ALREADY_EXISTS) {
+        fprintf(stderr, "another opendisplay-win is already connected to %s\n", argv[1]);
+        return 1;
+    }
+
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
         fprintf(stderr, "WSAStartup failed\n");
