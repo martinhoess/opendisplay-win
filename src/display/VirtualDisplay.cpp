@@ -58,6 +58,50 @@ bool GetMonitorRectByName(const std::wstring& name, RECT& out)
     return ctx.found;
 }
 
+// Removes leftover *non-present* parsec virtual-monitor devices and returns how
+// many were removed. Each VddAddDisplay mints a monitor with a fresh UID, and
+// when a previous run's process died the monitor was unplugged but its devnode
+// lingers as a phantom in Device Manager. We only touch monitors whose
+// instance id carries the parsec display id AND that are not currently present
+// — so the live monitor (present) and every physical monitor are never
+// affected. Best-effort. Deliberately NOT run automatically (device removal is
+// too invasive for the runtime path); exposed as an explicit one-off instead.
+int RemoveGhostMonitors()
+{
+    int removed = 0;
+    // Monitor device class {4d36e96e-e325-11ce-bfc1-08002be10318}.
+    static const GUID kMonitorClass = {
+        0x4d36e96e, 0xe325, 0x11ce, {0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18}};
+
+    // No DIGCF_PRESENT: include phantom (non-present) devices too.
+    HDEVINFO devInfo = SetupDiGetClassDevsW(&kMonitorClass, nullptr, nullptr, 0);
+    if (devInfo == INVALID_HANDLE_VALUE)
+        return removed;
+
+    SP_DEVINFO_DATA did{};
+    did.cbSize = sizeof(did);
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(devInfo, i, &did); ++i) {
+        wchar_t instanceId[256];
+        if (!SetupDiGetDeviceInstanceIdW(devInfo, &did, instanceId, 256, nullptr))
+            continue;
+
+        // Only the parsec virtual monitor (VDD_DISPLAY_ID = "PSCCDD0").
+        if (wcsstr(instanceId, L"PSCCDD0") == nullptr)
+            continue;
+
+        // Present devnode => it's the live monitor; never remove it.
+        ULONG status = 0, problem = 0;
+        if (CM_Get_DevNode_Status(&status, &problem, did.DevInst, 0) == CR_SUCCESS)
+            continue;
+
+        if (SetupDiRemoveDevice(devInfo, &did)) // phantom -> drop it (best-effort)
+            ++removed;
+    }
+
+    SetupDiDestroyDeviceInfoList(devInfo);
+    return removed;
+}
+
 } // namespace
 
 VirtualDisplay::VirtualDisplay() = default;
@@ -65,6 +109,11 @@ VirtualDisplay::VirtualDisplay() = default;
 VirtualDisplay::~VirtualDisplay()
 {
     Close();
+}
+
+int VirtualDisplay::CleanupGhostMonitors()
+{
+    return RemoveGhostMonitors();
 }
 
 bool VirtualDisplay::Open()

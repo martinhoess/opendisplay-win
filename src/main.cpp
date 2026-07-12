@@ -12,6 +12,7 @@
 
 #include "app/SenderApp.h"
 #include "app/TrayApp.h"
+#include "display/VirtualDisplay.h"
 
 namespace {
 
@@ -86,7 +87,11 @@ int main(int argc, char** argv)
     }
 
     int rc = 0;
-    if (argc >= 2) {
+    if (argc >= 2 && std::string(argv[1]) == "--cleanup-monitors") {
+        // Explicit one-off: drop phantom virtual monitors from earlier runs.
+        int n = od::VirtualDisplay::CleanupGhostMonitors();
+        printf("removed %d leftover virtual monitor(s)\n", n);
+    } else if (argc >= 2) {
         // Headless CLI mode: stream to the given IP until killed (handy for
         // testing/scripting; logging goes to the inherited/redirected stdout).
         // The per-iPad connection guard lives in SenderApp.

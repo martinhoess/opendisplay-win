@@ -47,6 +47,12 @@ public:
 
     bool IsOpen() const { return device_ != nullptr; }
 
+    // One-off maintenance: remove phantom (non-present) parsec virtual monitors
+    // left behind by earlier runs, returning the count. Explicitly NOT called
+    // automatically — device removal is too invasive for the normal path (see
+    // the ROADMAP). Needs admin.
+    static int CleanupGhostMonitors();
+
 private:
     bool WriteCustomResolutionRegistry(uint32_t width, uint32_t height, uint32_t hz);
     bool FindMonitorGeometry();

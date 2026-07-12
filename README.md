@@ -86,6 +86,13 @@ build\Release\opendisplay-win.exe <ipad-ip>
 Either way the iPad receiver app must already be running (listening on port
 9000); the sender reconnects automatically on drops.
 
+`--cleanup-monitors` is a one-off that removes phantom virtual-monitor devices
+left in Device Manager by earlier runs (see the ROADMAP for why they pile up):
+
+```
+build\Release\opendisplay-win.exe --cleanup-monitors
+```
+
 ## Testing without an iPad
 
 `tools/mock_receiver.py` (Python 3, stdlib only) stands in for the iPad:

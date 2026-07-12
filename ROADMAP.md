@@ -109,29 +109,21 @@ component-mapping, some ours:
 
 ## Known issues & smaller open items
 
-Found while building/testing the PoC; none block current use, but worth tracking.
+Most items found during the PoC are now addressed: per-iPad connection guard,
+live-move input tracking, a bounded (~3 s) connect timeout so Disconnect and
+reconnect stay snappy, silenced encoder log noise, a clean tray shutdown, and
+`.gitattributes`. What's left:
 
-- **Disconnect/Exit can block briefly on an unreachable iPad.** `Stop()` joins
-  the worker thread, but a blocking `connect()` isn't interruptible — if the
-  configured iPad is powered off / off the network (SYN timeout ~20s), the tray
-  UI freezes until the connect fails. Fix: a non-blocking connect with a short
-  timeout (select/WSAPoll) so Stop is always prompt.
-- **Ghost monitor devices accumulate.** Each `VddAddDisplay` leaves a
-  non-present `DISPLAY\PSCCDD0\…&UIDnnn` behind (the UID changes every add).
-  Cosmetic; a startup cleanup is possible but risky, and the own-driver work
-  (stable identity, §1) avoids it entirely.
-- **Encoder log noise.** `ICodecAPI::SetValue` rejects setting the B-picture
-  count to 0 on NVENC (`0x80070057`) and we print it every launch — harmless
-  (NVENC emits no B-frames anyway); just suppress it.
-- **No graceful shutdown.** The virtual monitor is removed via the parsec-vdd
-  keepalive timeout when the process dies, not by a clean teardown. Works, but a
-  proper shutdown path would be tidier.
+- **Phantom virtual monitors accumulate ~1 per run.** parsec-vdd mints a fresh
+  monitor UID on every add and, when the process dies, unplugs it but leaves the
+  devnode behind. `opendisplay-win.exe --cleanup-monitors` removes the leftovers
+  on demand. Deliberately **not** run automatically — device removal is too
+  invasive for the runtime path — and the own driver (§1, stable identity)
+  removes the root cause entirely (it wouldn't churn UIDs).
 - **Keyframe cadence spikes under motion.** Heavy on-screen change emits far
   more IDR frames than the 2 s GOP implies (active-tail re-encode + NVENC
   scene-change I-frames) — bandwidth only, not correctness; folds into the
   adaptive-bitrate item above.
-- **Missing `.gitattributes`.** Hence the LF↔CRLF warnings on every commit; add
-  one to normalize line endings.
 
 ## Suggested order
 

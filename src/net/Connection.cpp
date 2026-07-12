@@ -6,6 +6,40 @@
 
 namespace od {
 
+namespace {
+
+// Bounds a single connect attempt so an unreachable iPad (SYN black-hole ~20s)
+// fails fast — keeps reconnect snappy and Stop()/Disconnect from hanging.
+constexpr int kConnectTimeoutMs = 3000;
+
+bool ConnectWithTimeout(SOCKET s, const sockaddr* addr, int addrlen, int timeoutMs)
+{
+    u_long nonBlocking = 1;
+    ioctlsocket(s, FIONBIO, &nonBlocking);
+
+    bool ok = false;
+    int r = ::connect(s, addr, addrlen);
+    if (r == 0) {
+        ok = true;
+    } else if (WSAGetLastError() == WSAEWOULDBLOCK) {
+        WSAPOLLFD pfd{};
+        pfd.fd = s;
+        pfd.events = POLLWRNORM;
+        if (WSAPoll(&pfd, 1, timeoutMs) > 0 && (pfd.revents & POLLWRNORM) != 0) {
+            int soErr = 0;
+            int len = sizeof(soErr);
+            if (getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soErr), &len) == 0 && soErr == 0)
+                ok = true;
+        }
+    }
+
+    u_long blocking = 0;
+    ioctlsocket(s, FIONBIO, &blocking); // rest of the code uses blocking recv/send
+    return ok;
+}
+
+} // namespace
+
 Connection::~Connection()
 {
     Close();
@@ -43,7 +77,7 @@ std::optional<Connection> Connection::Connect(const std::string& ip, uint16_t po
         if (s == INVALID_SOCKET)
             continue;
 
-        if (::connect(s, p->ai_addr, static_cast<int>(p->ai_addrlen)) == 0)
+        if (ConnectWithTimeout(s, p->ai_addr, static_cast<int>(p->ai_addrlen), kConnectTimeoutMs))
             break;
 
         closesocket(s);
