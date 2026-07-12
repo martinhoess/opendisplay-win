@@ -154,10 +154,14 @@ void SenderApp::Run()
                         // reader thread (its initial SetMonitorRect happens on
                         // the main thread before this thread starts, and
                         // rotation rebuilds run on this same thread), so no
-                        // lock is needed.
+                        // lock is needed. Refresh the mapping rect first
+                        // (thread-safe read) so a live monitor drag is followed
+                        // immediately instead of only after the next reconnect.
+                        input.SetMonitorRect(vdisp.MonitorRect());
                         input.HandleTouch(msg->touch);
                         break;
                     case ControlType::Scroll:
+                        input.SetMonitorRect(vdisp.MonitorRect());
                         input.HandleScroll(msg->scroll);
                         break;
                     default:

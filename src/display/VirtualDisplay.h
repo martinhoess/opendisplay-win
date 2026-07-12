@@ -37,7 +37,9 @@ public:
 
     // Rect of the virtual monitor within the Windows virtual desktop
     // (SM_XVIRTUALSCREEN-relative), valid after a successful EnsureResolution().
-    RECT MonitorRect() const { return monitorRect_; }
+    // Thread-safe: the keepalive poll updates it when the user drags the
+    // monitor, so callers (e.g. input mapping) can pick up live moves.
+    RECT MonitorRect() const;
 
     // GDI device name (e.g. L"\\.\DISPLAY3") of the virtual monitor, needed
     // by DesktopDuplication to pick the matching IDXGIOutput.

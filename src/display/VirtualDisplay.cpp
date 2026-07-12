@@ -226,11 +226,18 @@ bool VirtualDisplay::FindMonitorGeometry()
     return WaitUntil([&] { return QueryMonitorRect(); }, 3000);
 }
 
+RECT VirtualDisplay::MonitorRect() const
+{
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    return monitorRect_;
+}
+
 bool VirtualDisplay::QueryMonitorRect()
 {
     RECT r{};
     if (!GetMonitorRectByName(deviceName_, r))
         return false;
+    std::lock_guard<std::mutex> lock(stateMutex_);
     monitorRect_ = r;
     return true;
 }
@@ -288,8 +295,13 @@ void VirtualDisplay::PollPosition(POINT& lastKnown)
     }
     if (r.left != lastKnown.x || r.top != lastKnown.y) {
         // The user dragged the monitor in Display Settings — remember it so the
-        // next launch restores this position instead of the default.
+        // next launch restores this position, and update the live rect so
+        // input mapping follows the move without waiting for a reconnect.
         SavePosition(r.left, r.top);
+        {
+            std::lock_guard<std::mutex> lock(stateMutex_);
+            monitorRect_ = r;
+        }
         lastKnown = {r.left, r.top};
     }
 }
