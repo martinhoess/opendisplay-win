@@ -33,6 +33,11 @@ out-of-band, `nefconw` + registry dance). Replace it with a driver we own:
 - Removes the Parsec runtime dependency *and* the external install step. The
   sender talks to our own adapter (own GUID); resolution is already set through
   the Win32 display APIs.
+- **Stable monitor identity, for free.** parsec-vdd hands the monitor a fresh
+  UID on every add (`DISPLAY\PSCCDD0\…&UID256`, `…&UID257`, …), so Windows can't
+  remember its position and we persist/reapply it ourselves in HKCU. Our own
+  driver can emit a fixed EDID/serial → Windows remembers the arrangement
+  natively, retiring that workaround (and the ghost-device buildup below).
 - Effort: **M** (driver code) + external (signing, see above).
 
 ## 2. Background / service model
@@ -83,6 +88,11 @@ component-mapping, some ours:
 - **USB transport** — the Apple Mobile Device Service *is* usbmuxd on Windows
   (ships with iTunes / Apple Devices) + libimobiledevice → TCP-over-USB. Lower
   latency, no WiFi, no IP entry.
+- **Multiple iPads at once** — each iPad as its own virtual monitor + connection
+  + capture/encode pipeline (today one running instance drives one iPad). Hard
+  rule: **exactly one connection per iPad/IP** — a second connection to the same
+  device must be refused (see the connection guard under Known issues), while
+  *different* iPads may be driven simultaneously.
 - **⚠️ Security** — the link is currently **unencrypted and unauthenticated**:
   anyone on the LAN can connect, see the screen, **and inject mouse input**
   (i.e. remote-control the PC). A real blocker for public distribution — add
@@ -96,6 +106,38 @@ component-mapping, some ours:
 - **Smaller items** — bitrate/fps/resolution as GUI settings + adaptive bitrate;
   GPU device-lost / display-sleep / multi-GPU robustness; auto-update;
   Apple Pencil pressure (currently mouse-only).
+
+## Known issues & smaller open items
+
+Found while building/testing the PoC; none block current use, but worth tracking.
+
+- **Input mapping is stale after a *live* monitor move.** Dragging the virtual
+  monitor in Display Settings mid-session updates the saved position (the
+  keepalive poll) but not the input-mapping rect, so touches land at the old
+  spot until the next reconnect rebuilds the pipeline. Fix: have the poll push
+  the new rect through to the `InputInjector`.
+- **No per-iPad connection guard.** Two instances pointed at the same iPad fight
+  over its single listening socket (a reconnect storm) and over the virtual
+  display. Add a lock keyed by target IP (e.g. a named mutex per IP) so only one
+  connection exists per iPad — while still allowing *different* iPads to be
+  driven at once (see "Multiple iPads" above). Deliberately **not** a global
+  single-instance lock.
+- **Ghost monitor devices accumulate.** Each `VddAddDisplay` leaves a
+  non-present `DISPLAY\PSCCDD0\…&UIDnnn` behind (the UID changes every add).
+  Cosmetic; a startup cleanup is possible but risky, and the own-driver work
+  (stable identity, §1) avoids it entirely.
+- **Encoder log noise.** `ICodecAPI::SetValue` rejects setting the B-picture
+  count to 0 on NVENC (`0x80070057`) and we print it every launch — harmless
+  (NVENC emits no B-frames anyway); just suppress it.
+- **No graceful shutdown.** The virtual monitor is removed via the parsec-vdd
+  keepalive timeout when the process dies, not by a clean teardown. Works, but a
+  proper shutdown path would be tidier.
+- **Keyframe cadence spikes under motion.** Heavy on-screen change emits far
+  more IDR frames than the 2 s GOP implies (active-tail re-encode + NVENC
+  scene-change I-frames) — bandwidth only, not correctness; folds into the
+  adaptive-bitrate item above.
+- **Missing `.gitattributes`.** Hence the LF↔CRLF warnings on every commit; add
+  one to normalize line endings.
 
 ## Suggested order
 
