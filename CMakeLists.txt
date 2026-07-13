@@ -51,14 +51,17 @@ target_compile_definitions(opendisplay-win PRIVATE
   NOMINMAX
 )
 
-# M2+ needs admin rights: writing the parsec-vdd custom-resolution registry
-# key under HKLM requires elevation (verified: fails silently otherwise).
+# asInvoker (not requireAdministrator): the app runs un-elevated. The only
+# operation that needs admin is registering a new iPad resolution as a
+# parsec-vdd custom mode (one HKLM write); that path self-elevates a one-off
+# (`--register-resolution`). Running the whole app elevated is optional (tray
+# menu) — only needed to inject touch into elevated windows.
 #
 # GUI subsystem so the tray app doesn't flash a console window, but keep
 # mainCRTStartup as the entry point so we still have a normal main(argc, argv)
 # (populated from the command line) for the headless CLI mode.
 target_link_options(opendisplay-win PRIVATE
-  "/MANIFESTUAC:level='requireAdministrator' uiAccess='false'"
+  "/MANIFESTUAC:level='asInvoker' uiAccess='false'"
   "/SUBSYSTEM:WINDOWS"
   "/ENTRY:mainCRTStartup"
 )

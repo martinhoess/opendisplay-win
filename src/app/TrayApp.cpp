@@ -22,6 +22,7 @@ enum : UINT {
     IDM_CONNECT = 40001,
     IDM_DISCONNECT,
     IDM_SETTINGS,
+    IDM_RUNASADMIN,
     IDM_EXIT,
 };
 
@@ -142,6 +143,52 @@ std::string Narrow(const std::wstring& w)
     return s;
 }
 
+bool IsElevated()
+{
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+        return false;
+    TOKEN_ELEVATION el{};
+    DWORD size = sizeof(el);
+    bool ok = GetTokenInformation(token, TokenElevation, &el, sizeof(el), &size) != 0;
+    CloseHandle(token);
+    return ok && el.TokenIsElevated;
+}
+
+const wchar_t* const kRunKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+const wchar_t* const kRunValue = L"opendisplay-win";
+
+// Autostart via the per-user Run key (no admin needed, and the app runs
+// un-elevated). Not a scheduled task — the app doesn't require elevation.
+bool IsAutostartEnabled()
+{
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+        return false;
+    bool exists = RegQueryValueExW(key, kRunValue, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS;
+    RegCloseKey(key);
+    return exists;
+}
+
+void SetAutostart(bool enable)
+{
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kRunKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) !=
+        ERROR_SUCCESS)
+        return;
+    if (enable) {
+        wchar_t exe[MAX_PATH];
+        if (GetModuleFileNameW(nullptr, exe, MAX_PATH) != 0) {
+            std::wstring val = L"\"" + std::wstring(exe) + L"\""; // no args -> tray mode
+            RegSetValueExW(key, kRunValue, 0, REG_SZ, reinterpret_cast<const BYTE*>(val.c_str()),
+                           static_cast<DWORD>((val.size() + 1) * sizeof(wchar_t)));
+        }
+    } else {
+        RegDeleteValueW(key, kRunValue);
+    }
+    RegCloseKey(key);
+}
+
 void UpdateStatus(TrayContext* ctx)
 {
     std::wstring ip = Widen(ctx->cfg.ip);
@@ -182,6 +229,7 @@ INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lPara
             SetDlgItemTextW(dlg, IDC_IP, Widen(cfg->ip).c_str());
             SetDlgItemInt(dlg, IDC_PORT, cfg->port, FALSE);
             CheckDlgButton(dlg, IDC_AUTORECONNECT, cfg->autoReconnect ? BST_CHECKED : BST_UNCHECKED);
+            CheckDlgButton(dlg, IDC_AUTOSTART, IsAutostartEnabled() ? BST_CHECKED : BST_UNCHECKED);
             return TRUE;
         }
         case WM_COMMAND:
@@ -195,6 +243,7 @@ INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lPara
                 if (ok && port > 0 && port <= 65535)
                     cfg->port = static_cast<uint16_t>(port);
                 cfg->autoReconnect = IsDlgButtonChecked(dlg, IDC_AUTORECONNECT) == BST_CHECKED;
+                SetAutostart(IsDlgButtonChecked(dlg, IDC_AUTOSTART) == BST_CHECKED);
                 EndDialog(dlg, IDOK);
                 return TRUE;
             }
@@ -217,6 +266,8 @@ void ShowContextMenu(HWND hwnd, TrayContext* ctx)
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, IDM_SETTINGS, L"Settings...");
+    if (!IsElevated())
+        AppendMenuW(menu, MF_STRING, IDM_RUNASADMIN, L"Run as administrator");
     AppendMenuW(menu, MF_STRING, IDM_EXIT, L"Exit");
 
     POINT pt;
@@ -251,13 +302,39 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                     ctx->app.Stop();
                     UpdateStatus(ctx);
                     return 0;
-                case IDM_SETTINGS:
+                case IDM_SETTINGS: {
+                    std::string oldIp = ctx->cfg.ip;
+                    uint16_t oldPort = ctx->cfg.port;
                     if (DialogBoxParamW(ctx->hInstance, MAKEINTRESOURCEW(IDD_SETTINGS), hwnd, SettingsDlgProc,
                                         reinterpret_cast<LPARAM>(&ctx->cfg)) == IDOK) {
                         ctx->cfg.Save();
-                        ApplyAndRestart(ctx);
+                        // Only tear down and reconnect if the *target* actually
+                        // changed — toggling auto-connect/autostart, or OK with
+                        // no change, must not drop a live stream.
+                        if (ctx->cfg.ip != oldIp || ctx->cfg.port != oldPort)
+                            ApplyAndRestart(ctx);
                     }
                     return 0;
+                }
+                case IDM_RUNASADMIN: {
+                    // Relaunch elevated, then exit this instance. Stop first so
+                    // the per-iPad lock is released before the elevated copy
+                    // grabs it. Elevated lets touch reach elevated windows and
+                    // register new resolutions without a separate prompt.
+                    ctx->app.Stop();
+                    wchar_t exe[MAX_PATH];
+                    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+                    SHELLEXECUTEINFOW sei{};
+                    sei.cbSize = sizeof(sei);
+                    sei.lpVerb = L"runas";
+                    sei.lpFile = exe;
+                    sei.nShow = SW_NORMAL;
+                    if (ShellExecuteExW(&sei))
+                        DestroyWindow(hwnd); // elevated copy is up; tear this one down
+                    else
+                        ApplyAndRestart(ctx); // UAC declined: resume as we were
+                    return 0;
+                }
                 case IDM_EXIT:
                     DestroyWindow(hwnd);
                     return 0;

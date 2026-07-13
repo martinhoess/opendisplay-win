@@ -53,10 +53,27 @@ hardcoded to it.
      `nefconw` device-node creation (`/S` alone is not enough)
   3. Confirm "Parsec Virtual Display Adapter" appears in Device Manager
 
-The sender **runs as Administrator** — it writes the driver's custom-resolution
-registry key under `HKLM\SOFTWARE\Parsec\vdd` (fails silently without
-elevation). The binary's manifest requests elevation, so launching it triggers
-a UAC prompt.
+### Admin rights
+
+The app **runs un-elevated**. The *only* thing that needs admin is registering
+an iPad's native resolution as a parsec-vdd custom mode — one `HKLM` write, done
+once per panel size. The first time you connect a new iPad, the app self-elevates
+a one-off (a single UAC prompt) to register both orientations, then keeps running
+un-elevated; after that it never prompts again. You can also do it by hand:
+
+```
+build\Release\opendisplay-win.exe --register-resolution <width> <height>
+```
+
+Running the whole app as administrator is **optional** (tray menu → *Run as
+administrator*) and only matters if you want touch to control *elevated* windows
+on the iPad screen — Windows blocks input from an un-elevated process into
+higher-integrity windows (UIPI).
+
+### Start with Windows
+
+Because the app is un-elevated, autostart is just a per-user Run entry — toggle
+**Start with Windows** in Settings (no scheduled task, no logon UAC).
 
 ## Build
 

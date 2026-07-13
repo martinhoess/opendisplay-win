@@ -2,9 +2,15 @@
 
 #include "parsec-vdd.h"
 
+#include <shellapi.h>
+
 #include <chrono>
 #include <climits>
 #include <cstdio>
+#include <string>
+#include <vector>
+
+#pragma comment(lib, "shell32.lib")
 
 namespace od {
 
@@ -102,6 +108,72 @@ int RemoveGhostMonitors()
     return removed;
 }
 
+// --- Custom-resolution registry (HKLM\SOFTWARE\Parsec\vdd\0..4) ---------------
+// parsec-vdd's default EDID doesn't list an iPad's native resolution, so we add
+// it as a custom mode. Up to 5 slots — enough for a couple of iPads (both
+// orientations each). Writing needs admin; reading doesn't.
+
+struct Res {
+    DWORD w = 0, h = 0, hz = 0;
+};
+
+std::vector<Res> ReadRegisteredResolutions()
+{
+    std::vector<Res> out;
+    for (int i = 0; i < 5; ++i) {
+        wchar_t sub[64];
+        swprintf_s(sub, L"SOFTWARE\\Parsec\\vdd\\%d", i);
+        HKEY key = nullptr;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, sub, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+            continue;
+        auto getDword = [&](const wchar_t* name, DWORD& v) {
+            DWORD size = sizeof(v), type = 0;
+            return RegQueryValueExW(key, name, nullptr, &type, reinterpret_cast<BYTE*>(&v), &size) == ERROR_SUCCESS &&
+                   type == REG_DWORD;
+        };
+        Res r;
+        bool ok = getDword(L"width", r.w) && getDword(L"height", r.h);
+        if (!getDword(L"hz", r.hz))
+            r.hz = 60;
+        RegCloseKey(key);
+        if (ok && r.w && r.h)
+            out.push_back(r);
+    }
+    return out;
+}
+
+bool IsResolutionRegistered(uint32_t w, uint32_t h)
+{
+    for (const auto& r : ReadRegisteredResolutions())
+        if (r.w == w && r.h == h)
+            return true;
+    return false;
+}
+
+// Writes the list into slots 0.., deleting any leftover slots. Needs admin;
+// returns false (without side effects that matter) if not elevated.
+bool WriteResolutionSlots(const std::vector<Res>& list)
+{
+    for (int i = 0; i < 5; ++i) {
+        wchar_t sub[64];
+        swprintf_s(sub, L"SOFTWARE\\Parsec\\vdd\\%d", i);
+        if (i < static_cast<int>(list.size())) {
+            HKEY key = nullptr;
+            if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, sub, 0, nullptr, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, nullptr,
+                                &key, nullptr) != ERROR_SUCCESS)
+                return false; // non-admin: HKLM write denied
+            DWORD w = list[i].w, h = list[i].h, z = list[i].hz;
+            RegSetValueExW(key, L"width", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&w), sizeof(w));
+            RegSetValueExW(key, L"height", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&h), sizeof(h));
+            RegSetValueExW(key, L"hz", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&z), sizeof(z));
+            RegCloseKey(key);
+        } else {
+            RegDeleteKeyW(HKEY_LOCAL_MACHINE, sub); // best-effort tidy of unused slots
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 VirtualDisplay::VirtualDisplay() = default;
@@ -163,22 +235,52 @@ void VirtualDisplay::KeepAliveLoop()
     }
 }
 
-bool VirtualDisplay::WriteCustomResolutionRegistry(uint32_t width, uint32_t height, uint32_t hz)
+bool VirtualDisplay::RegisterResolutions(uint32_t width, uint32_t height)
 {
-    HKEY key = nullptr;
-    LONG r = RegCreateKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Parsec\\vdd\\0", 0, nullptr,
-                              REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, nullptr, &key, nullptr);
-    if (r != ERROR_SUCCESS)
-        return false;
-
-    auto setDword = [&](const wchar_t* name, DWORD value) {
-        return RegSetValueExW(key, name, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&value), sizeof(value)) ==
-               ERROR_SUCCESS;
+    // Ensure both this resolution and its rotation (swapped W/H) are among the
+    // registered custom modes, preserving what's already there (other iPads).
+    std::vector<Res> list = ReadRegisteredResolutions();
+    auto ensure = [&](DWORD w, DWORD h) {
+        for (const auto& r : list)
+            if (r.w == w && r.h == h)
+                return;
+        list.push_back({w, h, 60});
     };
+    ensure(width, height);
+    ensure(height, width);
 
-    bool ok = setDword(L"width", width) && setDword(L"height", height) && setDword(L"hz", hz);
-    RegCloseKey(key);
-    return ok;
+    // Only 5 slots — if we overflow, keep the most recently needed ones.
+    if (list.size() > 5)
+        list.erase(list.begin(), list.end() - 5);
+
+    return WriteResolutionSlots(list); // needs admin
+}
+
+bool VirtualDisplay::SelfElevateRegister(uint32_t width, uint32_t height)
+{
+    // Relaunch ourselves elevated to do just the one HKLM write (single UAC
+    // prompt), then continue running un-elevated. Registering a new iPad's
+    // resolution is the only admin-needing step.
+    wchar_t exe[MAX_PATH];
+    if (GetModuleFileNameW(nullptr, exe, MAX_PATH) == 0)
+        return false;
+    std::wstring args = L"--register-resolution " + std::to_wstring(width) + L" " + std::to_wstring(height);
+
+    SHELLEXECUTEINFOW sei{};
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    sei.lpVerb = L"runas";
+    sei.lpFile = exe;
+    sei.lpParameters = args.c_str();
+    sei.nShow = SW_HIDE;
+    if (!ShellExecuteExW(&sei) || sei.hProcess == nullptr)
+        return false; // user declined the UAC prompt, or launch failed
+
+    WaitForSingleObject(sei.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(sei.hProcess, &code);
+    CloseHandle(sei.hProcess);
+    return code == 0 && IsResolutionRegistered(width, height);
 }
 
 bool VirtualDisplay::EnsureResolution(uint32_t width, uint32_t height, uint32_t hz)
@@ -195,9 +297,15 @@ bool VirtualDisplay::EnsureResolution(uint32_t width, uint32_t height, uint32_t 
     targetHeight_ = height;
     targetHz_ = hz;
 
-    if (!WriteCustomResolutionRegistry(width, height, hz)) {
-        fprintf(stderr, "VirtualDisplay: failed to write HKLM custom resolution (need admin?)\n");
-        return false;
+    // The resolution must be a registered custom mode. If it isn't, register it
+    // (needs admin): do it directly when already elevated, otherwise self-
+    // elevate a one-off. A known iPad is already registered, so this is a
+    // one-time UAC prompt the first time a new panel size is seen.
+    if (!IsResolutionRegistered(width, height)) {
+        if (!RegisterResolutions(width, height) && !SelfElevateRegister(width, height)) {
+            fprintf(stderr, "resolution %ux%u not registered (needs admin once; UAC declined?)\n", width, height);
+            return false;
+        }
     }
 
     if (displayIndex_ >= 0) {

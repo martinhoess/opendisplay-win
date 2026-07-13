@@ -49,23 +49,23 @@ service (lifecycle) **plus** an interactive agent launched into the user session
 via `WTSQueryUserToken` / `CreateProcessAsUser` (how Sunshine / Parsec / RDP do
 it).
 
-**Recommendation: skip the real service for now.** Use an **auto-start elevated
-app** (Task Scheduler at logon, "run with highest privileges") that lives in the
-interactive session — it gets the admin rights the driver registry needs, and
-capture + input both work. This collapses items 2 and 3 into a single tray app.
-Only build the full service+agent split if it must run before user logon /
-headless (not needed for "a second monitor for my own PC").
+**Largely done.** It turned out the app doesn't need elevation at all — the only
+admin-requiring step is registering an iPad resolution as a parsec-vdd custom
+mode (a one-off HKLM write, which self-elevates once). So the tray app runs
+un-elevated and **autostart is a plain per-user Run entry** (Settings → *Start
+with Windows*), no scheduled task and no logon UAC. The full session-0
+service + interactive agent split is only worth it if it must run *before* user
+logon / fully headless — not needed for "a second monitor for my own PC".
 
-## 3. Tray app + settings GUI
+## 3. Tray app + settings GUI — done
 
-- A **native Win32 tray app** (`Shell_NotifyIcon`) that *is* the sender host (no
-  separate process): settings for IP/port, an auto-reconnect toggle,
-  connect/disconnect, and live status (connected / fps).
-- Refactor `SenderApp` from a run-forever CLI into something controllable (stop
-  token, IP reconfigurable at runtime). Persist config as JSON in `%APPDATA%`.
-- Tech: **native Win32** keeps the bundle small and the stack single-language
-  (no .NET dependency). If a richer UI is wanted later, split the GUI into a
-  C#/WinUI front-end talking to the C++ core over a named pipe.
+- Native Win32 tray app (`Shell_NotifyIcon`) that *is* the sender host: a
+  status-dot icon, a Connect/Disconnect/Settings/Run-as-admin/Exit menu, and a
+  settings dialog (iPad IP, port, auto-connect, Start-with-Windows).
+- `SenderApp` is controllable (Start/Stop/state); config persists as JSON in
+  `%APPDATA%`.
+- Remaining polish: async Stop so the UI never briefly blocks (see known issues);
+  a richer C#/WinUI front-end is possible later but not needed.
 
 ## 4. Installer / distribution
 

@@ -87,7 +87,15 @@ int main(int argc, char** argv)
     }
 
     int rc = 0;
-    if (argc >= 2 && std::string(argv[1]) == "--cleanup-monitors") {
+    if (argc >= 4 && std::string(argv[1]) == "--register-resolution") {
+        // Elevated one-off: register a custom resolution (+ its rotation) so the
+        // virtual monitor can use it. Invoked by the self-elevate path or by hand.
+        auto w = static_cast<uint32_t>(strtoul(argv[2], nullptr, 10));
+        auto h = static_cast<uint32_t>(strtoul(argv[3], nullptr, 10));
+        bool ok = w > 0 && h > 0 && od::VirtualDisplay::RegisterResolutions(w, h);
+        printf("register %ux%u: %s\n", w, h, ok ? "ok" : "failed");
+        rc = ok ? 0 : 1;
+    } else if (argc >= 2 && std::string(argv[1]) == "--cleanup-monitors") {
         // Explicit one-off: drop phantom virtual monitors from earlier runs.
         int n = od::VirtualDisplay::CleanupGhostMonitors();
         printf("removed %d leftover virtual monitor(s)\n", n);

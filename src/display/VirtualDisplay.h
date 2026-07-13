@@ -53,8 +53,13 @@ public:
     // the ROADMAP). Needs admin.
     static int CleanupGhostMonitors();
 
+    // Registers a custom resolution (and its rotation) as a parsec-vdd mode so
+    // the virtual monitor can use the iPad's native size. Writing needs admin;
+    // used by the `--register-resolution` one-off and by the self-elevate path.
+    static bool RegisterResolutions(uint32_t width, uint32_t height);
+
 private:
-    bool WriteCustomResolutionRegistry(uint32_t width, uint32_t height, uint32_t hz);
+    bool SelfElevateRegister(uint32_t width, uint32_t height);
     bool FindMonitorGeometry();
     bool QueryMonitorRect();
     void KeepAliveLoop();
