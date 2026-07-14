@@ -78,6 +78,14 @@ private:
     std::thread keepAliveThread_;
     std::atomic<bool> keepAliveRunning_{false};
 
+    // Serializes every parsec-vdd driver call on device_ (the VddUpdate keepalive
+    // vs. VddAddDisplay/VddRemoveDisplay on rotation). Two DeviceIoControls in
+    // flight on the same handle race the driver's monitor-topology state — that
+    // crashes DWM / the Display Settings dialog and flaps the monitor out from
+    // under the live capture. Locked per call only (never across the settle
+    // sleeps), so the keepalive is never starved past the driver's ~10s watchdog.
+    std::mutex vddMutex_;
+
     uint32_t targetWidth_ = 0;
     uint32_t targetHeight_ = 0;
     uint32_t targetHz_ = 60;

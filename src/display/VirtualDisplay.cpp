@@ -223,7 +223,10 @@ void VirtualDisplay::KeepAliveLoop()
     int tick = 0;
 
     while (keepAliveRunning_) {
-        parsec_vdd::VddUpdate(device_);
+        {
+            std::lock_guard<std::mutex> lock(vddMutex_);
+            parsec_vdd::VddUpdate(device_);
+        }
 
         // ~once a second, notice if the user dragged the monitor and persist it.
         if (++tick >= 20) {
@@ -315,12 +318,19 @@ bool VirtualDisplay::EnsureResolution(uint32_t width, uint32_t height, uint32_t 
     }
 
     if (displayIndex_ >= 0) {
-        parsec_vdd::VddRemoveDisplay(device_, displayIndex_);
+        {
+            std::lock_guard<std::mutex> lock(vddMutex_);
+            parsec_vdd::VddRemoveDisplay(device_, displayIndex_);
+        }
         displayIndex_ = -1;
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
-    int idx = parsec_vdd::VddAddDisplay(device_);
+    int idx;
+    {
+        std::lock_guard<std::mutex> lock(vddMutex_);
+        idx = parsec_vdd::VddAddDisplay(device_);
+    }
     if (idx < 0) {
         fprintf(stderr, "VddAddDisplay failed\n");
         return false;
@@ -333,7 +343,10 @@ bool VirtualDisplay::EnsureResolution(uint32_t width, uint32_t height, uint32_t 
     // never-attached display forever — the app would loop "connecting" and
     // never recover once conditions became good.
     if (!FindMonitorGeometry()) {
-        parsec_vdd::VddRemoveDisplay(device_, displayIndex_);
+        {
+            std::lock_guard<std::mutex> lock(vddMutex_);
+            parsec_vdd::VddRemoveDisplay(device_, displayIndex_);
+        }
         displayIndex_ = -1;
         return false;
     }
