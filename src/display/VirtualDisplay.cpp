@@ -321,7 +321,17 @@ bool VirtualDisplay::EnsureResolution(uint32_t width, uint32_t height, uint32_t 
     }
     displayIndex_ = idx;
 
-    return FindMonitorGeometry();
+    // If the monitor didn't attach (e.g. the desktop wasn't settled yet at
+    // logon), drop the display so the *next* reconnect re-adds and re-attaches
+    // from scratch. Without this, the early-return above would keep querying a
+    // never-attached display forever — the app would loop "connecting" and
+    // never recover once conditions became good.
+    if (!FindMonitorGeometry()) {
+        parsec_vdd::VddRemoveDisplay(device_, displayIndex_);
+        displayIndex_ = -1;
+        return false;
+    }
+    return true;
 }
 
 bool VirtualDisplay::FindMonitorGeometry()
@@ -373,14 +383,36 @@ bool VirtualDisplay::FindMonitorGeometry()
     mode.dmBitsPerPel = 32;
     mode.dmDisplayFrequency = targetHz_;
 
-    ChangeDisplaySettingsExW(name.c_str(), &mode, nullptr, CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
+    LONG rDev = ChangeDisplaySettingsExW(name.c_str(), &mode, nullptr, CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
     LONG r = ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
     if (r != DISP_CHANGE_SUCCESSFUL) {
-        fprintf(stderr, "ChangeDisplaySettingsEx failed: %ld\n", r);
+        fprintf(stderr, "ChangeDisplaySettingsEx failed: apply=%ld dev=%ld\n", r, rDev);
         return false;
     }
 
-    return WaitUntil([&] { return QueryMonitorRect(); }, 3000);
+    bool got = WaitUntil([&] { return QueryMonitorRect(); }, 3000);
+
+    // A stale saved position can be off-screen after a monitor-layout change and
+    // refuse to attach. Fall back to the default right edge (and persist it) so
+    // we recover instead of looping add/remove on every reconnect.
+    if (!got) {
+        int defX = GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        int defY = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        if (defX != posX || defY != posY) {
+            mode.dmPosition.x = defX;
+            mode.dmPosition.y = defY;
+            ChangeDisplaySettingsExW(name.c_str(), &mode, nullptr, CDS_UPDATEREGISTRY | CDS_NORESET, nullptr);
+            ChangeDisplaySettingsExW(nullptr, nullptr, nullptr, 0, nullptr);
+            got = WaitUntil([&] { return QueryMonitorRect(); }, 3000);
+            if (got)
+                SavePosition(defX, defY);
+        }
+    }
+
+    if (!got)
+        fprintf(stderr, "FindMonitorGeometry: monitor %ls did not attach at %d,%d %ux%u (dev-set=%ld)\n",
+                name.c_str(), posX, posY, targetWidth_, targetHeight_, rDev);
+    return got;
 }
 
 RECT VirtualDisplay::MonitorRect() const
