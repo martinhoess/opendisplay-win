@@ -56,6 +56,27 @@ void RedirectLogToFile()
     setvbuf(stderr, nullptr, _IONBF, 0);
 }
 
+// Last-resort diagnostics: on an unhandled crash, write the exception code and
+// the faulting module + offset to the log before dying. Without this the tray
+// process just vanishes with no WER entry, so a crash during a resolution/
+// rotation change left nothing to point at the culprit.
+LONG WINAPI CrashLogger(EXCEPTION_POINTERS* ep)
+{
+    void* addr = ep->ExceptionRecord->ExceptionAddress;
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    HMODULE mod = nullptr;
+    char modName[MAX_PATH] = "?";
+    uintptr_t off = 0;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(addr), &mod)) {
+        GetModuleFileNameA(mod, modName, MAX_PATH);
+        off = reinterpret_cast<uintptr_t>(addr) - reinterpret_cast<uintptr_t>(mod);
+    }
+    fprintf(stderr, "\n*** CRASH: code=0x%08lX addr=%p module=%s +0x%zX ***\n", code, addr, modName, off);
+    fflush(stderr);
+    return EXCEPTION_EXECUTE_HANDLER; // let the process terminate
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -79,6 +100,7 @@ int main(int argc, char** argv)
     MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
 
     RedirectLogToFile();
+    SetUnhandledExceptionFilter(CrashLogger);
 
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {

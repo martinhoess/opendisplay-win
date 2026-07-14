@@ -117,11 +117,17 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
             fprintf(stderr, "VirtualDisplay::Open failed (parsec-vdd driver missing/inaccessible?)\n");
             return false;
         }
+        // Release the capture BEFORE touching the monitor. On a rotation rebuild
+        // EnsureResolution removes and re-adds the virtual display; doing that
+        // while a DXGI duplication is still live on the old output tears the
+        // monitor down under an active capture — which destabilizes DWM (the
+        // Display Settings dialog crashes) and can crash us. Closing first means
+        // no duplication ever references a monitor that's being replaced.
+        dup.Close();
         if (!vdisp.EnsureResolution(width, height, kFps)) {
             fprintf(stderr, "VirtualDisplay::EnsureResolution failed (run as Administrator?)\n");
             return false;
         }
-        dup.Close();
         if (!dup.Open(vdisp.DeviceName())) {
             fprintf(stderr, "DesktopDuplication::Open failed\n");
             return false;
