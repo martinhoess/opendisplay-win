@@ -40,7 +40,7 @@ private:
     // duplicated desktop image), so we cache its latest shape/position and
     // blend it into each captured frame ourselves before NV12 conversion.
     void UpdatePointer(const DXGI_OUTDUPL_FRAME_INFO& info);
-    void CompositePointer(uint8_t* bgra, uint32_t stride) const;
+    void CompositePointer(uint8_t* bgra, uint32_t stride, uint32_t frameW, uint32_t frameH) const;
 
     // Tears down and recreates the duplication (and its D3D device) for the
     // remembered output. Called after the duplication is invalidated by a

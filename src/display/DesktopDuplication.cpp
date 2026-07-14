@@ -198,6 +198,14 @@ bool DesktopDuplication::CaptureFrameNv12(std::vector<uint8_t>& nv12, int timeou
     D3D11_TEXTURE2D_DESC desc;
     texture->GetDesc(&desc);
 
+    // The mapped staging buffer below is exactly this texture's size. Across a
+    // resolution/rotation change the duplication can hand back a frame whose
+    // dimensions differ from width_/height_ (which came from the ModeDesc at
+    // Open); always process against the frame's own size so we never read/write
+    // past the buffer.
+    const uint32_t frameW = desc.Width;
+    const uint32_t frameH = desc.Height;
+
     if (!staging_) {
         D3D11_TEXTURE2D_DESC stagingDesc = desc;
         stagingDesc.Usage = D3D11_USAGE_STAGING;
@@ -217,8 +225,8 @@ bool DesktopDuplication::CaptureFrameNv12(std::vector<uint8_t>& nv12, int timeou
     hr = context_->Map(staging_.Get(), 0, D3D11_MAP_READ_WRITE, 0, &mapped);
     if (SUCCEEDED(hr)) {
         if (pointerVisible_ && !pointerShape_.empty())
-            CompositePointer(reinterpret_cast<uint8_t*>(mapped.pData), mapped.RowPitch);
-        ConvertBgraToNv12(reinterpret_cast<const uint8_t*>(mapped.pData), mapped.RowPitch, width_, height_, nv12);
+            CompositePointer(reinterpret_cast<uint8_t*>(mapped.pData), mapped.RowPitch, frameW, frameH);
+        ConvertBgraToNv12(reinterpret_cast<const uint8_t*>(mapped.pData), mapped.RowPitch, frameW, frameH, nv12);
         context_->Unmap(staging_.Get(), 0);
     }
 
@@ -249,7 +257,7 @@ void DesktopDuplication::UpdatePointer(const DXGI_OUTDUPL_FRAME_INFO& info)
     }
 }
 
-void DesktopDuplication::CompositePointer(uint8_t* bgra, uint32_t stride) const
+void DesktopDuplication::CompositePointer(uint8_t* bgra, uint32_t stride, uint32_t frameW, uint32_t frameH) const
 {
     const int posX = pointerPosition_.x;
     const int posY = pointerPosition_.y;
@@ -257,8 +265,12 @@ void DesktopDuplication::CompositePointer(uint8_t* bgra, uint32_t stride) const
     const int shapeW = static_cast<int>(pointerShapeInfo_.Width);
     int shapeH = static_cast<int>(pointerShapeInfo_.Height);
 
+    // Bound against the *actual* frame the caller mapped (frameW/frameH), not the
+    // cached width_/height_ from Open's ModeDesc — those two diverge transiently
+    // across a resolution/rotation change, and writing past the smaller staging
+    // buffer is an out-of-bounds write (0xC0000005).
     auto inFrame = [&](int fx, int fy) {
-        return fx >= 0 && fy >= 0 && fx < static_cast<int>(width_) && fy < static_cast<int>(height_);
+        return fx >= 0 && fy >= 0 && fx < static_cast<int>(frameW) && fy < static_cast<int>(frameH);
     };
 
     if (pointerShapeInfo_.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME) {
