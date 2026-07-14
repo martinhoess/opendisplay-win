@@ -288,10 +288,16 @@ bool VirtualDisplay::EnsureResolution(uint32_t width, uint32_t height, uint32_t 
     if (!IsOpen())
         return false;
 
-    // Reconnects (same panel, no rotation) shouldn't flicker-rebuild the
-    // monitor — only a genuine dimension change needs a remove/re-add.
-    if (displayIndex_ >= 0 && targetWidth_ == width && targetHeight_ == height && targetHz_ == hz)
-        return QueryMonitorRect();
+    // Reconnects (same panel, no rotation) reuse the monitor — but only if it's
+    // actually still there. The driver drops the virtual display across a
+    // standby/resume (and other resets), leaving displayIndex_ pointing at a
+    // monitor that no longer exists; reusing it blindly would fail forever and
+    // the app would just loop "connecting". If QueryMonitorRect() can't find it,
+    // fall through to the remove + re-add path below (which cleans up the stale
+    // index, with the settle delay, and re-attaches).
+    if (displayIndex_ >= 0 && targetWidth_ == width && targetHeight_ == height && targetHz_ == hz &&
+        QueryMonitorRect())
+        return true;
 
     targetWidth_ = width;
     targetHeight_ = height;
