@@ -10,15 +10,24 @@ video-looking payload against the Annex-B rules from the wire spec:
     preceded by SPS (type 7) and PPS (type 8)
   - first byte is 0x00, never '{'
 
+It also plays back Apple Pencil input on demand (--pencil-stroke), which is the
+only way to exercise the sender's pen path without an actual iPad and Pencil:
+the receiver announces protocol 3 in `hello`, waits for the sender's `welcome`,
+and then emits a proximity/hover/down/move/up sequence with a rising pressure
+ramp and changing tilt.
+
 Usage:
   python3 tools/mock_receiver.py [--host 0.0.0.0] [--port 9000]
                                   [--width 2388] [--height 1668]
                                   [--send-kf-after N] [--dump-h264 out.h264]
+                                  [--pencil-stroke] [--pencil-repeat SECONDS]
 """
 import argparse
+import json
 import socket
 import struct
 import sys
+import threading
 import time
 
 
@@ -101,6 +110,58 @@ def validate_annexb_frame(payload: bytes) -> list:
     return problems
 
 
+def send_control(sock: socket.socket, **fields) -> None:
+    send_frame(sock, json.dumps(fields).encode("utf-8"))
+
+
+def play_pencil_stroke(sock: socket.socket, welcome: threading.Event, repeat: float) -> None:
+    """A diagonal stroke with rising pressure and rotating tilt.
+
+    Mirrors what the real receiver sends (PhoneReceiver.sendPencil): normalized
+    coordinates, pressure 0..1, azimuth/altitude in radians. Waits for the
+    sender's `welcome` first, because that is exactly the gate the iPad applies
+    before it switches from `touch` to `pencil`.
+    """
+    if not welcome.wait(timeout=15.0):
+        print("[mock] no welcome within 15s - sender does not speak protocol 3, skipping pencil")
+        return
+
+    steps = 40
+    altitude = 0.9  # radians, clearly tilted so tiltX/tiltY are non-zero
+    try:
+        while True:
+            time.sleep(1.0)
+            x0, y0, x1, y1 = 0.25, 0.25, 0.75, 0.75
+            print("[mock] pencil: proximity + hover")
+            send_control(sock, type="proximity", entering=True, x=x0, y=y0)
+            for i in range(5):
+                t = i / 4
+                send_control(sock, type="pencil", phase="hover", x=x0 - 0.05 + t * 0.05,
+                             y=y0 - 0.05 + t * 0.05, pressure=0.0, azimuth=0.0,
+                             altitude=altitude, rotation=0)
+                time.sleep(0.03)
+
+            print("[mock] pencil: stroke with pressure ramp 0.05 -> 1.0")
+            send_control(sock, type="pencil", phase="down", x=x0, y=y0, pressure=0.05,
+                         azimuth=0.0, altitude=altitude, rotation=0)
+            for i in range(1, steps + 1):
+                t = i / steps
+                send_control(sock, type="pencil", phase="move", x=x0 + (x1 - x0) * t,
+                             y=y0 + (y1 - y0) * t, pressure=0.05 + 0.95 * t,
+                             azimuth=6.283 * t, altitude=altitude, rotation=0)
+                time.sleep(0.012)
+            send_control(sock, type="pencil", phase="up", x=x1, y=y1, pressure=0.0,
+                         azimuth=0.0, altitude=altitude, rotation=0)
+            send_control(sock, type="proximity", entering=False, x=x1, y=y1)
+            print("[mock] pencil: stroke done")
+
+            if repeat <= 0:
+                return
+            time.sleep(repeat)
+    except OSError as exc:
+        print(f"[mock] pencil playback stopped: {exc}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="0.0.0.0")
@@ -116,6 +177,10 @@ def main() -> int:
     )
     ap.add_argument("--dump-h264", default=None, help="write received video payloads (Annex-B) to this file")
     ap.add_argument("--max-frames", type=int, default=0, help="exit after N video frames (0 = run forever)")
+    ap.add_argument("--pencil-stroke", action="store_true",
+                    help="play a scripted Apple Pencil stroke once the sender sent its welcome")
+    ap.add_argument("--pencil-repeat", type=float, default=0.0,
+                    help="replay that stroke every N seconds (0 = play it once)")
     args = ap.parse_args()
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -128,12 +193,19 @@ def main() -> int:
     conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     print(f"[mock] accepted connection from {addr}")
 
+    # pv mirrors the real receiver: 3 is what unlocks pencil on the wire.
     hello = (
         '{"type":"hello","pixelsWide":%d,"pixelsHigh":%d,"scale":%d,'
-        '"device":"iPad","id":"mock-uuid-0000"}' % (args.width, args.height, args.scale)
+        '"device":"iPad","id":"mock-uuid-0000","pv":3}' % (args.width, args.height, args.scale)
     )
     send_frame(conn, hello.encode("utf-8"))
     print(f"[mock] sent hello: {hello}")
+
+    welcome_seen = threading.Event()
+    if args.pencil_stroke:
+        threading.Thread(target=play_pencil_stroke,
+                         args=(conn, welcome_seen, args.pencil_repeat),
+                         daemon=True).start()
 
     dump = open(args.dump_h264, "wb") if args.dump_h264 else None
     video_frames = 0
@@ -145,7 +217,10 @@ def main() -> int:
 
             if is_control(payload):
                 control_frames += 1
-                print(f"[mock] control #{control_frames}: {payload.decode('utf-8', 'replace')}")
+                text = payload.decode("utf-8", "replace")
+                print(f"[mock] control #{control_frames}: {text}")
+                if '"welcome"' in text:
+                    welcome_seen.set()
                 continue
 
             video_frames += 1

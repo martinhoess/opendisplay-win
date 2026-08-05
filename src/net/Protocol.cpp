@@ -66,6 +66,21 @@ std::optional<double> FindNumberField(std::string_view json, std::string_view ke
     return std::strtod(std::string(json.substr(start, end - start)).c_str(), nullptr);
 }
 
+std::optional<bool> FindBoolField(std::string_view json, std::string_view key)
+{
+    size_t start = FindValueStart(json, key);
+    if (start == std::string_view::npos)
+        return std::nullopt;
+
+    std::string_view rest = json.substr(start);
+    if (rest.starts_with("true"))
+        return true;
+    if (rest.starts_with("false"))
+        return false;
+
+    return std::nullopt;
+}
+
 TouchPhase ParseTouchPhase(const std::string& phase)
 {
     if (phase == "began") return TouchPhase::Began;
@@ -73,6 +88,15 @@ TouchPhase ParseTouchPhase(const std::string& phase)
     if (phase == "ended") return TouchPhase::Ended;
     if (phase == "cancelled") return TouchPhase::Cancelled;
     return TouchPhase::Unknown;
+}
+
+PencilPhase ParsePencilPhase(const std::string& phase)
+{
+    if (phase == "hover") return PencilPhase::Hover;
+    if (phase == "down") return PencilPhase::Down;
+    if (phase == "move") return PencilPhase::Move;
+    if (phase == "up") return PencilPhase::Up;
+    return PencilPhase::Unknown;
 }
 
 } // namespace
@@ -119,6 +143,19 @@ std::optional<ControlMessage> ParseControlMessage(const uint8_t* data, size_t si
         msg.type = ControlType::Scroll;
         msg.scroll.dx = FindNumberField(json, "dx").value_or(0.0);
         msg.scroll.dy = FindNumberField(json, "dy").value_or(0.0);
+    } else if (*type == "pencil") {
+        msg.type = ControlType::Pencil;
+        msg.pencil.phase = ParsePencilPhase(FindStringField(json, "phase").value_or(""));
+        msg.pencil.x = FindNumberField(json, "x").value_or(0.0);
+        msg.pencil.y = FindNumberField(json, "y").value_or(0.0);
+        msg.pencil.pressure = FindNumberField(json, "pressure").value_or(0.0);
+        msg.pencil.azimuth = FindNumberField(json, "azimuth").value_or(0.0);
+        msg.pencil.altitude = FindNumberField(json, "altitude").value_or(kPencilAltitudeUpright);
+    } else if (*type == "proximity") {
+        msg.type = ControlType::Proximity;
+        msg.proximity.entering = FindBoolField(json, "entering").value_or(false);
+        msg.proximity.x = FindNumberField(json, "x").value_or(0.0);
+        msg.proximity.y = FindNumberField(json, "y").value_or(0.0);
     } else if (*type == "kf") {
         msg.type = ControlType::Kf;
     } else {

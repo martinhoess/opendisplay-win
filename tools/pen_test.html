@@ -1,0 +1,62 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Pen-Test — opendisplay-win</title>
+<style>
+  html, body { margin: 0; height: 100%; font: 16px system-ui, sans-serif; background: #111; color: #eee; }
+  #hud { position: fixed; top: 0; left: 0; padding: 12px 16px; background: #000c; line-height: 1.6; }
+  #hud b { display: inline-block; width: 9ch; color: #8cf; font-weight: 600; }
+  canvas { display: block; touch-action: none; cursor: crosshair; }
+</style>
+<div id="hud">
+  <div><b>Typ</b><span id="type">—</span></div>
+  <div><b>Druck</b><span id="pressure">—</span></div>
+  <div><b>Tilt X/Y</b><span id="tilt">—</span></div>
+  <div><b>Hover</b><span id="hover">—</span></div>
+  <div><b>Events</b><span id="count">0</span></div>
+</div>
+<canvas id="c"></canvas>
+<script>
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const out = id => document.getElementById(id);
+  let events = 0, last = null;
+
+  function resize() {
+    const img = ctx.getImageData(0, 0, canvas.width || 1, canvas.height || 1);
+    canvas.width = innerWidth;
+    canvas.height = innerHeight;
+    ctx.putImageData(img, 0, 0);
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = '#8cf';
+  }
+  addEventListener('resize', resize);
+  resize();
+
+  function report(e, hovering) {
+    out('type').textContent = e.pointerType;
+    out('pressure').textContent = e.pressure.toFixed(3);
+    out('tilt').textContent = `${e.tiltX}° / ${e.tiltY}°`;
+    out('hover').textContent = hovering ? 'ja (kein Kontakt)' : 'nein (Kontakt)';
+    out('count').textContent = ++events;
+    // Der Titel ist von außen per GetWindowText lesbar — so kann ein Testskript
+    // ohne Blick auf den Schirm prüfen, ob Stiftereignisse wirklich ankommen.
+    document.title = `${e.pointerType} p=${e.pressure.toFixed(2)} t=${e.tiltX}/${e.tiltY} n=${events}`;
+  }
+
+  canvas.addEventListener('pointerdown', e => { last = { x: e.offsetX, y: e.offsetY }; report(e, false); });
+  canvas.addEventListener('pointerup', () => { last = null; });
+  canvas.addEventListener('pointerleave', () => { last = null; });
+
+  canvas.addEventListener('pointermove', e => {
+    const down = e.buttons !== 0;
+    report(e, !down);
+    if (!down || !last) { last = down ? { x: e.offsetX, y: e.offsetY } : null; return; }
+    // Strichbreite folgt dem Druck: eine flache Linie heißt, es kommt nur Maus an.
+    ctx.lineWidth = 1 + e.pressure * 24;
+    ctx.beginPath();
+    ctx.moveTo(last.x, last.y);
+    ctx.lineTo(e.offsetX, e.offsetY);
+    ctx.stroke();
+    last = { x: e.offsetX, y: e.offsetY };
+  });
+</script>

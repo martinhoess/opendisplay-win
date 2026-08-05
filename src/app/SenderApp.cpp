@@ -187,6 +187,16 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         if (!gotHello)
             continue;
 
+        // Version handshake (receiver protocol 3+): the iPad only sends
+        // `pencil`/`proximity` to a peer that announced protocol >= 3 —
+        // without this it silently degrades the Apple Pencil to plain `touch`
+        // and pressure never arrives. Sent once per connection and only from
+        // this thread: the reader thread must never write to the socket, or
+        // its frames would interleave with the video the capture loop sends.
+        static constexpr char kWelcome[] = "{\"type\":\"welcome\",\"pv\":3,\"min\":1}";
+        bool welcomeSent = conn->SendFrame(reinterpret_cast<const uint8_t*>(kWelcome), sizeof(kWelcome) - 1);
+        printf("welcome sent: %s\n", welcomeSent ? "yes" : "FAILED");
+
         uint32_t width = EvenClamp(hello.pixelsWide, 1920);
         uint32_t height = EvenClamp(hello.pixelsHigh, 1080);
         printf("hello: %dx%d -> %ux%u\n", hello.pixelsWide, hello.pixelsHigh, width, height);
@@ -207,6 +217,7 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         state_ = State::Streaming;
 
         std::atomic<bool> running{true};
+        bool loggedPencil = false; // reader-thread only; one line per connection
 
         std::thread reader([&] {
             while (running && !stopRequested_) {
@@ -261,6 +272,20 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                     case ControlType::Scroll:
                         input.SetMonitorRect(vdisp.MonitorRect());
                         input.HandleScroll(msg->scroll);
+                        break;
+                    case ControlType::Pencil:
+                        if (!loggedPencil) {
+                            // Proof the version handshake landed: without our
+                            // `welcome` the iPad would send `touch` here.
+                            loggedPencil = true;
+                            printf("pencil input active (receiver honoured welcome pv=3)\n");
+                        }
+                        input.SetMonitorRect(vdisp.MonitorRect());
+                        input.HandlePencil(msg->pencil);
+                        break;
+                    case ControlType::Proximity:
+                        input.SetMonitorRect(vdisp.MonitorRect());
+                        input.HandleProximity(msg->proximity);
                         break;
                     default:
                         break;
