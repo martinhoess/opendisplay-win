@@ -46,8 +46,15 @@ def read_frame(sock: socket.socket) -> bytes:
     return recv_exact(sock, length)
 
 
+# The pencil playback runs on its own thread while the main loop may send a `kf`
+# request, and sendall is not atomic — two writers would interleave and break
+# the receiver's length-prefixed framing.
+_send_lock = threading.Lock()
+
+
 def send_frame(sock: socket.socket, payload: bytes) -> None:
-    sock.sendall(struct.pack(">I", len(payload)) + payload)
+    with _send_lock:
+        sock.sendall(struct.pack(">I", len(payload)) + payload)
 
 
 def is_control(payload: bytes) -> bool:
@@ -114,6 +121,30 @@ def send_control(sock: socket.socket, **fields) -> None:
     send_frame(sock, json.dumps(fields).encode("utf-8"))
 
 
+def play_pencil_tap(sock: socket.socket, x: float, y: float, pressure: float) -> None:
+    """A tap: down, a few samples in place, up.
+
+    Worth its own playback because a zero-force tap is how the pen clicks UI
+    elements, and because a down/up pair with nothing in between behaves
+    differently from a real tap (a Pencil samples at ~240 Hz, so even the
+    shortest tap carries move samples).
+    """
+    altitude = 1.4
+    send_control(sock, type="proximity", entering=True, x=x, y=y)
+    send_control(sock, type="pencil", phase="hover", x=x, y=y, pressure=0.0,
+                 azimuth=0.0, altitude=altitude, rotation=0)
+    time.sleep(0.05)
+    send_control(sock, type="pencil", phase="down", x=x, y=y, pressure=pressure,
+                 azimuth=0.0, altitude=altitude, rotation=0)
+    for _ in range(4):
+        time.sleep(0.02)
+        send_control(sock, type="pencil", phase="move", x=x, y=y, pressure=pressure,
+                     azimuth=0.0, altitude=altitude, rotation=0)
+    send_control(sock, type="pencil", phase="up", x=x, y=y, pressure=0.0,
+                 azimuth=0.0, altitude=altitude, rotation=0)
+    send_control(sock, type="proximity", entering=False, x=x, y=y)
+
+
 def play_pencil_stroke(sock: socket.socket, welcome: threading.Event, repeat: float) -> None:
     """A diagonal stroke with rising pressure and rotating tilt.
 
@@ -154,6 +185,11 @@ def play_pencil_stroke(sock: socket.socket, welcome: threading.Event, repeat: fl
                          azimuth=0.0, altitude=altitude, rotation=0)
             send_control(sock, type="proximity", entering=False, x=x1, y=y1)
             print("[mock] pencil: stroke done")
+
+            # Zero-force tap right after: this is what has to click UI elements.
+            time.sleep(0.4)
+            print("[mock] pencil: zero-pressure tap")
+            play_pencil_tap(sock, 0.5, 0.5, 0.0)
 
             if repeat <= 0:
                 return

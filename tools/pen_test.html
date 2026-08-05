@@ -8,18 +8,23 @@
   canvas { display: block; touch-action: none; cursor: crosshair; }
 </style>
 <div id="hud">
-  <div><b>Typ</b><span id="type">—</span></div>
-  <div><b>Druck</b><span id="pressure">—</span></div>
+  <div><b>Type</b><span id="type">—</span></div>
+  <div><b>Pressure</b><span id="pressure">—</span></div>
   <div><b>Tilt X/Y</b><span id="tilt">—</span></div>
   <div><b>Hover</b><span id="hover">—</span></div>
   <div><b>Events</b><span id="count">0</span></div>
 </div>
 <canvas id="c"></canvas>
 <script>
+  // Title marker: pen_e2e_test.py finds this window by it and reads the pointer
+  // data back out of the title, so it must stay in front on every update.
+  const MARKER = 'Pen-Test';
   const canvas = document.getElementById('c');
   const ctx = canvas.getContext('2d');
   const out = id => document.getElementById(id);
-  let events = 0, last = null;
+  // `downs` is reported separately so a test can tell a real click apart from
+  // mere hover movement — a zero-pressure tap must still produce a pointerdown.
+  let events = 0, downs = 0, last = null;
 
   function resize() {
     const img = ctx.getImageData(0, 0, canvas.width || 1, canvas.height || 1);
@@ -36,14 +41,17 @@
     out('type').textContent = e.pointerType;
     out('pressure').textContent = e.pressure.toFixed(3);
     out('tilt').textContent = `${e.tiltX}° / ${e.tiltY}°`;
-    out('hover').textContent = hovering ? 'ja (kein Kontakt)' : 'nein (Kontakt)';
+    out('hover').textContent = hovering ? 'yes (no contact)' : 'no (in contact)';
     out('count').textContent = ++events;
-    // Der Titel ist von außen per GetWindowText lesbar — so kann ein Testskript
-    // ohne Blick auf den Schirm prüfen, ob Stiftereignisse wirklich ankommen.
-    document.title = `${e.pointerType} p=${e.pressure.toFixed(2)} t=${e.tiltX}/${e.tiltY} n=${events}`;
+    document.title = `${MARKER} ${e.pointerType} p=${e.pressure.toFixed(2)} ` +
+                     `t=${e.tiltX}/${e.tiltY} n=${events} d=${downs}`;
   }
 
-  canvas.addEventListener('pointerdown', e => { last = { x: e.offsetX, y: e.offsetY }; report(e, false); });
+  canvas.addEventListener('pointerdown', e => {
+    downs++;
+    last = { x: e.offsetX, y: e.offsetY };
+    report(e, false);
+  });
   canvas.addEventListener('pointerup', () => { last = null; });
   canvas.addEventListener('pointerleave', () => { last = null; });
 
@@ -51,7 +59,7 @@
     const down = e.buttons !== 0;
     report(e, !down);
     if (!down || !last) { last = down ? { x: e.offsetX, y: e.offsetY } : null; return; }
-    // Strichbreite folgt dem Druck: eine flache Linie heißt, es kommt nur Maus an.
+    // Stroke width follows pressure: a flat line means only mouse input arrives.
     ctx.lineWidth = 1 + e.pressure * 24;
     ctx.beginPath();
     ctx.moveTo(last.x, last.y);

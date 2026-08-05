@@ -135,6 +135,8 @@ bool InputInjector::EnsurePenDevice()
 
 void InputInjector::InjectPen(UINT32 flags, POINT pt, double pressure, double azimuth, double altitude)
 {
+    lastPenPoint_ = pt;
+
     POINTER_TYPE_INFO info{};
     info.type = PT_PEN;
     info.penInfo.pointerInfo.pointerType = PT_PEN;
@@ -200,6 +202,19 @@ void InputInjector::HandlePencil(const PencilMsg& pencil)
             break;
         default:
             break;
+    }
+}
+
+void InputInjector::EndSession()
+{
+    if (penDevice_ == nullptr)
+        return;
+
+    ReleasePenIfDown(lastPenPoint_);
+    if (penInRange_) {
+        // No INRANGE flag: tells Windows the pen left hover range for good.
+        InjectPen(POINTER_FLAG_UPDATE, lastPenPoint_, 0.0, 0.0, kPencilAltitudeUpright);
+        penInRange_ = false;
     }
 }
 

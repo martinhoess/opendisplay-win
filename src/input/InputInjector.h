@@ -35,6 +35,11 @@ public:
     void HandlePencil(const PencilMsg& pencil);
     void HandleProximity(const ProximityMsg& proximity);
 
+    // Call when a connection ends. The pen device outlives a reconnect, so a
+    // link that drops mid-stroke would otherwise leave the injected pen in
+    // contact — Windows keeps dragging until the pen happens to hover again.
+    void EndSession();
+
 private:
     POINT ScreenPoint(double nx, double ny) const;
     bool EnsurePenDevice();
@@ -49,6 +54,7 @@ private:
     bool injectFailed_ = false;    // log the first injection failure only
     bool penDown_ = false;
     bool penInRange_ = false;
+    POINT lastPenPoint_{}; // where to release from if the link dies mid-stroke
 };
 
 } // namespace od

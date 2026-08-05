@@ -366,6 +366,8 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
 
         conn->Close();
         reader.join();
+        // After the reader is gone, so nothing else touches the injector.
+        input.EndSession();
         width_ = 0;
         height_ = 0;
         printf("disconnected%s\n", stopRequested_ ? "" : ", reconnecting");
