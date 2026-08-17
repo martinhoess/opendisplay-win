@@ -8,6 +8,11 @@ endif()
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Static CRT so a released .exe runs on a bare Windows box without the VC++
+# Redistributable installed. Costs ~250 KB; the UCRT part (api-ms-win-crt-*)
+# ships with Windows 10/11 either way.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 add_executable(opendisplay-win
   src/main.cpp
   src/net/Connection.cpp
