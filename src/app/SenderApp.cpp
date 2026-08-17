@@ -296,6 +296,9 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         std::vector<uint8_t> nv12;
         auto lastSend = std::chrono::steady_clock::now();
         auto lastChange = std::chrono::steady_clock::now() - std::chrono::milliseconds(kActiveTailMs);
+        // A drop is "pending" until something goes out again. Guards the replay
+        // below against re-arming itself on every failed attempt.
+        bool dropPending = false;
 
         while (running && !stopRequested_) {
             std::vector<EncodedFrame> encoded;
@@ -347,6 +350,28 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                 // so the next frame we do send resyncs the decoder.
                 if (!conn->WaitWritable(kSendTimeoutMs)) {
                     encoder.RequestKeyFrame();
+                    // A dropped frame leaves the receiver on the previous
+                    // image, and Desktop Duplication delivers nothing new once
+                    // the desktop goes static, so the correction would wait for
+                    // the keepalive — up to a second. Count the drop as a
+                    // change: the active tail re-feeds the last captured buffer
+                    // right away, no second timer needed (upstream does the
+                    // same with a dedicated 30ms replay timer, see #207).
+                    //
+                    // Only for the *first* drop of an episode. Re-arming on
+                    // every failed attempt would keep `active` true for as long
+                    // as the link stays congested, burning an encode per
+                    // WaitWritable timeout on frames nobody can receive. One
+                    // prompt replay, then fall back to the keepalive until the
+                    // socket drains.
+                    if (!dropPending) {
+                        lastChange = std::chrono::steady_clock::now();
+                        dropPending = true;
+                        // Once per episode, not per dropped frame: on a link
+                        // that stays congested this would otherwise be the
+                        // loudest line in the log.
+                        printf("send backpressure, dropped a frame\n");
+                    }
                     break;
                 }
                 if (!conn->SendFrame(f.annexB.data(), static_cast<uint32_t>(f.annexB.size()))) {
@@ -357,6 +382,7 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                     break;
                 }
                 sentSomething = true;
+                dropPending = false;
                 if (f.isKeyFrame)
                     printf("sent keyframe, %zu bytes\n", f.annexB.size());
             }

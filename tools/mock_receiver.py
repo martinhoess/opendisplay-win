@@ -21,6 +21,14 @@ Usage:
                                   [--width 2388] [--height 1668]
                                   [--send-kf-after N] [--dump-h264 out.h264]
                                   [--pencil-stroke] [--pencil-repeat SECONDS]
+                                  [--stall-after N] [--stall-secs SECONDS]
+
+--stall-after exercises the send-backpressure path: after N video frames the
+mock stops reading (while still requesting keyframes, the only payload big
+enough to back up the socket on a static desktop), so the sender's WaitWritable
+budget expires and it drops a frame. The mock can only confirm the connection
+survives and video resumes; that the drop actually happened is visible on the
+sender side, which logs "send backpressure, dropped a frame" once per episode.
 """
 import argparse
 import json
@@ -115,6 +123,11 @@ def validate_annexb_frame(payload: bytes) -> list:
                 )
 
     return problems
+
+
+def is_keyframe(payload: bytes) -> bool:
+    return any(payload[o + c] & 0x1F == 5
+               for o, c in find_start_codes(payload) if o + c < len(payload))
 
 
 def send_control(sock: socket.socket, **fields) -> None:
@@ -217,10 +230,20 @@ def main() -> int:
                     help="play a scripted Apple Pencil stroke once the sender sent its welcome")
     ap.add_argument("--pencil-repeat", type=float, default=0.0,
                     help="replay that stroke every N seconds (0 = play it once)")
+    ap.add_argument("--stall-after", type=int, default=0,
+                    help="after N video frames, stop reading for --stall-secs so the sender "
+                         "runs into send backpressure and drops a frame (0 = never)")
+    ap.add_argument("--stall-secs", type=float, default=3.0,
+                    help="how long --stall-after stops reading")
     args = ap.parse_args()
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if args.stall_after:
+        # Inherited by the accepted socket. A small receive window is what makes
+        # the sender's socket fill within the stall instead of swallowing
+        # several seconds of frames in kernel buffers.
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8192)
     srv.bind((args.host, args.port))
     srv.listen(1)
     print(f"[mock] listening on {args.host}:{args.port}")
@@ -246,6 +269,8 @@ def main() -> int:
     dump = open(args.dump_h264, "wb") if args.dump_h264 else None
     video_frames = 0
     control_frames = 0
+    stalled_at = None
+    stall_frame = 0
 
     try:
         while True:
@@ -264,12 +289,40 @@ def main() -> int:
             status = "OK" if not problems else "PROBLEMS: " + "; ".join(problems)
             print(f"[mock] video frame #{video_frames}: {len(payload)} bytes - {status}")
 
+            if stalled_at is not None and is_keyframe(payload):
+                # Deliberately not a latency measurement: reads resume into a
+                # backlog, so this keyframe may well be one the sender queued
+                # *during* the stall rather than its post-drop resync. All this
+                # asserts is that the connection came through the stall intact
+                # and video is flowing again. Whether the sender actually hit
+                # the drop path is only visible on its side - it logs
+                # "send backpressure, dropped a frame" once per episode.
+                gap = time.monotonic() - stalled_at
+                print(f"[mock] recovered after the stall: keyframe {gap * 1000:.0f}ms in, "
+                      f"{video_frames - stall_frame} frame(s) read - OK")
+                stalled_at = None
+
             if dump:
                 dump.write(payload)
 
             if args.send_kf_after and video_frames == args.send_kf_after:
                 send_frame(conn, b'{"type":"kf"}')
                 print("[mock] sent kf request")
+
+            if args.stall_after and video_frames == args.stall_after:
+                print(f"[mock] stalling {args.stall_secs}s - not reading, sender should "
+                      f"hit WaitWritable timeout and drop a frame")
+                deadline = time.monotonic() + args.stall_secs
+                while time.monotonic() < deadline:
+                    # Keep *writing* while refusing to read. On a static desktop
+                    # the sender only emits tiny keepalive P-frames, which never
+                    # fill a socket; requested keyframes are the only payload
+                    # big enough to back the connection up within seconds.
+                    send_frame(conn, b'{"type":"kf"}')
+                    time.sleep(0.1)
+                stalled_at = time.monotonic()
+                stall_frame = video_frames
+                print("[mock] resuming reads")
 
             if args.max_frames and video_frames >= args.max_frames:
                 print("[mock] reached --max-frames, closing")
