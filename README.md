@@ -7,7 +7,8 @@ reimplements that sender side for Windows and speaks the iPad's exact wire
 protocol, so the iOS app needs no changes.
 
 > **Status: proof-of-concept / prototype.** It works end to end — real desktop
-> on the iPad, touch and scroll driving the mouse, live cursor — but it is a
+> on the iPad, touch and scroll driving the mouse, Apple Pencil with pressure
+> and tilt, live cursor — but it is a
 > single-purpose spike, not a polished product: WiFi only, one iPad, manual IP
 > entry, hardcoded stream settings, a minimal tray UI. Expect rough edges.
 
@@ -29,29 +30,84 @@ The iPad app listens on TCP port 9000; the Windows sender connects to it and:
    idle desktop drops to ~1 keepalive frame/second).
 5. **Input** — the iPad's touch and scroll events come back on the same
    connection and are injected as mouse input with `SendInput`, mapped onto the
-   virtual monitor's rectangle.
+   virtual monitor's rectangle. Apple Pencil is injected separately, as a real
+   Windows pen pointer (`InjectSyntheticPointerInput`) carrying pressure, tilt
+   and hover, so pressure-aware apps see a pen rather than a mouse.
 
 It reconnects on its own if the iPad app is closed/reopened or the link drops,
 and rebuilds the pipeline if the iPad rotates (the panel dimensions change).
 
 ### Deliberately out of scope
 
-USB (usbmuxd), mDNS/Bonjour discovery, pen/pressure input, H.265, audio, and
-multiple simultaneous iPads. H.264 is required — the iPad receiver is
-hardcoded to it.
+USB (usbmuxd), mDNS/Bonjour discovery, H.265, audio, and multiple simultaneous
+iPads. H.264 is required — the iPad receiver is hardcoded to it.
 
-## Prerequisites
+## Install
 
-- Windows 10/11
-- Visual Studio Build Tools (Desktop C++ workload) or Visual Studio, with the
-  Windows 10/11 SDK; CMake ≥ 3.20
-- The [parsec-vdd](https://github.com/nomi-san/parsec-vdd) virtual display
-  driver, installed once (needs admin rights):
-  1. Download & run `parsec-vdd-0.45.0.0.exe` from `https://builds.parsec.app/vdd/` (silent: `/S`)
-  2. Run `"C:\Program Files\Parsec Virtual Display Driver\vddinstall.bat"` **elevated**
-     — the installer only extracts files; this script does the actual
-     `nefconw` device-node creation (`/S` alone is not enough)
-  3. Confirm "Parsec Virtual Display Adapter" appears in Device Manager
+Needs Windows 10/11 (x64) and, on the iPad, the
+[OpenDisplay](https://github.com/peetzweg/opendisplay) receiver app.
+
+### 1. Install the parsec-vdd driver
+
+This is a **separate third-party driver** and is not bundled with the release —
+without it there is no virtual monitor to capture, and the app will refuse to
+connect. Install it once, as administrator:
+
+1. Download `parsec-vdd-0.45.0.0.exe` from `https://builds.parsec.app/vdd/`
+   and run it (silent install: `/S`).
+2. Run `"C:\Program Files\Parsec Virtual Display Driver\vddinstall.bat"`
+   **elevated** — right-click → *Run as administrator*, or from an elevated
+   terminal. This step is **not optional**: the installer in step 1 only
+   extracts files, and this script does the actual `nefconw` device-node
+   creation. Running the installer with `/S` alone leaves you with a driver
+   that is present but has no device node.
+3. Verify: open Device Manager (`devmgmt.msc`) → **Display adapters** → an
+   entry named **"Parsec Virtual Display Adapter"** must be listed. If it is
+   missing, step 2 did not run elevated — repeat it.
+
+The driver stays installed and survives reboots; you never repeat this.
+
+> To remove it later: uninstall "Parsec Virtual Display Driver" via
+> *Settings → Apps*, which also drops the device node.
+
+### 2. Download opendisplay-win.exe
+
+Grab `opendisplay-win.exe` from the
+[latest release](https://github.com/martinhoess/opendisplay-win/releases/latest).
+It is a single self-contained executable — no installer, no VC++
+Redistributable, no DLLs alongside it. Put it wherever you like (it writes its
+config to `%APPDATA%`, not next to itself).
+
+**SmartScreen will warn you.** The binary is not code-signed yet, so Windows
+shows *"Windows protected your PC"* on first launch. Click **More info** →
+**Run anyway**. Signing is planned via the SignPath Foundation's free OSS
+programme (see the [ROADMAP](ROADMAP.md)) — until that comes through, every
+release is unsigned. If you would rather not trust an unsigned binary from a
+stranger on the internet: [build it from source](#build-from-source), it is two
+commands.
+
+### 3. First start
+
+Double-click the exe. It starts as a tray app (see [Run](#run)); open
+*Settings* from its right-click menu and enter the iPad's IP address.
+
+The first time you connect a **new** iPad, you get **one UAC prompt** — the app
+registers that panel's resolution as a parsec-vdd custom mode, which needs a
+single `HKLM` write. Accept it; it happens once per iPad model, never again.
+Details in [Admin rights](#admin-rights) below.
+
+**Expect leftover monitors in Device Manager.** parsec-vdd mints a fresh
+monitor identity on every add and leaves the device node behind when the app
+exits, so roughly one phantom "Parsec Virtual Display" piles up per run. They
+are harmless but they accumulate; clear them out now and then with
+
+```
+opendisplay-win.exe --cleanup-monitors
+```
+
+This is deliberately not automatic — removing devices from inside the runtime
+path is too invasive. See the [ROADMAP](ROADMAP.md) for why an own driver would
+remove the cause.
 
 ### Admin rights
 
@@ -75,14 +131,25 @@ higher-integrity windows (UIPI).
 Because the app is un-elevated, autostart is just a per-user Run entry — toggle
 **Start with Windows** in Settings (no scheduled task, no logon UAC).
 
-## Build
+## Build from source
+
+Needs Visual Studio Build Tools (Desktop C++ workload) or Visual Studio with
+the Windows 10/11 SDK, and CMake ≥ 3.20. The parsec-vdd driver from
+[Install](#1-install-the-parsec-vdd-driver) is required to *run* it, not to
+build it.
 
 ```
 cmake -S . -B build -G "Visual Studio 18 2026"
 cmake --build build --config Release
 ```
 
+The result is `build\Release\opendisplay-win.exe`, statically linked against
+the CRT — the same single-file binary the releases ship.
+
 ## Run
+
+The commands below spell out the build-tree path; if you downloaded the release
+binary, substitute wherever you put `opendisplay-win.exe`.
 
 Launched **without arguments** it runs as a **tray app**: a notification-area
 icon whose status dot is green when connected, red when configured but not, grey

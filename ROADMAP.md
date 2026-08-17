@@ -104,8 +104,7 @@ component-mapping, some ours:
 - **Clock-sync / latency overlay** — the telemetry prefix + `pong` reply we
   currently skip would light up the iPad's latency overlay. Nice-to-have.
 - **Smaller items** — bitrate/fps/resolution as GUI settings + adaptive bitrate;
-  GPU device-lost / display-sleep / multi-GPU robustness; auto-update;
-  Apple Pencil pressure (currently mouse-only).
+  GPU device-lost / display-sleep / multi-GPU robustness; auto-update.
 
 ## Known issues & smaller open items
 
