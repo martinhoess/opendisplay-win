@@ -299,6 +299,10 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         // A drop is "pending" until something goes out again. Guards the replay
         // below against re-arming itself on every failed attempt.
         bool dropPending = false;
+        // Set when the monitor rect couldn't be read right after a geometry
+        // change (the desktop can still be mid-reconfigure); retried below
+        // until it succeeds, because nothing else refreshes it in place.
+        bool rectStale = false;
 
         while (running && !stopRequested_) {
             std::vector<EncodedFrame> encoded;
@@ -321,13 +325,21 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                 // encoder would keep the old geometry and read the new frame
                 // with the wrong stride — a skewed picture on the iPad while
                 // the host's own screenshot looks fine. Follow the capture.
-                if (encoder.Width() != dup.Width() || encoder.Height() != dup.Height()) {
+                //
+                // Only once a frame actually arrived: the recovery path in
+                // CaptureFrameNv12 reopens the duplication and takes fresh
+                // dimensions from the ModeDesc while returning false, so
+                // dup.Width()/Height() can already describe the new geometry
+                // while nv12 still holds the previous frame. Reconfiguring on
+                // that would encode the old buffer with the new stride — one
+                // skewed frame, exactly what this is here to prevent.
+                if (changed && (encoder.Width() != dup.Width() || encoder.Height() != dup.Height())) {
                     printf("capture is now %ux%u (encoder had %ux%u), reconfiguring\n", dup.Width(), dup.Height(),
                            encoder.Width(), encoder.Height());
                     if (encoder.Configure(dup.Width(), dup.Height(), kFps, kBitrateBps)) {
                         // The cached rect is only refreshed when the monitor
                         // moves, and a rotation in place doesn't move it.
-                        vdisp.QueryMonitorRect();
+                        rectStale = !vdisp.QueryMonitorRect();
                         input.SetMonitorRect(vdisp.MonitorRect());
                         encoder.RequestKeyFrame();
                         width_ = dup.Width();
@@ -336,6 +348,12 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                         fprintf(stderr, "encoder reconfigure failed, dropping the connection\n");
                         running = false;
                     }
+                } else if (rectStale && vdisp.QueryMonitorRect()) {
+                    // The desktop was still mid-reconfigure above. Without this
+                    // retry the touch mapping would stay on the old geometry
+                    // until the monitor is moved or the pipeline rebuilt.
+                    input.SetMonitorRect(vdisp.MonitorRect());
+                    rectStale = false;
                 }
 
                 auto now = std::chrono::steady_clock::now();

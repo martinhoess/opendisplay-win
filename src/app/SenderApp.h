@@ -37,7 +37,7 @@ public:
 
     bool IsRunning() const { return running_.load(); }
     State GetState() const { return state_.load(); }
-    uint32_t Width() const { return width_.load(); }   // panel px from last hello, 0 until connected
+    uint32_t Width() const { return width_.load(); }   // current capture px, 0 until connected
     uint32_t Height() const { return height_.load(); }
 
 private:
