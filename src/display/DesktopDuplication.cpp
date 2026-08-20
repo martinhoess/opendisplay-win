@@ -206,6 +206,16 @@ bool DesktopDuplication::CaptureFrameNv12(std::vector<uint8_t>& nv12, int timeou
     const uint32_t frameW = desc.Width;
     const uint32_t frameH = desc.Height;
 
+    // A rotation or resolution change triggered on the Windows side arrives
+    // here as a frame with new dimensions and nothing else announcing it.
+    // Follow it: the staging texture must match the source for CopyResource,
+    // and callers size their encoder off Width()/Height().
+    if (frameW != width_ || frameH != height_) {
+        width_ = frameW;
+        height_ = frameH;
+        staging_.Reset();
+    }
+
     if (!staging_) {
         D3D11_TEXTURE2D_DESC stagingDesc = desc;
         stagingDesc.Usage = D3D11_USAGE_STAGING;

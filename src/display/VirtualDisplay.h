@@ -41,6 +41,12 @@ public:
     // monitor, so callers (e.g. input mapping) can pick up live moves.
     RECT MonitorRect() const;
 
+    // Re-reads the rect from Windows. The keepalive poll only refreshes it when
+    // the monitor *moves*, so a rotation in place leaves the cached rect at the
+    // old geometry — call this after a Windows-side rotation before handing the
+    // rect to the input mapping.
+    bool QueryMonitorRect();
+
     // GDI device name (e.g. L"\\.\DISPLAY3") of the virtual monitor, needed
     // by DesktopDuplication to pick the matching IDXGIOutput.
     const std::wstring& DeviceName() const { return deviceName_; }
@@ -61,7 +67,6 @@ public:
 private:
     bool SelfElevateRegister(uint32_t width, uint32_t height);
     bool FindMonitorGeometry();
-    bool QueryMonitorRect();
     void KeepAliveLoop();
 
     // Persist the monitor's desktop position ourselves (HKCU): the parsec-vdd

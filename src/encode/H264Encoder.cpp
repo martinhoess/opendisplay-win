@@ -375,4 +375,14 @@ bool H264Encoder::IsConfigured() const
     return impl_->configured;
 }
 
+uint32_t H264Encoder::Width() const
+{
+    return impl_->width;
+}
+
+uint32_t H264Encoder::Height() const
+{
+    return impl_->height;
+}
+
 } // namespace od

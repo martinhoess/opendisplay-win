@@ -316,6 +316,28 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                 // screen or cursor changed since last time).
                 bool changed = dup.CaptureFrameNv12(nv12, 1000 / static_cast<int>(kFps));
 
+                // Rotation or a resolution change made on the Windows side
+                // never sends a `hello`, so nothing rebuilds the pipeline: the
+                // encoder would keep the old geometry and read the new frame
+                // with the wrong stride — a skewed picture on the iPad while
+                // the host's own screenshot looks fine. Follow the capture.
+                if (encoder.Width() != dup.Width() || encoder.Height() != dup.Height()) {
+                    printf("capture is now %ux%u (encoder had %ux%u), reconfiguring\n", dup.Width(), dup.Height(),
+                           encoder.Width(), encoder.Height());
+                    if (encoder.Configure(dup.Width(), dup.Height(), kFps, kBitrateBps)) {
+                        // The cached rect is only refreshed when the monitor
+                        // moves, and a rotation in place doesn't move it.
+                        vdisp.QueryMonitorRect();
+                        input.SetMonitorRect(vdisp.MonitorRect());
+                        encoder.RequestKeyFrame();
+                        width_ = dup.Width();
+                        height_ = dup.Height();
+                    } else {
+                        fprintf(stderr, "encoder reconfigure failed, dropping the connection\n");
+                        running = false;
+                    }
+                }
+
                 auto now = std::chrono::steady_clock::now();
                 if (changed)
                     lastChange = now;
@@ -338,7 +360,7 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                 // connection survives until real content arrives.
                 bool keepaliveDue = now - lastSend >= std::chrono::milliseconds(kKeepaliveMs);
 
-                if (active || keepaliveDue)
+                if (running && (active || keepaliveDue))
                     encoded = encoder.EncodeNv12(nv12.data(), nv12.size());
             }
 

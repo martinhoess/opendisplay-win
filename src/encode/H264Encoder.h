@@ -38,6 +38,12 @@ public:
 
     bool IsConfigured() const;
 
+    // The geometry the encoder is currently configured for. The capture side
+    // compares against these to notice a rotation/resolution change that came
+    // from Windows instead of from the receiver's `hello`.
+    uint32_t Width() const;
+    uint32_t Height() const;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
