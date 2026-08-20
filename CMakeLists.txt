@@ -17,11 +17,13 @@ add_executable(opendisplay-win
   src/main.cpp
   src/net/Connection.cpp
   src/net/Protocol.cpp
+  src/net/Mdns.cpp
   src/encode/AnnexB.cpp
   src/encode/H264Encoder.cpp
   src/display/VirtualDisplay.cpp
   src/display/DesktopDuplication.cpp
   src/input/InputInjector.cpp
+  src/app/Log.cpp
   src/app/SenderApp.cpp
   src/app/Config.cpp
   src/app/TrayApp.cpp

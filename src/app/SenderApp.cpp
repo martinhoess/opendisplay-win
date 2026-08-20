@@ -1,10 +1,13 @@
 #include "app/SenderApp.h"
 
+#include "app/Log.h"
+
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <mutex>
 #include <thread>
+#include <utility>
 
 #include <winsock2.h>
 
@@ -25,6 +28,84 @@ constexpr int kSendTimeoutMs = 500;      // backpressure: how long to wait for t
 constexpr int kReconnectDelayMs = 2000;
 constexpr int kKeepaliveMs = 1000;       // max silence on a static screen; well under the iPad's ~5s watchdog
 constexpr int kActiveTailMs = 300;       // keep feeding the encoder this long after the last change (drains its 1-frame hold)
+constexpr int kWrongSizeGraceMs = 3000;  // how long the monitor may sit on a foreign size before we rebuild it
+constexpr int kBlockedRetryMs = 5000;    // how often a waiting iPad checks whether the display is free again
+
+// Only one panel size may be on the air at a time.
+//
+// parsec-vdd puts a single custom resolution on all of its virtual monitors:
+// whichever sender sets its size last drags every other monitor along, and
+// those iPads then show a letterboxed desktop at the wrong aspect. Rather than
+// serve a wrong-shaped picture, iPads of the same panel size run together and
+// a different one waits until the display is free again.
+//
+// Process-wide, because the tray drives every sender. A headless CLI sender
+// started next to the tray is outside this and can still take the mode with
+// it — that path is for testing.
+struct PanelState {
+    std::mutex mutex;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    int holders = 0;
+};
+
+PanelState& Panel()
+{
+    static PanelState state;
+    return state;
+}
+
+// Takes a share of the display for w x h. Returns false when a different size
+// holds it, and then reports that size in activeW/activeH.
+bool AcquirePanel(uint32_t w, uint32_t h, uint32_t& activeW, uint32_t& activeH)
+{
+    PanelState& panel = Panel();
+    std::lock_guard<std::mutex> lock(panel.mutex);
+    if (panel.holders > 0 && (panel.width != w || panel.height != h)) {
+        activeW = panel.width;
+        activeH = panel.height;
+        return false;
+    }
+    panel.width = w;
+    panel.height = h;
+    ++panel.holders;
+    return true;
+}
+
+void ReleasePanel()
+{
+    PanelState& panel = Panel();
+    std::lock_guard<std::mutex> lock(panel.mutex);
+    if (--panel.holders <= 0) {
+        panel.holders = 0;
+        panel.width = 0;
+        panel.height = 0;
+    }
+}
+
+// Rotation: the panel is the same device, just turned. Only the sole holder
+// may change the size under the claim — with another iPad attached the two
+// would fight over the one custom resolution again.
+bool RetunePanel(uint32_t w, uint32_t h)
+{
+    PanelState& panel = Panel();
+    std::lock_guard<std::mutex> lock(panel.mutex);
+    if (panel.holders > 1)
+        return false;
+    panel.width = w;
+    panel.height = h;
+    return true;
+}
+
+// Releases the claim when the connection ends, whichever way it ends.
+struct PanelHolder {
+    bool held = false;
+    ~PanelHolder()
+    {
+        if (held)
+            ReleasePanel();
+    }
+};
 
 uint32_t EvenClamp(int32_t v, uint32_t fallback)
 {
@@ -94,7 +175,7 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         lockName += (c == '.' || c == ':') ? L'_' : static_cast<wchar_t>(c);
     HANDLE ipLock = CreateMutexW(nullptr, FALSE, lockName.c_str());
     if (ipLock != nullptr && GetLastError() == ERROR_ALREADY_EXISTS) {
-        fprintf(stderr, "another opendisplay-win is already connected to %s\n", ip.c_str());
+        Logf(ip, "another opendisplay-win is already connected to this iPad\n");
         CloseHandle(ipLock);
         state_ = State::Idle;
         return;
@@ -111,10 +192,14 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
     InputInjector input;
     std::mutex pipelineMutex;
 
+    // Keeps this sender's monitor position separate from the other iPads' —
+    // several senders share one HKCU key.
+    vdisp.SetIdentity(ip);
+
     auto buildPipeline = [&](uint32_t width, uint32_t height) {
         // Caller holds pipelineMutex.
         if (!vdisp.IsOpen() && !vdisp.Open()) {
-            fprintf(stderr, "VirtualDisplay::Open failed (parsec-vdd driver missing/inaccessible?)\n");
+            Logf(ip, "VirtualDisplay::Open failed (parsec-vdd driver missing/inaccessible?)\n");
             return false;
         }
         // Release the capture BEFORE touching the monitor. On a rotation rebuild
@@ -125,19 +210,19 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         // no duplication ever references a monitor that's being replaced.
         dup.Close();
         if (!vdisp.EnsureResolution(width, height, kFps)) {
-            fprintf(stderr, "VirtualDisplay::EnsureResolution failed (run as Administrator?)\n");
+            Logf(ip, "VirtualDisplay::EnsureResolution failed (run as Administrator?)\n");
             return false;
         }
         if (!dup.Open(vdisp.DeviceName())) {
-            fprintf(stderr, "DesktopDuplication::Open failed\n");
+            Logf(ip, "DesktopDuplication::Open failed\n");
             return false;
         }
         if (!encoder.Configure(dup.Width(), dup.Height(), kFps, kBitrateBps)) {
-            fprintf(stderr, "encoder configure failed\n");
+            Logf(ip, "encoder configure failed\n");
             return false;
         }
         input.SetMonitorRect(vdisp.MonitorRect());
-        printf("pipeline ready: %ux%u\n", dup.Width(), dup.Height());
+        Logf(ip, "pipeline ready: %ux%u\n", dup.Width(), dup.Height());
         return true;
     };
 
@@ -158,17 +243,24 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         }
     };
 
+    bool blockedLogged = false; // the wait message belongs in the log once, not every retry
+
     while (!stopRequested_) {
-        state_ = State::Connecting;
-        printf("connecting to %s:%u ...\n", ip.c_str(), port);
+        // A blocked sender keeps checking back every few seconds; flipping it to
+        // Connecting for each of those attempts would make the tray entry
+        // alternate between "waiting for 2732x2048" and "connecting..." while
+        // nothing about its situation changed.
+        if (state_ != State::Blocked)
+            state_ = State::Connecting;
+        Logf(ip, "connecting to port %u ...\n", port);
         auto conn = Connection::Connect(ip, port);
         if (!conn) {
-            fprintf(stderr, "connect failed, retrying in %dms\n", kReconnectDelayMs);
+            Logf(ip, "connect failed, retrying in %dms\n", kReconnectDelayMs);
             InterruptibleSleep(kReconnectDelayMs);
             continue;
         }
         ActiveConn activeConn(this, &*conn);
-        printf("connected, waiting for hello...\n");
+        Logf(ip, "connected, waiting for hello...\n");
 
         HelloMsg hello;
         bool gotHello = false;
@@ -195,11 +287,37 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         // its frames would interleave with the video the capture loop sends.
         static constexpr char kWelcome[] = "{\"type\":\"welcome\",\"pv\":3,\"min\":1}";
         bool welcomeSent = conn->SendFrame(reinterpret_cast<const uint8_t*>(kWelcome), sizeof(kWelcome) - 1);
-        printf("welcome sent: %s\n", welcomeSent ? "yes" : "FAILED");
+        Logf(ip, "welcome sent: %s\n", welcomeSent ? "yes" : "FAILED");
 
         uint32_t width = EvenClamp(hello.pixelsWide, 1920);
         uint32_t height = EvenClamp(hello.pixelsHigh, 1080);
-        printf("hello: %dx%d -> %ux%u\n", hello.pixelsWide, hello.pixelsHigh, width, height);
+        Logf(ip, "hello: %dx%d -> %ux%u\n", hello.pixelsWide, hello.pixelsHigh, width, height);
+
+        // Only iPads of the panel size that is already on the air may join (see
+        // AcquirePanel). A different one hangs up and keeps checking back, so
+        // it starts by itself once the other iPad disconnects.
+        PanelHolder panel;
+        uint32_t activeWidth = 0, activeHeight = 0;
+        panel.held = AcquirePanel(width, height, activeWidth, activeHeight);
+        if (!panel.held) {
+            blockedByWidth_ = activeWidth;
+            blockedByHeight_ = activeHeight;
+            state_ = State::Blocked;
+            // Once per episode, not on every check: this comes back every few
+            // seconds for as long as the other iPad streams.
+            if (!blockedLogged) {
+                blockedLogged = true;
+                Logf(ip, "waiting: an iPad with a %ux%u panel is streaming and this one is %ux%u — parsec-vdd only "
+                         "holds one custom resolution at a time\n",
+                     activeWidth, activeHeight, width, height);
+            }
+            conn->Close();
+            InterruptibleSleep(kBlockedRetryMs);
+            continue;
+        }
+        blockedByWidth_ = 0;
+        blockedByHeight_ = 0;
+        blockedLogged = false;
 
         bool pipelineOk;
         {
@@ -234,22 +352,37 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
 
                 switch (msg->type) {
                     case ControlType::Kf:
-                        printf("kf requested by receiver\n");
+                        Logf(ip, "kf requested by receiver\n");
                         encoder.RequestKeyFrame();
                         break;
                     case ControlType::Hello: {
                         // Rotation (or any panel-size change): rebuild the
-                        // whole pipeline for the new dimensions.
+                        // whole pipeline for the new dimensions. Everything
+                        // that reads or writes `width`/`height` does so under
+                        // pipelineMutex — the capture loop compares the
+                        // monitor against them (see the panel-size watchdog).
+                        std::lock_guard<std::mutex> lock(pipelineMutex);
                         uint32_t w = EvenClamp(msg->hello.pixelsWide, width);
                         uint32_t h = EvenClamp(msg->hello.pixelsHigh, height);
-                        printf("hello again: %dx%d -> rebuilding pipeline at %ux%u\n", msg->hello.pixelsWide,
+                        Logf(ip, "hello again: %dx%d -> rebuilding pipeline at %ux%u\n", msg->hello.pixelsWide,
                                msg->hello.pixelsHigh, w, h);
-                        std::lock_guard<std::mutex> lock(pipelineMutex);
+                        // Turning the iPad changes the size under the claim.
+                        // Alone that's fine; with another iPad attached the two
+                        // would be back to fighting over the one custom
+                        // resolution the driver has, so say so and carry on —
+                        // hanging up on the user for turning their iPad would
+                        // be worse.
+                        if (!RetunePanel(w, h))
+                            Logf(ip, "rotating while another iPad is attached — its picture may end up "
+                                     "letterboxed until one of you reconnects\n");
+
                         if (buildPipeline(w, h)) {
+                            width = w;
+                            height = h;
                             width_ = w;
                             height_ = h;
                         } else {
-                            fprintf(stderr, "pipeline rebuild failed, disconnecting\n");
+                            Logf(ip, "pipeline rebuild failed, disconnecting\n");
                             running = false;
                         }
                         break;
@@ -278,7 +411,7 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                             // Proof the version handshake landed: without our
                             // `welcome` the iPad would send `touch` here.
                             loggedPencil = true;
-                            printf("pencil input active (receiver honoured welcome pv=3)\n");
+                            Logf(ip, "pencil input active (receiver honoured welcome pv=3)\n");
                         }
                         input.SetMonitorRect(vdisp.MonitorRect());
                         input.HandlePencil(msg->pencil);
@@ -303,6 +436,13 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         // change (the desktop can still be mid-reconfigure); retried below
         // until it succeeds, because nothing else refreshes it in place.
         bool rectStale = false;
+
+        // Watchdog for the panel size (see the check further down): when the
+        // monitor is left on a size that isn't this iPad's, this is when it
+        // started, and how many rebuilds we already spent on it.
+        std::chrono::steady_clock::time_point wrongSizeSince{};
+        bool sizeRebuildDone = false;
+        bool sizeGiveUpLogged = false;
 
         while (running && !stopRequested_) {
             std::vector<EncodedFrame> encoded;
@@ -334,7 +474,7 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                 // that would encode the old buffer with the new stride — one
                 // skewed frame, exactly what this is here to prevent.
                 if (changed && (encoder.Width() != dup.Width() || encoder.Height() != dup.Height())) {
-                    printf("capture is now %ux%u (encoder had %ux%u), reconfiguring\n", dup.Width(), dup.Height(),
+                    Logf(ip, "capture is now %ux%u (encoder had %ux%u), reconfiguring\n", dup.Width(), dup.Height(),
                            encoder.Width(), encoder.Height());
                     if (encoder.Configure(dup.Width(), dup.Height(), kFps, kBitrateBps)) {
                         // The cached rect is only refreshed when the monitor
@@ -345,7 +485,7 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                         width_ = dup.Width();
                         height_ = dup.Height();
                     } else {
-                        fprintf(stderr, "encoder reconfigure failed, dropping the connection\n");
+                        Logf(ip, "encoder reconfigure failed, dropping the connection\n");
                         running = false;
                     }
                 } else if (rectStale && vdisp.QueryMonitorRect()) {
@@ -357,6 +497,59 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                 }
 
                 auto now = std::chrono::steady_clock::now();
+
+                // Adding or removing *any* parsec virtual display resets the
+                // mode of *every* parsec monitor; Windows then restores each
+                // one from what it last persisted for that display path. With
+                // two iPads the paths get swapped around, so a neighbour
+                // connecting can leave this monitor on the other iPad's size —
+                // the picture then arrives letterboxed on this panel. The
+                // reconfigure above keeps it correct but wrong-shaped, so once
+                // the churn has settled, put our own size back.
+                //
+                // Only when the size is neither the panel's nor the panel
+                // rotated: a rotation made in Windows is the user's decision
+                // and is adopted, not undone.
+                if (dup.Width() == height && dup.Height() == width) {
+                    std::swap(width, height); // rotated in Windows: that is the panel size now
+                }
+                // Exactly one attempt, and only after the churn has settled. A
+                // rebuild resets every parsec monitor in turn, so retrying is
+                // how two senders end up trading rebuilds forever — and a
+                // second attempt can't help anyway: either Windows had merely
+                // restored a stale mode for this display path (the rebuild
+                // fixes that), or another sender's panel size is in force, and
+                // then no amount of rebuilding wins (see the note below).
+                if (dup.Width() == width && dup.Height() == height) {
+                    wrongSizeSince = {};
+                    sizeRebuildDone = false;
+                } else if (wrongSizeSince == std::chrono::steady_clock::time_point{}) {
+                    wrongSizeSince = now;
+                } else if (!sizeRebuildDone &&
+                           now - wrongSizeSince > std::chrono::milliseconds(kWrongSizeGraceMs)) {
+                    // A remove + re-add is what gets the panel size back;
+                    // re-applying the mode on the live monitor is refused
+                    // (DISP_CHANGE_BADMODE) while the capture runs.
+                    sizeRebuildDone = true;
+                    Logf(ip, "monitor sits at %ux%u instead of %ux%u, rebuilding once\n", dup.Width(), dup.Height(),
+                         width, height);
+                    if (!buildPipeline(width, height))
+                        Logf(ip, "rebuild for the panel size failed, keeping what we have\n");
+                    else
+                        continue; // nv12 still holds the pre-rebuild frame — capture a fresh one
+                } else if (sizeRebuildDone && !sizeGiveUpLogged) {
+                    // parsec-vdd puts *one* custom resolution on all of its
+                    // virtual monitors: whichever sender sets its panel size
+                    // last drags every other monitor along. Two iPads with
+                    // different panels therefore can't both run native, and
+                    // the smaller one shows the picture letterboxed. Said once
+                    // per connection, then we stop touching the monitor.
+                    sizeGiveUpLogged = true;
+                    Logf(ip, "monitor stays at %ux%u (this iPad is %ux%u): parsec-vdd shares one custom resolution "
+                             "across all its monitors, so the picture stays letterboxed here\n",
+                         dup.Width(), dup.Height(), width, height);
+                }
+
                 if (changed)
                     lastChange = now;
 
@@ -410,7 +603,7 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                         // Once per episode, not per dropped frame: on a link
                         // that stays congested this would otherwise be the
                         // loudest line in the log.
-                        printf("send backpressure, dropped a frame\n");
+                        Logf(ip, "send backpressure, dropped a frame\n");
                     }
                     break;
                 }
@@ -424,7 +617,7 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                 sentSomething = true;
                 dropPending = false;
                 if (f.isKeyFrame)
-                    printf("sent keyframe, %zu bytes\n", f.annexB.size());
+                    Logf(ip, "sent keyframe, %zu bytes\n", f.annexB.size());
             }
             if (sentSomething)
                 lastSend = std::chrono::steady_clock::now();
@@ -436,7 +629,7 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         input.EndSession();
         width_ = 0;
         height_ = 0;
-        printf("disconnected%s\n", stopRequested_ ? "" : ", reconnecting");
+        Logf(ip, "disconnected%s\n", stopRequested_ ? "" : ", reconnecting");
     }
 
     if (ipLock != nullptr)

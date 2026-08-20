@@ -5,13 +5,17 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 
 namespace od {
 
 // Wraps the parsec-vdd driver (third_party/parsec-vdd/parsec-vdd.h) to
-// provide/manage exactly one virtual monitor sized to the iPad panel.
+// provide/manage exactly one virtual monitor sized to the iPad panel. Several
+// instances can run side by side (one per iPad): each claims the monitor its
+// own VddAddDisplay produced and keeps its own saved position, keyed by the
+// identity passed to SetIdentity.
 //
 // Needs admin rights (custom-resolution registry lives under HKLM, verified
 // non-writable without elevation — see CMakeLists' /MANIFESTUAC flag).
@@ -28,6 +32,10 @@ public:
     // isn't installed/accessible.
     bool Open();
     void Close();
+
+    // Names this display's owner (the iPad's address) so its desktop position
+    // is saved per iPad rather than shared. Call before EnsureResolution.
+    void SetIdentity(const std::string& id);
 
     // Registers width x height @ hz as the custom-resolution slot, then
     // (re)adds the virtual display and attaches/resizes it to exactly that
@@ -59,6 +67,14 @@ public:
     // the ROADMAP). Needs admin.
     static int CleanupGhostMonitors();
 
+    // Unplugs the virtual display at `index` (0..VDD_MAX_DISPLAYS-1) through a
+    // fresh driver handle. Recovery for a sender that was killed instead of
+    // shut down: the driver keeps its display plugged in — attached to the
+    // desktop, not just a phantom devnode — until someone removes it by index.
+    // Indexes are driver-global, so this can unplug a *running* sender's
+    // monitor too; only run it when the sender is stopped.
+    static bool RemoveDisplayIndex(int index);
+
     // Registers a custom resolution (and its rotation) as a parsec-vdd mode so
     // the virtual monitor can use the iPad's native size. Writing needs admin;
     // used by the `--register-resolution` one-off and by the self-elevate path.
@@ -66,8 +82,12 @@ public:
 
 private:
     bool SelfElevateRegister(uint32_t width, uint32_t height);
-    bool FindMonitorGeometry();
+
+    // Claims the monitor that attached since `attachedBefore` was snapshotted
+    // (i.e. the one our VddAddDisplay produced) and places/sizes it.
+    bool FindMonitorGeometry(const std::set<std::wstring>& attachedBefore);
     void KeepAliveLoop();
+    std::wstring PositionValueName(const wchar_t* base) const;
 
     // Persist the monitor's desktop position ourselves (HKCU): the parsec-vdd
     // monitor gets a fresh identity/UID on every add, so Windows can't
@@ -90,6 +110,8 @@ private:
     // under the live capture. Locked per call only (never across the settle
     // sleeps), so the keepalive is never starved past the driver's ~10s watchdog.
     std::mutex vddMutex_;
+
+    std::string identity_; // owner id (iPad address): log tag and saved-position key
 
     uint32_t targetWidth_ = 0;
     uint32_t targetHeight_ = 0;

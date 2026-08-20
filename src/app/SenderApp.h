@@ -16,7 +16,10 @@ class Connection;
 // the headless CLI). The reconnect loop runs until stopped.
 class SenderApp {
 public:
-    enum class State { Idle, Connecting, Streaming };
+    // Blocked: an iPad with a different panel size is streaming. parsec-vdd
+    // puts one custom resolution on all of its virtual monitors, so this one
+    // would only get a letterboxed picture — it waits for the other to finish.
+    enum class State { Idle, Connecting, Streaming, Blocked };
 
     SenderApp() = default;
     ~SenderApp();
@@ -40,6 +43,11 @@ public:
     uint32_t Width() const { return width_.load(); }   // current capture px, 0 until connected
     uint32_t Height() const { return height_.load(); }
 
+    // While Blocked: the panel size currently holding the display, so the UI
+    // can name what this iPad is waiting for. Zero otherwise.
+    uint32_t BlockedByWidth() const { return blockedByWidth_.load(); }
+    uint32_t BlockedByHeight() const { return blockedByHeight_.load(); }
+
 private:
     void RunLoop(std::string ip, uint16_t port);
     void InterruptibleSleep(int ms);
@@ -50,6 +58,8 @@ private:
     std::atomic<State> state_{State::Idle};
     std::atomic<uint32_t> width_{0};
     std::atomic<uint32_t> height_{0};
+    std::atomic<uint32_t> blockedByWidth_{0};
+    std::atomic<uint32_t> blockedByHeight_{0};
 
     // Lets Stop() close the socket the worker is currently blocked on
     // (Connect's result / ReadFrame), so a stop doesn't wait for the next

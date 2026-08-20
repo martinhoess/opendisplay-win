@@ -230,6 +230,8 @@ def main() -> int:
                     help="play a scripted Apple Pencil stroke once the sender sent its welcome")
     ap.add_argument("--pencil-repeat", type=float, default=0.0,
                     help="replay that stroke every N seconds (0 = play it once)")
+    ap.add_argument("--rotate-after", type=int, default=0,
+                    help="after N video frames, send a second hello with width/height swapped")
     ap.add_argument("--stall-after", type=int, default=0,
                     help="after N video frames, stop reading for --stall-secs so the sender "
                          "runs into send backpressure and drops a frame (0 = never)")
@@ -253,10 +255,12 @@ def main() -> int:
     print(f"[mock] accepted connection from {addr}")
 
     # pv mirrors the real receiver: 3 is what unlocks pencil on the wire.
-    hello = (
-        '{"type":"hello","pixelsWide":%d,"pixelsHigh":%d,"scale":%d,'
-        '"device":"iPad","id":"mock-uuid-0000","pv":3}' % (args.width, args.height, args.scale)
-    )
+    def hello_json(w: int, h: int) -> str:
+        return ('{"type":"hello","pixelsWide":%d,"pixelsHigh":%d,"scale":%d,'
+                '"device":"iPad","id":"mock-uuid-0000","pv":3}' % (w, h, args.scale))
+
+    width, height = args.width, args.height
+    hello = hello_json(width, height)
     send_frame(conn, hello.encode("utf-8"))
     print(f"[mock] sent hello: {hello}")
 
@@ -323,6 +327,16 @@ def main() -> int:
                 stalled_at = time.monotonic()
                 stall_frame = video_frames
                 print("[mock] resuming reads")
+
+            if args.rotate_after and video_frames == args.rotate_after:
+                # What the iPad does when it is turned: a second hello with the
+                # panel dimensions swapped. The sender has to remove and re-add
+                # its virtual display for that - the path where it must claim
+                # its *own* new monitor again and leave other senders' alone.
+                width, height = height, width
+                rotated = hello_json(width, height)
+                send_frame(conn, rotated.encode("utf-8"))
+                print(f"[mock] sent rotation hello: {rotated}")
 
             if args.max_frames and video_frames >= args.max_frames:
                 print("[mock] reached --max-frames, closing")

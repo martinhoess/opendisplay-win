@@ -3,10 +3,17 @@
 #include "app/Config.h"
 #include "app/SenderApp.h"
 #include "app/resources.h"
+#include "net/Mdns.h"
 
 #include <shellapi.h>
 
+#include <atomic>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <vector>
 
 #pragma comment(lib, "shell32.lib")
 
@@ -24,19 +31,106 @@ enum : UINT {
     IDM_SETTINGS,
     IDM_RUNASADMIN,
     IDM_EXIT,
+
+    // One command per configured iPad, IDM_DEVICE_FIRST + index. Toggles that
+    // device's sender on its own, so the others keep streaming.
+    IDM_DEVICE_FIRST = 41000,
 };
 
 const wchar_t* const kWndClass = L"opendisplay-win-tray";
 
 struct TrayContext {
     HINSTANCE hInstance = nullptr;
-    SenderApp app;
+    // One sender per configured iPad, index-aligned with cfg.devices: each
+    // drives its own virtual monitor, capture, encoder and input injection.
+    // unique_ptr because SenderApp owns a thread and can't be moved.
+    std::vector<std::unique_ptr<SenderApp>> apps;
     Config cfg;
     NOTIFYICONDATAW nid{};
-    HICON iconGreen = nullptr; // streaming
-    HICON iconRed = nullptr;   // configured but not connected
+    HICON iconGreen = nullptr; // at least one iPad streaming
+    HICON iconRed = nullptr;   // configured but nothing streaming
     HICON iconGrey = nullptr;  // no iPad configured
+
+    // Names the iPads advertise over Bonjour, keyed by address — filled by a
+    // background browse, because a lookup takes a moment and the menu must not
+    // wait for it.
+    mutable std::mutex discoveredMutex;
+    std::map<std::string, std::string> discovered;
+    std::thread discovery;
+    std::atomic<bool> discoveryRunning{false};
 };
+
+// Rebuilds the sender list to match cfg.devices, stopping every running sender
+// first. Called after the device list changed — a live stream survives only the
+// settings changes that leave the list alone (see IDM_SETTINGS).
+void RebuildSenders(TrayContext* ctx)
+{
+    for (auto& app : ctx->apps)
+        app->Stop();
+    ctx->apps.clear();
+    for (size_t i = 0; i < ctx->cfg.devices.size(); ++i)
+        ctx->apps.push_back(std::make_unique<SenderApp>());
+}
+
+// The label an iPad publishes for itself. Its Bonjour instance name is what the
+// app's settings call the name — but that field falls back to the system name,
+// and iOS hands out a plain "iPad" there, so a generic instance name is passed
+// over for the host name (the iOS device name, e.g. "iPad-Pro.local").
+std::string ReceiverLabel(const MdnsReceiver& receiver)
+{
+    bool generic = receiver.instance.empty() || receiver.instance == "iPad" || receiver.instance == "iPhone" ||
+                   receiver.instance == "OpenDisplay";
+    if (!generic)
+        return receiver.instance;
+
+    std::string host = receiver.host;
+    const std::string suffix = ".local";
+    if (host.size() > suffix.size() && host.compare(host.size() - suffix.size(), suffix.size(), suffix) == 0)
+        host.resize(host.size() - suffix.size());
+    return host.empty() ? receiver.instance : host;
+}
+
+// Refreshes the advertised names in the background. Browsing takes a moment and
+// names change rarely, so once a minute is plenty; the first pass runs
+// immediately so the menu has names shortly after launch.
+void RunDiscovery(TrayContext* ctx)
+{
+    constexpr int kBrowseMs = 800;
+    constexpr int kPauseMs = 60'000;
+
+    while (ctx->discoveryRunning) {
+        std::map<std::string, std::string> names;
+        for (const MdnsReceiver& receiver : BrowseReceivers(kBrowseMs))
+            names[receiver.address] = ReceiverLabel(receiver);
+
+        if (!names.empty()) {
+            std::lock_guard<std::mutex> lock(ctx->discoveredMutex);
+            // Merged, not replaced: an iPad that is asleep doesn't answer, and
+            // dropping its name would make the menu flip back to a raw address.
+            for (auto& name : names)
+                ctx->discovered[name.first] = name.second;
+        }
+
+        for (int waited = 0; waited < kPauseMs && ctx->discoveryRunning; waited += 250)
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+}
+
+bool AnyStreaming(const TrayContext* ctx)
+{
+    for (const auto& app : ctx->apps)
+        if (app->GetState() == SenderApp::State::Streaming)
+            return true;
+    return false;
+}
+
+bool AnyRunning(const TrayContext* ctx)
+{
+    for (const auto& app : ctx->apps)
+        if (app->IsRunning())
+            return true;
+    return false;
+}
 
 // Builds the tray icon at runtime (no .ico asset to ship): a little monitor
 // glyph with a coloured status dot in the top-left corner. `dotColor` is the
@@ -116,9 +210,9 @@ HICON MakeStatusIcon(COLORREF dotColor)
 
 HICON PickIcon(TrayContext* ctx)
 {
-    if (ctx->cfg.ip.empty())
+    if (ctx->cfg.devices.empty())
         return ctx->iconGrey;
-    if (ctx->app.GetState() == SenderApp::State::Streaming)
+    if (AnyStreaming(ctx))
         return ctx->iconGreen;
     return ctx->iconRed;
 }
@@ -131,6 +225,31 @@ std::wstring Widen(const std::string& s)
     std::wstring w(n, L'\0');
     MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), w.data(), n);
     return w;
+}
+
+// A configured device is "<address>[ <name>]": the iPad only ever calls itself
+// "iPad" on the wire (iOS hands out the model, not the device name) and neither
+// DNS nor mDNS resolves these addresses, so a readable label can only come from
+// the user. Everything up to the first space is the address, the rest is the
+// label; without one the address is the label.
+struct DeviceEntry {
+    std::string address;
+    std::string label;
+};
+
+DeviceEntry SplitDevice(const std::string& entry)
+{
+    size_t space = entry.find_first_of(" \t");
+    if (space == std::string::npos)
+        return {entry, entry};
+
+    std::string address = entry.substr(0, space);
+    size_t nameStart = entry.find_first_not_of(" \t", space);
+    if (nameStart == std::string::npos)
+        return {address, address};
+
+    size_t nameEnd = entry.find_last_not_of(" \t");
+    return {address, entry.substr(nameStart, nameEnd - nameStart + 1)};
 }
 
 std::string Narrow(const std::wstring& w)
@@ -189,21 +308,50 @@ void SetAutostart(bool enable)
     RegCloseKey(key);
 }
 
+// One line per iPad: "iPad-Pro 2732x2048" / "connecting..." / "off".
+// Also the menu entry's text, so both say the same thing.
+// What to call this iPad: the name the user typed in Settings wins, then the
+// one it advertises over Bonjour, and the address is the fallback.
+std::wstring DeviceLabel(const TrayContext* ctx, size_t index)
+{
+    DeviceEntry entry = SplitDevice(ctx->cfg.devices[index]);
+    if (entry.label != entry.address)
+        return Widen(entry.label);
+
+    std::lock_guard<std::mutex> lock(ctx->discoveredMutex);
+    auto discovered = ctx->discovered.find(entry.address);
+    return Widen(discovered != ctx->discovered.end() ? discovered->second : entry.address);
+}
+
+std::wstring DeviceStatusText(const TrayContext* ctx, size_t index)
+{
+    std::wstring text = DeviceLabel(ctx, index);
+    const SenderApp& app = *ctx->apps[index];
+    switch (app.GetState()) {
+        case SenderApp::State::Streaming:
+            return text + L"  " + std::to_wstring(app.Width()) + L"x" + std::to_wstring(app.Height());
+        case SenderApp::State::Connecting:
+            return text + L"  connecting...";
+        case SenderApp::State::Blocked:
+            // Only one panel size can be on the air (see AcquirePanel): name
+            // the size that holds it, otherwise "waiting" looks like a hang.
+            return text + L"  waiting for " + std::to_wstring(app.BlockedByWidth()) + L"x" +
+                   std::to_wstring(app.BlockedByHeight());
+        default:
+            return text + L"  off";
+    }
+}
+
 void UpdateStatus(TrayContext* ctx)
 {
-    std::wstring ip = Widen(ctx->cfg.ip);
-    std::wstring tip;
-    switch (ctx->app.GetState()) {
-        case SenderApp::State::Streaming:
-            tip = L"opendisplay-win - " + ip + L" (" + std::to_wstring(ctx->app.Width()) + L"x" +
-                  std::to_wstring(ctx->app.Height()) + L")";
-            break;
-        case SenderApp::State::Connecting:
-            tip = L"opendisplay-win - connecting to " + (ip.empty() ? L"?" : ip) + L"...";
-            break;
-        default:
-            tip = ip.empty() ? L"opendisplay-win - no iPad configured" : L"opendisplay-win - not connected";
-            break;
+    std::wstring tip = L"opendisplay-win";
+    if (ctx->cfg.devices.empty()) {
+        tip += L" - no iPad configured";
+    } else {
+        // The tooltip is capped at 128 characters, so with several iPads the
+        // tail may be cut — the menu carries the full list.
+        for (size_t i = 0; i < ctx->cfg.devices.size(); ++i)
+            tip += (i == 0 ? L" - " : L" | ") + DeviceStatusText(ctx, i);
     }
 
     ctx->nid.hIcon = PickIcon(ctx);
@@ -214,9 +362,9 @@ void UpdateStatus(TrayContext* ctx)
 
 void ApplyAndRestart(TrayContext* ctx)
 {
-    ctx->app.Stop();
-    if (!ctx->cfg.ip.empty())
-        ctx->app.Start(ctx->cfg.ip, ctx->cfg.port);
+    RebuildSenders(ctx);
+    for (size_t i = 0; i < ctx->apps.size(); ++i)
+        ctx->apps[i]->Start(SplitDevice(ctx->cfg.devices[i]).address, ctx->cfg.port);
     UpdateStatus(ctx);
 }
 
@@ -226,7 +374,10 @@ INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_INITDIALOG: {
             auto* cfg = reinterpret_cast<Config*>(lParam);
             SetWindowLongPtrW(dlg, GWLP_USERDATA, static_cast<LONG_PTR>(lParam));
-            SetDlgItemTextW(dlg, IDC_IP, Widen(cfg->ip).c_str());
+            std::wstring list;
+            for (const std::string& device : cfg->devices)
+                list += Widen(device) + L"\r\n"; // the edit control's line break
+            SetDlgItemTextW(dlg, IDC_IP, list.c_str());
             SetDlgItemInt(dlg, IDC_PORT, cfg->port, FALSE);
             CheckDlgButton(dlg, IDC_AUTORECONNECT, cfg->autoReconnect ? BST_CHECKED : BST_UNCHECKED);
             CheckDlgButton(dlg, IDC_AUTOSTART, IsAutostartEnabled() ? BST_CHECKED : BST_UNCHECKED);
@@ -235,9 +386,34 @@ INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_COMMAND:
             if (LOWORD(wParam) == IDOK) {
                 auto* cfg = reinterpret_cast<Config*>(GetWindowLongPtrW(dlg, GWLP_USERDATA));
-                wchar_t buf[64] = {};
+
+                // One device per line, "<address> <name>" (see SplitDevice).
+                // Blank lines and stray whitespace are dropped, and a repeated
+                // address would only produce a second sender that the per-iPad
+                // lock refuses — so drop those too, name or no name.
+                wchar_t buf[1024] = {};
                 GetDlgItemTextW(dlg, IDC_IP, buf, static_cast<int>(std::size(buf)));
-                cfg->ip = Narrow(buf);
+                cfg->devices.clear();
+                std::wstring text(buf);
+                size_t pos = 0;
+                while (pos <= text.size()) {
+                    size_t end = text.find_first_of(L"\r\n", pos);
+                    if (end == std::wstring::npos)
+                        end = text.size();
+                    std::wstring line = text.substr(pos, end - pos);
+                    size_t first = line.find_first_not_of(L" \t");
+                    size_t last = line.find_last_not_of(L" \t");
+                    if (first != std::wstring::npos) {
+                        std::string device = Narrow(line.substr(first, last - first + 1));
+                        std::string address = SplitDevice(device).address;
+                        bool known = false;
+                        for (const std::string& existing : cfg->devices)
+                            known = known || SplitDevice(existing).address == address;
+                        if (!known)
+                            cfg->devices.push_back(device);
+                    }
+                    pos = end + 1;
+                }
                 BOOL ok = FALSE;
                 UINT port = GetDlgItemInt(dlg, IDC_PORT, &ok, FALSE);
                 if (ok && port > 0 && port <= 65535)
@@ -259,10 +435,25 @@ INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lPara
 void ShowContextMenu(HWND hwnd, TrayContext* ctx)
 {
     HMENU menu = CreatePopupMenu();
-    if (ctx->app.IsRunning()) {
-        AppendMenuW(menu, MF_STRING, IDM_DISCONNECT, L"Disconnect");
+
+    // One checkable entry per iPad: click toggles just that one, so the others
+    // keep streaming.
+    bool several = ctx->cfg.devices.size() > 1;
+    for (size_t i = 0; i < ctx->cfg.devices.size(); ++i) {
+        // Checked follows the *state*, not IsRunning(): a sender that backed off
+        // because another instance already holds this iPad keeps its thread
+        // object but sits Idle, and showing that as connected would lie.
+        UINT flags = MF_STRING | (ctx->apps[i]->GetState() != SenderApp::State::Idle ? MF_CHECKED : 0);
+        AppendMenuW(menu, flags, IDM_DEVICE_FIRST + i, DeviceStatusText(ctx, i).c_str());
+    }
+    if (!ctx->cfg.devices.empty())
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+
+    if (AnyRunning(ctx)) {
+        AppendMenuW(menu, MF_STRING, IDM_DISCONNECT, several ? L"Disconnect all" : L"Disconnect");
     } else {
-        AppendMenuW(menu, MF_STRING | (ctx->cfg.ip.empty() ? MF_GRAYED : 0), IDM_CONNECT, L"Connect");
+        AppendMenuW(menu, MF_STRING | (ctx->cfg.devices.empty() ? MF_GRAYED : 0), IDM_CONNECT,
+                    several ? L"Connect all" : L"Connect");
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, IDM_SETTINGS, L"Settings...");
@@ -292,36 +483,50 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             return 0;
 
         case WM_COMMAND:
+            // One iPad's entry: toggle that sender alone.
+            if (LOWORD(wParam) >= IDM_DEVICE_FIRST && LOWORD(wParam) < IDM_DEVICE_FIRST + ctx->apps.size()) {
+                size_t index = LOWORD(wParam) - IDM_DEVICE_FIRST;
+                SenderApp& app = *ctx->apps[index];
+                if (app.IsRunning())
+                    app.Stop();
+                else
+                    app.Start(SplitDevice(ctx->cfg.devices[index]).address, ctx->cfg.port);
+                UpdateStatus(ctx);
+                return 0;
+            }
+
             switch (LOWORD(wParam)) {
                 case IDM_CONNECT:
-                    if (!ctx->cfg.ip.empty())
-                        ctx->app.Start(ctx->cfg.ip, ctx->cfg.port);
+                    for (size_t i = 0; i < ctx->apps.size(); ++i)
+                        ctx->apps[i]->Start(SplitDevice(ctx->cfg.devices[i]).address, ctx->cfg.port);
                     UpdateStatus(ctx);
                     return 0;
                 case IDM_DISCONNECT:
-                    ctx->app.Stop();
+                    for (auto& app : ctx->apps)
+                        app->Stop();
                     UpdateStatus(ctx);
                     return 0;
                 case IDM_SETTINGS: {
-                    std::string oldIp = ctx->cfg.ip;
+                    std::vector<std::string> oldDevices = ctx->cfg.devices;
                     uint16_t oldPort = ctx->cfg.port;
                     if (DialogBoxParamW(ctx->hInstance, MAKEINTRESOURCEW(IDD_SETTINGS), hwnd, SettingsDlgProc,
                                         reinterpret_cast<LPARAM>(&ctx->cfg)) == IDOK) {
                         ctx->cfg.Save();
-                        // Only tear down and reconnect if the *target* actually
+                        // Only tear down and reconnect if the *targets* actually
                         // changed — toggling auto-connect/autostart, or OK with
                         // no change, must not drop a live stream.
-                        if (ctx->cfg.ip != oldIp || ctx->cfg.port != oldPort)
+                        if (ctx->cfg.devices != oldDevices || ctx->cfg.port != oldPort)
                             ApplyAndRestart(ctx);
                     }
                     return 0;
                 }
                 case IDM_RUNASADMIN: {
                     // Relaunch elevated, then exit this instance. Stop first so
-                    // the per-iPad lock is released before the elevated copy
-                    // grabs it. Elevated lets touch reach elevated windows and
+                    // the per-iPad locks are released before the elevated copy
+                    // grabs them. Elevated lets touch reach elevated windows and
                     // register new resolutions without a separate prompt.
-                    ctx->app.Stop();
+                    for (auto& app : ctx->apps)
+                        app->Stop();
                     wchar_t exe[MAX_PATH];
                     GetModuleFileNameW(nullptr, exe, MAX_PATH);
                     SHELLEXECUTEINFOW sei{};
@@ -349,7 +554,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case WM_DESTROY:
             KillTimer(hwnd, kStatusTimerId);
             Shell_NotifyIconW(NIM_DELETE, &ctx->nid);
-            ctx->app.Stop();
+            for (auto& app : ctx->apps)
+                app->Stop();
             PostQuitMessage(0);
             return 0;
     }
@@ -363,6 +569,7 @@ int RunTray(HINSTANCE hInstance)
     TrayContext ctx;
     ctx.hInstance = hInstance;
     ctx.cfg = Config::Load();
+    RebuildSenders(&ctx);
 
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
@@ -392,9 +599,13 @@ int RunTray(HINSTANCE hInstance)
 
     SetTimer(hwnd, kStatusTimerId, kStatusTimerMs, nullptr);
 
-    // Auto-connect on launch if configured and an iPad is set.
-    if (ctx.cfg.autoReconnect && !ctx.cfg.ip.empty())
-        ctx.app.Start(ctx.cfg.ip, ctx.cfg.port);
+    ctx.discoveryRunning = true;
+    ctx.discovery = std::thread([&ctx] { RunDiscovery(&ctx); });
+
+    // Auto-connect on launch: every configured iPad, each on its own sender.
+    if (ctx.cfg.autoReconnect)
+        for (size_t i = 0; i < ctx.apps.size(); ++i)
+            ctx.apps[i]->Start(SplitDevice(ctx.cfg.devices[i]).address, ctx.cfg.port);
     UpdateStatus(&ctx);
 
     MSG msg;
@@ -402,6 +613,10 @@ int RunTray(HINSTANCE hInstance)
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+
+    ctx.discoveryRunning = false;
+    if (ctx.discovery.joinable())
+        ctx.discovery.join();
 
     DestroyIcon(ctx.iconGreen);
     DestroyIcon(ctx.iconRed);

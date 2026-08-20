@@ -68,6 +68,31 @@ bool ReadInt(std::string_view json, std::string_view key, long& out)
     return true;
 }
 
+// Reads a flat array of strings ("devices": ["a", "b"]). The only nesting the
+// config has, so it stays a scan for quoted values up to the closing bracket
+// rather than a reason to pull in a JSON library.
+std::vector<std::string> ReadStringArray(std::string_view json, std::string_view key)
+{
+    std::vector<std::string> out;
+    std::string_view v = ValueAfter(json, key);
+    if (v.empty() || v.front() != '[')
+        return out;
+
+    size_t end = v.find(']');
+    if (end == std::string_view::npos)
+        return out;
+    v = v.substr(1, end - 1);
+
+    for (size_t pos = v.find('"'); pos != std::string_view::npos; pos = v.find('"', pos + 1)) {
+        size_t close = v.find('"', pos + 1);
+        if (close == std::string_view::npos)
+            break;
+        out.emplace_back(v.substr(pos + 1, close - pos - 1));
+        pos = close;
+    }
+    return out;
+}
+
 bool ReadBool(std::string_view json, std::string_view key, bool& out)
 {
     std::string_view v = ValueAfter(json, key);
@@ -101,7 +126,14 @@ Config Config::Load()
     ss << file.rdbuf();
     std::string json = ss.str();
 
-    cfg.ip = ReadString(json, "ip");
+    cfg.devices = ReadStringArray(json, "devices");
+    if (cfg.devices.empty()) {
+        // Config written by the single-iPad version.
+        std::string legacy = ReadString(json, "ip");
+        if (!legacy.empty())
+            cfg.devices.push_back(legacy);
+    }
+
     long port = 0;
     if (ReadInt(json, "port", port) && port > 0 && port <= 65535)
         cfg.port = static_cast<uint16_t>(port);
@@ -119,8 +151,25 @@ void Config::Save() const
     if (!file)
         return;
 
+    // The names are free text from the settings dialog, and both the writer
+    // here and the reader above are hand-rolled: an unescaped quote in a name
+    // would split the entry at the wrong place on the next load — the name
+    // truncated, the rest read back as another device. Quotes and backslashes
+    // are dropped rather than escaped, because nothing needs them in a name and
+    // dropping keeps the reader as simple as it is.
+    auto plain = [](const std::string& device) {
+        std::string out;
+        for (char c : device)
+            if (c != '"' && c != '\\')
+                out += c;
+        return out;
+    };
+
     file << "{\n"
-         << "  \"ip\": \"" << ip << "\",\n"
+         << "  \"devices\": [";
+    for (size_t i = 0; i < devices.size(); ++i)
+        file << (i == 0 ? "\"" : ", \"") << plain(devices[i]) << "\"";
+    file << "],\n"
          << "  \"port\": " << port << ",\n"
          << "  \"autoReconnect\": " << (autoReconnect ? "true" : "false") << "\n"
          << "}\n";

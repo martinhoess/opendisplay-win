@@ -13,13 +13,19 @@
 #include "app/SenderApp.h"
 #include "app/TrayApp.h"
 #include "display/VirtualDisplay.h"
+#include "net/Mdns.h"
+
+#include "parsec-vdd.h" // VDD_MAX_DISPLAYS, to range-check --remove-display
 
 namespace {
 
 // Route diagnostics to %APPDATA%\opendisplay-win\log.txt. Under the GUI
 // subsystem there is no console to print to, and a file gives persistent logs
 // regardless of how the app was launched.
-void RedirectLogToFile()
+// `name` is the log's file name: the tray owns log.txt, while a headless CLI
+// sender gets its own log-<pid>.txt. Both open CREATE_ALWAYS, so without the
+// split a second process would truncate the first one's log out from under it.
+void RedirectLogToFile(const std::string& name)
 {
     char* appdata = nullptr;
     size_t len = 0;
@@ -29,7 +35,7 @@ void RedirectLogToFile()
     free(appdata);
 
     CreateDirectoryA(dir.c_str(), nullptr); // no-op if it already exists
-    std::string logPath = dir + "\\log.txt";
+    std::string logPath = dir + "\\" + name;
 
     // Under the GUI subsystem there is no console, so stdout/stderr have no
     // valid fd to redirect. Bind them to NUL first to give them real fds, then
@@ -54,6 +60,22 @@ void RedirectLogToFile()
     _close(fd); // the dup'd copies on stdout/stderr keep the file open
     setvbuf(stdout, nullptr, _IONBF, 0); // unbuffered so a live stream shows immediately
     setvbuf(stderr, nullptr, _IONBF, 0);
+}
+
+// The one-off commands below are meant to be read in the terminal that started
+// them, but this is a GUI-subsystem process and has no console of its own — so
+// borrow the caller's. Returns false when there is none (double-clicked, or
+// started by a process without a console), and the log file takes over.
+bool AttachParentConsole()
+{
+    if (!AttachConsole(ATTACH_PARENT_PROCESS))
+        return false;
+    FILE* f = nullptr;
+    freopen_s(&f, "CONOUT$", "w", stdout);
+    freopen_s(&f, "CONOUT$", "w", stderr);
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    setvbuf(stderr, nullptr, _IONBF, 0);
+    return true;
 }
 
 // Last-resort diagnostics: on an unhandled crash, write the exception code and
@@ -99,7 +121,16 @@ int main(int argc, char** argv)
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
 
-    RedirectLogToFile();
+    std::string command = argc >= 2 ? argv[1] : "";
+    bool oneOff = command == "--register-resolution" || command == "--cleanup-monitors" ||
+                  command == "--remove-display" || command == "--browse-mdns";
+
+    // A one-off answers into the caller's terminal; a sender writes to the log,
+    // and a headless one gets its own file so two of them don't truncate each
+    // other's.
+    if (!oneOff || !AttachParentConsole())
+        RedirectLogToFile(argc >= 2 ? "log-" + std::to_string(GetCurrentProcessId()) + ".txt" : "log.txt");
+
     SetUnhandledExceptionFilter(CrashLogger);
 
     WSADATA wsaData;
@@ -116,6 +147,31 @@ int main(int argc, char** argv)
         auto h = static_cast<uint32_t>(strtoul(argv[3], nullptr, 10));
         bool ok = w > 0 && h > 0 && od::VirtualDisplay::RegisterResolutions(w, h);
         printf("register %ux%u: %s\n", w, h, ok ? "ok" : "failed");
+        rc = ok ? 0 : 1;
+    } else if (argc >= 3 && std::string(argv[1]) == "--remove-display") {
+        // Explicit one-off: unplug the virtual display at this index. Cleans up
+        // after a sender that was killed rather than stopped — the driver keeps
+        // such a display attached to the desktop for as long as any client
+        // holds the adapter open.
+        // Range-checked before it reaches the driver: the index goes straight
+        // into an IOCTL, and parsec-vdd has VDD_MAX_DISPLAYS slots.
+        int index = atoi(argv[2]);
+        if (index < 0 || index >= parsec_vdd::VDD_MAX_DISPLAYS) {
+            printf("remove display %d: refused, index must be 0..%d\n", index, parsec_vdd::VDD_MAX_DISPLAYS - 1);
+            rc = 1;
+        } else {
+            bool ok = od::VirtualDisplay::RemoveDisplayIndex(index);
+            printf("remove display %d: %s\n", index, ok ? "sent" : "failed (driver handle?)");
+            rc = ok ? 0 : 1;
+        }
+    } else if (argc >= 2 && std::string(argv[1]) == "--browse-mdns") {
+        // Checks the response parser against malformed packets, then shows what
+        // is actually advertising right now — the parser reads data from
+        // whoever answers on the network, so it gets a probe of its own.
+        bool ok = od::SelfCheck();
+        for (const od::MdnsReceiver& receiver : od::BrowseReceivers(1500))
+            printf("%s  %s  host=%s port=%u id=%s\n", receiver.address.c_str(), receiver.instance.c_str(),
+                   receiver.host.c_str(), receiver.port, receiver.id.c_str());
         rc = ok ? 0 : 1;
     } else if (argc >= 2 && std::string(argv[1]) == "--cleanup-monitors") {
         // Explicit one-off: drop phantom virtual monitors from earlier runs.

@@ -82,17 +82,40 @@ Depends on item 1 (a signed driver).
 Some from the [#65](https://github.com/peetzweg/opendisplay/issues/65)
 component-mapping, some ours:
 
-- **mDNS/Bonjour discovery** — auto-find the iPad instead of typing an IP
-  (Bonjour SDK for Windows). Big UX win; drops straight into the tray GUI as a
-  device list.
+- **mDNS/Bonjour discovery** — half done. `src/net/Mdns.cpp` browses
+  `_opensidecar._tcp` (a hand-rolled query, no Bonjour SDK) and the tray already
+  uses it to name the iPads. What's left is the UX: offer the found receivers as
+  a pick list in Settings instead of typing an IP, and follow an address that
+  DHCP moved by matching the TXT `id` against the one in the `hello` — the same
+  install UUID.
+  **The trap when testing this:** left to Windows, a multicast query follows the
+  route metric, and on a machine with VMware or Hyper-V adapters it leaves
+  through one of those and never reaches the iPads — with no error, just
+  silence. The browse therefore queries on *every* IPv4 interface.
 - **USB transport** — the Apple Mobile Device Service *is* usbmuxd on Windows
   (ships with iTunes / Apple Devices) + libimobiledevice → TCP-over-USB. Lower
   latency, no WiFi, no IP entry.
-- **Multiple iPads at once** — each iPad as its own virtual monitor + connection
-  + capture/encode pipeline (today one running instance drives one iPad). Hard
-  rule: **exactly one connection per iPad/IP** — a second connection to the same
-  device must be refused (see the connection guard under Known issues), while
-  *different* iPads may be driven simultaneously.
+- ~~**Multiple iPads at once**~~ — **done, with one restriction.** The tray runs
+  one `SenderApp` per configured address, each with its own virtual monitor,
+  capture/encode pipeline and input injection; the per-IP named mutex still
+  refuses a *second* connection to the same iPad. What made it work was monitor
+  identity: the driver exposes all its display slots as permanent GDI entries,
+  so a sender claims the parsec monitor that attached across its own
+  `VddAddDisplay` (add and claim serialized machine-wide) instead of taking the
+  first one it finds. Remaining cost: the BGRA→NV12 conversion is per-sender CPU
+  work, see Performance below.
+
+  **The restriction is the driver's:** parsec-vdd puts one custom resolution on
+  *all* of its virtual monitors — measured with two mock receivers, where the
+  second sender's `ChangeDisplaySettingsEx` moved the first sender's monitor to
+  its size as well. Two panels of different sizes therefore can't both be
+  native, and the sender refuses to serve the wrong aspect: same-size iPads
+  stream together, a different one waits for the display to come free
+  (`SenderApp::State::Blocked`). Lifting that is item 1 below — an IddCx driver
+  we own gives each monitor its own EDID and a stable identity, so the modes
+  stop trampling each other and Windows stops restoring a foreign mode after
+  every add. `itsmikethetech/Virtual-Display-Driver` would be the shortcut: a
+  second, independent adapter for the second iPad.
 - **⚠️ Security** — the link is currently **unencrypted and unauthenticated**:
   anyone on the LAN can connect, see the screen, **and inject mouse input**
   (i.e. remote-control the PC). A real blocker for public distribution — add
@@ -113,6 +136,12 @@ live-move input tracking, a bounded (~3 s) connect timeout so Disconnect and
 reconnect stay snappy, silenced encoder log noise, a clean tray shutdown, and
 `.gitattributes`. What's left:
 
+- **A killed sender leaves its monitor plugged in.** Not just a devnode: the
+  display stays *attached* to the desktop, because the driver only unplugs on an
+  explicit `VddRemoveDisplay` (which a `taskkill /F` skips) or once no client
+  holds the adapter open at all — and any other running sender keeps it open.
+  `--remove-display <index>` unplugs one by index; run it with the senders
+  stopped. An own driver (§1) would tie the display to the client handle.
 - **Phantom virtual monitors accumulate ~1 per run.** parsec-vdd mints a fresh
   monitor UID on every add and, when the process dies, unplugs it but leaves the
   devnode behind. `opendisplay-win.exe --cleanup-monitors` removes the leftovers
