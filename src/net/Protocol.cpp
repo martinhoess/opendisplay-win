@@ -161,6 +161,8 @@ std::optional<ControlMessage> ParseControlMessage(const uint8_t* data, size_t si
         msg.type = ControlType::Kf;
     } else if (*type == "cursorAck") {
         msg.type = ControlType::CursorAck;
+    } else if (*type == "stats") {
+        msg.type = ControlType::Stats;
     } else {
         msg.type = ControlType::Unknown; // e.g. "stats", "pong" -> ignored by caller
     }

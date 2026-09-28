@@ -4,7 +4,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -24,8 +26,8 @@ namespace od {
 
 namespace {
 
-constexpr uint32_t kFps = 60;
-constexpr uint32_t kBitrateBps = 30'000'000;
+constexpr uint32_t kFps = 30;
+constexpr uint32_t kBitrateBps = 10'000'000; // peak for constrained VBR
 constexpr int kSendTimeoutMs = 500;      // backpressure: how long to wait for the socket before dropping a frame
 constexpr int kReconnectDelayMs = 2000;
 constexpr int kKeepaliveMs = 1000;       // max silence on a static screen; well under the iPad's ~5s watchdog
@@ -110,11 +112,43 @@ struct PanelHolder {
     }
 };
 
-uint32_t EvenClamp(int32_t v, uint32_t fallback)
+uint32_t Align16Clamp(int32_t v, uint32_t fallback)
 {
     uint32_t u = v > 0 ? static_cast<uint32_t>(v) : fallback;
-    return u & ~1u; // NV12 4:2:0 needs even dimensions
+    u &= ~15u; // H.264 / QSV want multiples of 16 (also keeps NV12 chroma even)
+    if (u == 0)
+        u = fallback & ~15u;
+    return u;
 }
+
+// Pad NV12 up to encoder size (16-ceil of capture). Floor-crop (1080->1072)
+// made every frame look like a size change and reconfigure-flashed black.
+bool PadNv12TopLeft(const std::vector<uint8_t>& src, uint32_t srcW, uint32_t srcH,
+                    uint32_t dstW, uint32_t dstH, std::vector<uint8_t>& dst)
+{
+    if (dstW == 0 || dstH == 0 || dstW < srcW || dstH < srcH)
+        return false;
+    if (srcW == dstW && srcH == dstH) {
+        dst = src;
+        return true;
+    }
+    dst.assign(dstW * dstH * 3 / 2, 0);
+    std::fill(dst.begin() + static_cast<std::ptrdiff_t>(dstW * dstH), dst.end(),
+              static_cast<uint8_t>(0x80));
+    for (uint32_t y = 0; y < srcH; ++y)
+        memcpy(dst.data() + y * dstW, src.data() + y * srcW, srcW);
+    const uint8_t* srcUv = src.data() + srcW * srcH;
+    uint8_t* dstUv = dst.data() + dstW * dstH;
+    for (uint32_t y = 0; y < srcH / 2; ++y)
+        memcpy(dstUv + y * dstW, srcUv + y * srcW, srcW);
+    return true;
+}
+
+uint32_t Align16Ceil(uint32_t v)
+{
+    return (v + 15u) & ~15u;
+}
+
 
 // usbmuxd cannot carry UDP (PROTOCOL 6.3). Loopback dials are the USB
 // binding on Windows when we add it; ignore cursorPort there.
@@ -227,12 +261,31 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
             Logf(ip, "DesktopDuplication::Open failed\n");
             return false;
         }
-        if (!encoder.Configure(dup.Width(), dup.Height(), kFps, kBitrateBps)) {
+        const uint32_t encW = Align16Ceil(dup.Width());
+        const uint32_t encH = Align16Ceil(dup.Height());
+        if (encW == 0 || encH == 0) {
+            Logf(ip, "encoder size align failed (dup %ux%u)\n", dup.Width(), dup.Height());
+            return false;
+        }
+        if (encW != dup.Width() || encH != dup.Height())
+            Logf(ip, "encode size %ux%u (capture %ux%u, 16-ceil pad)\n",
+                 encW, encH, dup.Width(), dup.Height());
+        if (!encoder.Configure(encW, encH, kFps, kBitrateBps)) {
             Logf(ip, "encoder configure failed\n");
             return false;
         }
         input.SetMonitorRect(vdisp.MonitorRect());
-        Logf(ip, "pipeline ready: %ux%u\n", dup.Width(), dup.Height());
+        {
+            const std::wstring mftW = encoder.MftName();
+            std::string mft;
+            mft.reserve(mftW.size());
+            for (wchar_t c : mftW)
+                mft.push_back(c >= 32 && c < 127 ? static_cast<char>(c) : '?');
+            if (mft.empty())
+                mft = "(unknown)";
+            Logf(ip, "pipeline ready: %ux%u @ %u fps / VBR peak %u kbps, MFT: %s\n",
+                 encoder.Width(), encoder.Height(), kFps, kBitrateBps / 1000, mft.c_str());
+        }
         return true;
     };
 
@@ -299,8 +352,8 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         bool welcomeSent = conn->SendFrame(reinterpret_cast<const uint8_t*>(kWelcome), sizeof(kWelcome) - 1);
         Logf(ip, "welcome sent: %s\n", welcomeSent ? "yes" : "FAILED");
 
-        uint32_t width = EvenClamp(hello.pixelsWide, 1920);
-        uint32_t height = EvenClamp(hello.pixelsHigh, 1080);
+        uint32_t width = Align16Clamp(hello.pixelsWide, 1920);
+        uint32_t height = Align16Clamp(hello.pixelsHigh, 1080);
         Logf(ip, "hello: %dx%d -> %ux%u\n", hello.pixelsWide, hello.pixelsHigh, width, height);
 
         // Only iPads of the panel size that is already on the air may join (see
@@ -382,8 +435,8 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                         // pipelineMutex — the capture loop compares the
                         // monitor against them (see the panel-size watchdog).
                         std::lock_guard<std::mutex> lock(pipelineMutex);
-                        uint32_t w = EvenClamp(msg->hello.pixelsWide, width);
-                        uint32_t h = EvenClamp(msg->hello.pixelsHigh, height);
+                        uint32_t w = Align16Clamp(msg->hello.pixelsWide, width);
+                        uint32_t h = Align16Clamp(msg->hello.pixelsHigh, height);
                         Logf(ip, "hello again: %dx%d -> rebuilding pipeline at %ux%u\n", msg->hello.pixelsWide,
                                msg->hello.pixelsHigh, w, h);
                         // Turning the iPad changes the size under the claim.
@@ -464,6 +517,12 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                         }
                         break;
                     }
+                    case ControlType::Stats:
+                        // Free-form receiver telemetry (~5s). Prefix matches the
+                        // Mac sender so one log file tells the whole story.
+                        Logf(ip, "PHONE-STATS %.*s\n", static_cast<int>(frame->size()),
+                             reinterpret_cast<const char*>(frame->data()));
+                        break;
                     default:
                         break;
                 }
@@ -566,10 +625,13 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                 // while nv12 still holds the previous frame. Reconfiguring on
                 // that would encode the old buffer with the new stride — one
                 // skewed frame, exactly what this is here to prevent.
-                if (changed && (encoder.Width() != dup.Width() || encoder.Height() != dup.Height())) {
+                const uint32_t wantW = Align16Ceil(dup.Width());
+                const uint32_t wantH = Align16Ceil(dup.Height());
+                if (changed && (encoder.Width() != wantW || encoder.Height() != wantH)) {
                     Logf(ip, "capture is now %ux%u (encoder had %ux%u), reconfiguring\n", dup.Width(), dup.Height(),
                            encoder.Width(), encoder.Height());
-                    if (encoder.Configure(dup.Width(), dup.Height(), kFps, kBitrateBps)) {
+                    encoder.SetAllowHardware(false); // size flip: keep software, skip QSV probe walk
+                    if (encoder.Configure(wantW, wantH, kFps, kBitrateBps)) {
                         // The cached rect is only refreshed when the monitor
                         // moves, and a rotation in place doesn't move it.
                         rectStale = !vdisp.QueryMonitorRect();
@@ -664,8 +726,30 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                 // connection survives until real content arrives.
                 bool keepaliveDue = now - lastSend >= std::chrono::milliseconds(kKeepaliveMs);
 
-                if (running && (active || keepaliveDue))
-                    encoded = encoder.EncodeNv12(nv12.data(), nv12.size());
+                if (running && (active || keepaliveDue)) {
+                    std::vector<uint8_t> encNv12;
+                    if (!PadNv12TopLeft(nv12, dup.Width(), dup.Height(),
+                                         encoder.Width(), encoder.Height(), encNv12)) {
+                        Logf(ip, "nv12 pad failed (cap %ux%u -> enc %ux%u)\n",
+                             dup.Width(), dup.Height(), encoder.Width(), encoder.Height());
+                        continue;
+                    }
+                    encoded = encoder.EncodeNv12(encNv12.data(), encNv12.size());
+                    if (encoder.ConsecutiveAsyncTimeouts() >= 3) {
+                        Logf(ip, "async encoder stalled (%d timeouts) - falling back to software\n",
+                             encoder.ConsecutiveAsyncTimeouts());
+                        encoder.SetAllowHardware(false);
+                        if (!encoder.Configure(encoder.Width(), encoder.Height(), kFps, kBitrateBps)) {
+                            Logf(ip, "software encoder fallback failed\n");
+                        } else {
+                            const std::wstring mft = encoder.MftName();
+                            std::string mftA;
+                            for (wchar_t c : mft)
+                                mftA.push_back(c >= 32 && c < 127 ? static_cast<char>(c) : '?');
+                            Logf(ip, "fallback MFT: %s\n", mftA.empty() ? "(unknown)" : mftA.c_str());
+                        }
+                    }
+                }
             }
 
             // cursorImg always TCP. Positions: UDP when open; mirror TCP until

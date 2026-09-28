@@ -11,7 +11,7 @@
 // so a tiny field-scanner is enough and keeps the dependency footprint at zero.
 namespace od {
 
-enum class ControlType { Hello, Touch, Scroll, Pencil, Proximity, Kf, CursorAck, Unknown };
+enum class ControlType { Hello, Touch, Scroll, Pencil, Proximity, Kf, CursorAck, Stats, Unknown };
 
 enum class TouchPhase { Began, Moved, Ended, Cancelled, Unknown };
 
