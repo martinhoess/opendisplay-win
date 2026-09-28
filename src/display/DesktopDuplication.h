@@ -10,8 +10,21 @@
 
 namespace od {
 
-// Captures the virtual monitor's output via DXGI Desktop Duplication and
-// converts BGRA -> NV12 (the encoder's required input format) on the CPU.
+struct CaptureResult {
+    bool acquired = false;
+    bool desktopChanged = false;
+    bool cursorChanged = false;
+    bool pointerShapeChanged = false;
+};
+
+struct PointerShapeBgra {
+    int width = 0;
+    int height = 0;
+    int hotX = 0;
+    int hotY = 0;
+    std::vector<uint8_t> bgra;
+};
+
 class DesktopDuplication {
 public:
     DesktopDuplication() = default;
@@ -20,32 +33,24 @@ public:
     DesktopDuplication(const DesktopDuplication&) = delete;
     DesktopDuplication& operator=(const DesktopDuplication&) = delete;
 
-    // deviceName is the GDI device name (e.g. L"\\.\DISPLAY3") from
-    // VirtualDisplay::DeviceName() — the D3D11 device must be created on the
-    // same adapter as this output for DuplicateOutput() to work.
     bool Open(const std::wstring& deviceName);
     void Close();
 
-    // Captures one frame and appends its NV12 conversion into `nv12`
-    // (resized as needed). Returns false on timeout (no desktop update since
-    // the last call — caller should just re-encode/resend the previous
-    // frame) or on error.
-    bool CaptureFrameNv12(std::vector<uint8_t>& nv12, int timeoutMs = 500);
+    CaptureResult CaptureFrameNv12(std::vector<uint8_t>& nv12, int timeoutMs = 500);
 
     uint32_t Width() const { return width_; }
     uint32_t Height() const { return height_; }
 
-private:
-    // DXGI delivers the mouse cursor out-of-band (it is NOT baked into the
-    // duplicated desktop image), so we cache its latest shape/position and
-    // blend it into each captured frame ourselves before NV12 conversion.
-    void UpdatePointer(const DXGI_OUTDUPL_FRAME_INFO& info);
-    void CompositePointer(uint8_t* bgra, uint32_t stride, uint32_t frameW, uint32_t frameH) const;
+    bool PointerVisible() const { return pointerVisible_; }
+    int PointerX() const { return pointerPosition_.x; }
+    int PointerY() const { return pointerPosition_.y; }
+    int PointerHotX() const { return static_cast<int>(pointerShapeInfo_.HotSpot.x); }
+    int PointerHotY() const { return static_cast<int>(pointerShapeInfo_.HotSpot.y); }
 
-    // Tears down and recreates the duplication (and its D3D device) for the
-    // remembered output. Called after the duplication is invalidated by a
-    // desktop topology change / access loss. Returns false if it can't be
-    // rebuilt right now (e.g. the desktop is still mid-reconfigure).
+    bool GetPointerShapeBgra(PointerShapeBgra& out) const;
+
+private:
+    bool UpdatePointer(const DXGI_OUTDUPL_FRAME_INFO& info, bool* shapeChanged = nullptr);
     bool Reopen();
 
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
@@ -53,8 +58,9 @@ private:
     Microsoft::WRL::ComPtr<IDXGIOutputDuplication> duplication_;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> staging_;
 
-    std::wstring deviceName_; // remembered so the duplication can be rebuilt after it's lost
-    bool reportedLoss_ = false; // throttles the "lost, rebuilding" log to once per teardown
+    std::wstring deviceName_;
+    bool reportedLoss_ = false;
+    bool haveDesktopFrame_ = false;
     uint32_t width_ = 0;
     uint32_t height_ = 0;
 
@@ -62,6 +68,7 @@ private:
     DXGI_OUTDUPL_POINTER_SHAPE_INFO pointerShapeInfo_{};
     POINT pointerPosition_{};
     bool pointerVisible_ = false;
+    bool pointerShapeValid_ = false;
 };
 
 } // namespace od

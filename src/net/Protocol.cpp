@@ -134,6 +134,7 @@ std::optional<ControlMessage> ParseControlMessage(const uint8_t* data, size_t si
         msg.hello.scale = static_cast<int>(FindNumberField(json, "scale").value_or(1));
         msg.hello.device = FindStringField(json, "device").value_or("");
         msg.hello.id = FindStringField(json, "id").value_or("");
+        msg.hello.cursorPort = static_cast<int>(FindNumberField(json, "cursorPort").value_or(0));
     } else if (*type == "touch") {
         msg.type = ControlType::Touch;
         msg.touch.phase = ParseTouchPhase(FindStringField(json, "phase").value_or(""));
@@ -158,6 +159,8 @@ std::optional<ControlMessage> ParseControlMessage(const uint8_t* data, size_t si
         msg.proximity.y = FindNumberField(json, "y").value_or(0.0);
     } else if (*type == "kf") {
         msg.type = ControlType::Kf;
+    } else if (*type == "cursorAck") {
+        msg.type = ControlType::CursorAck;
     } else {
         msg.type = ControlType::Unknown; // e.g. "stats", "pong" -> ignored by caller
     }

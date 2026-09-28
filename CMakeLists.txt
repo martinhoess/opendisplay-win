@@ -17,6 +17,8 @@ add_executable(opendisplay-win
   src/main.cpp
   src/net/Connection.cpp
   src/net/Protocol.cpp
+  src/net/CursorMessages.cpp
+  src/net/CursorUdp.cpp
   src/net/Mdns.cpp
   src/encode/AnnexB.cpp
   src/encode/H264Encoder.cpp
@@ -49,6 +51,8 @@ target_link_libraries(opendisplay-win PRIVATE
   cfgmgr32
   shell32
   gdi32
+  windowscodecs
+  ole32
 )
 
 target_compile_definitions(opendisplay-win PRIVATE

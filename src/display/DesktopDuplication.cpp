@@ -14,10 +14,6 @@ namespace od {
 
 namespace {
 
-// Backoff after a failed capture so a persistently-erroring duplication (or a
-// desktop still mid-reconfigure) can't spin the capture loop at full CPU —
-// AcquireNextFrame only paces us via its timeout on the *success/timeout*
-// path, not on errors.
 constexpr int kRecoveryBackoffMs = 100;
 
 inline uint8_t Clamp8(int v)
@@ -25,9 +21,6 @@ inline uint8_t Clamp8(int v)
     return static_cast<uint8_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
 }
 
-// BT.601 studio-range BGRA -> NV12. CPU-side; fine for a local-link sender,
-// not optimized (a GPU color-convert MFT would be the follow-up if this
-// turns out to be the bottleneck).
 void ConvertBgraToNv12(const uint8_t* bgra, UINT rowPitch, uint32_t width, uint32_t height, std::vector<uint8_t>& nv12)
 {
     nv12.resize(static_cast<size_t>(width) * height * 3 / 2);
@@ -38,7 +31,7 @@ void ConvertBgraToNv12(const uint8_t* bgra, UINT rowPitch, uint32_t width, uint3
         const uint8_t* srcRow = bgra + static_cast<size_t>(row) * rowPitch;
         uint8_t* yRow = yPlane + static_cast<size_t>(row) * width;
         for (uint32_t col = 0; col < width; ++col) {
-            const uint8_t* px = srcRow + static_cast<size_t>(col) * 4; // B G R A
+            const uint8_t* px = srcRow + static_cast<size_t>(col) * 4;
             int b = px[0], g = px[1], r = px[2];
             int y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
             yRow[col] = Clamp8(y);
@@ -127,6 +120,7 @@ bool DesktopDuplication::Open(const std::wstring& deviceName)
     height_ = dupDesc.ModeDesc.Height;
 
     deviceName_ = deviceName;
+    haveDesktopFrame_ = false;
     return true;
 }
 
@@ -136,25 +130,24 @@ void DesktopDuplication::Close()
     staging_.Reset();
     context_.Reset();
     device_.Reset();
+    haveDesktopFrame_ = false;
 }
 
 bool DesktopDuplication::Reopen()
 {
-    std::wstring name = deviceName_; // Close() keeps it, but copy defensively
+    std::wstring name = deviceName_;
     Close();
     return Open(name);
 }
 
-bool DesktopDuplication::CaptureFrameNv12(std::vector<uint8_t>& nv12, int timeoutMs)
+CaptureResult DesktopDuplication::CaptureFrameNv12(std::vector<uint8_t>& nv12, int timeoutMs)
 {
-    // The duplication may have been torn down by an earlier frame (topology
-    // change, access loss). Try to rebuild before giving up — and if it still
-    // can't be rebuilt (desktop mid-reconfigure), back off briefly and drop
-    // this frame rather than dying permanently or busy-looping on Open().
+    CaptureResult result{};
+
     if (!duplication_) {
         if (!Reopen()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(kRecoveryBackoffMs));
-            return false;
+            return result;
         }
     }
 
@@ -162,54 +155,46 @@ bool DesktopDuplication::CaptureFrameNv12(std::vector<uint8_t>& nv12, int timeou
     ComPtr<IDXGIResource> resource;
     HRESULT hr = duplication_->AcquireNextFrame(timeoutMs, &info, &resource);
     if (hr == DXGI_ERROR_WAIT_TIMEOUT)
-        return false;
+        return result;
     if (FAILED(hr)) {
-        // The duplication is dead — recreate it. This covers ACCESS_LOST
-        // (0x887A0026, e.g. lock screen / power state) *and* INVALID_CALL
-        // (0x887A0001), which is what AcquireNextFrame returns after the
-        // desktop topology changes, e.g. dragging this monitor to a new
-        // position in Display Settings. Previously only ACCESS_LOST was
-        // handled, so a rearrange left the duplication permanently dead.
         if (!reportedLoss_) {
             fprintf(stderr, "AcquireNextFrame lost (0x%08lx), rebuilding duplication\n", hr);
             reportedLoss_ = true;
         }
         Reopen();
-        // Back off whether or not Reopen() succeeded: if it failed the next
-        // call's top handles it, but if it succeeded yet AcquireNextFrame keeps
-        // failing immediately, this is what stops a full-CPU spin.
         std::this_thread::sleep_for(std::chrono::milliseconds(kRecoveryBackoffMs));
-        return false;
+        return result;
     }
     reportedLoss_ = false;
+    result.acquired = true;
 
-    // The cursor's shape and position arrive via the frame info, independent
-    // of whether the desktop image itself changed (a mouse-only move still
-    // produces a frame). Refresh our cache before compositing.
-    UpdatePointer(info);
+    bool shapeChanged = false;
+    result.cursorChanged = UpdatePointer(info, &shapeChanged);
+    result.pointerShapeChanged = shapeChanged;
+
+    const bool desktopChanged = info.LastPresentTime.QuadPart != 0 || !haveDesktopFrame_;
+    result.desktopChanged = desktopChanged;
+
+    if (!desktopChanged) {
+        duplication_->ReleaseFrame();
+        return result;
+    }
 
     ComPtr<ID3D11Texture2D> texture;
     hr = resource.As(&texture);
     if (FAILED(hr)) {
         duplication_->ReleaseFrame();
-        return false;
+        result.acquired = false;
+        result.desktopChanged = false;
+        return result;
     }
 
     D3D11_TEXTURE2D_DESC desc;
     texture->GetDesc(&desc);
 
-    // The mapped staging buffer below is exactly this texture's size. Across a
-    // resolution/rotation change the duplication can hand back a frame whose
-    // dimensions differ from width_/height_ (which came from the ModeDesc at
-    // Open); always process against the frame's own size so we never read/write
-    // past the buffer.
     const uint32_t frameW = desc.Width;
     const uint32_t frameH = desc.Height;
 
-    // A rotation or resolution change triggered on the Windows side arrives
-    // here as a frame with new dimensions and nothing else announcing it.
-    // Follow it: the staging texture must match the source for CopyResource,
-    // and callers size their encoder off Width()/Height().
     if (frameW != width_ || frameH != height_) {
         width_ = frameW;
         height_ = frameH;
@@ -220,122 +205,138 @@ bool DesktopDuplication::CaptureFrameNv12(std::vector<uint8_t>& nv12, int timeou
         D3D11_TEXTURE2D_DESC stagingDesc = desc;
         stagingDesc.Usage = D3D11_USAGE_STAGING;
         stagingDesc.BindFlags = 0;
-        // READ to convert to NV12, WRITE so we can blend the cursor in place.
-        stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
+        stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         stagingDesc.MiscFlags = 0;
         if (FAILED(device_->CreateTexture2D(&stagingDesc, nullptr, &staging_))) {
             duplication_->ReleaseFrame();
-            return false;
+            result.acquired = false;
+            result.desktopChanged = false;
+            return result;
         }
     }
 
     context_->CopyResource(staging_.Get(), texture.Get());
 
     D3D11_MAPPED_SUBRESOURCE mapped;
-    hr = context_->Map(staging_.Get(), 0, D3D11_MAP_READ_WRITE, 0, &mapped);
+    hr = context_->Map(staging_.Get(), 0, D3D11_MAP_READ, 0, &mapped);
     if (SUCCEEDED(hr)) {
-        if (pointerVisible_ && !pointerShape_.empty())
-            CompositePointer(reinterpret_cast<uint8_t*>(mapped.pData), mapped.RowPitch, frameW, frameH);
         ConvertBgraToNv12(reinterpret_cast<const uint8_t*>(mapped.pData), mapped.RowPitch, frameW, frameH, nv12);
         context_->Unmap(staging_.Get(), 0);
+        haveDesktopFrame_ = true;
+    } else {
+        result.desktopChanged = false;
     }
 
     duplication_->ReleaseFrame();
-    return SUCCEEDED(hr);
+    if (FAILED(hr))
+        result.acquired = false;
+    return result;
 }
 
-void DesktopDuplication::UpdatePointer(const DXGI_OUTDUPL_FRAME_INFO& info)
+bool DesktopDuplication::UpdatePointer(const DXGI_OUTDUPL_FRAME_INFO& info, bool* shapeChanged)
 {
-    // Position is only meaningful when the mouse actually updated this frame;
-    // otherwise keep the last known position so a static cursor stays put.
+    bool changed = false;
+    if (shapeChanged)
+        *shapeChanged = false;
+
     if (info.LastMouseUpdateTime.QuadPart != 0) {
-        pointerVisible_ = info.PointerPosition.Visible != 0;
-        pointerPosition_.x = info.PointerPosition.Position.x;
-        pointerPosition_.y = info.PointerPosition.Position.y;
+        const bool vis = info.PointerPosition.Visible != 0;
+        const int x = info.PointerPosition.Position.x;
+        const int y = info.PointerPosition.Position.y;
+        if (vis != pointerVisible_ || x != pointerPosition_.x || y != pointerPosition_.y)
+            changed = true;
+        pointerVisible_ = vis;
+        pointerPosition_.x = x;
+        pointerPosition_.y = y;
     }
 
-    // A non-zero shape buffer size means the cursor bitmap itself changed
-    // (e.g. arrow -> I-beam) — re-fetch and cache it.
     if (info.PointerShapeBufferSize != 0) {
         pointerShape_.resize(info.PointerShapeBufferSize);
         UINT required = 0;
         DXGI_OUTDUPL_POINTER_SHAPE_INFO shapeInfo{};
         HRESULT hr = duplication_->GetFramePointerShape(
             info.PointerShapeBufferSize, pointerShape_.data(), &required, &shapeInfo);
-        if (SUCCEEDED(hr))
+        if (SUCCEEDED(hr)) {
             pointerShapeInfo_ = shapeInfo;
+            pointerShapeValid_ = true;
+            changed = true;
+            if (shapeChanged)
+                *shapeChanged = true;
+        }
     }
+
+    return changed;
 }
 
-void DesktopDuplication::CompositePointer(uint8_t* bgra, uint32_t stride, uint32_t frameW, uint32_t frameH) const
+bool DesktopDuplication::GetPointerShapeBgra(PointerShapeBgra& out) const
 {
-    const int posX = pointerPosition_.x;
-    const int posY = pointerPosition_.y;
+    if (!pointerShapeValid_ || pointerShape_.empty())
+        return false;
+
     const UINT pitch = pointerShapeInfo_.Pitch;
     const int shapeW = static_cast<int>(pointerShapeInfo_.Width);
     int shapeH = static_cast<int>(pointerShapeInfo_.Height);
-
-    // Bound against the *actual* frame the caller mapped (frameW/frameH), not the
-    // cached width_/height_ from Open's ModeDesc — those two diverge transiently
-    // across a resolution/rotation change, and writing past the smaller staging
-    // buffer is an out-of-bounds write (0xC0000005).
-    auto inFrame = [&](int fx, int fy) {
-        return fx >= 0 && fy >= 0 && fx < static_cast<int>(frameW) && fy < static_cast<int>(frameH);
-    };
+    out.hotX = static_cast<int>(pointerShapeInfo_.HotSpot.x);
+    out.hotY = static_cast<int>(pointerShapeInfo_.HotSpot.y);
 
     if (pointerShapeInfo_.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME) {
-        // 1bpp, AND mask on top of XOR mask (so reported height is doubled).
         shapeH /= 2;
+        out.width = shapeW;
+        out.height = shapeH;
+        out.bgra.assign(static_cast<size_t>(shapeW) * shapeH * 4, 0);
         const uint8_t* andMask = pointerShape_.data();
         const uint8_t* xorMask = pointerShape_.data() + static_cast<size_t>(pitch) * shapeH;
         for (int y = 0; y < shapeH; ++y) {
             for (int x = 0; x < shapeW; ++x) {
-                int fx = posX + x, fy = posY + y;
-                if (!inFrame(fx, fy))
-                    continue;
                 size_t byteIdx = static_cast<size_t>(y) * pitch + (x / 8);
                 int bit = 7 - (x % 8);
                 int a = (andMask[byteIdx] >> bit) & 1;
                 int xr = (xorMask[byteIdx] >> bit) & 1;
-                uint8_t* dst = bgra + static_cast<size_t>(fy) * stride + static_cast<size_t>(fx) * 4;
+                uint8_t* dst = out.bgra.data() + (static_cast<size_t>(y) * shapeW + x) * 4;
                 if (a == 0 && xr == 0) {
-                    dst[0] = dst[1] = dst[2] = 0; // black
+                    dst[0] = dst[1] = dst[2] = 0;
+                    dst[3] = 255;
                 } else if (a == 0 && xr == 1) {
-                    dst[0] = dst[1] = dst[2] = 255; // white
+                    dst[0] = dst[1] = dst[2] = 255;
+                    dst[3] = 255;
                 } else if (a == 1 && xr == 1) {
-                    dst[0] = 255 - dst[0]; dst[1] = 255 - dst[1]; dst[2] = 255 - dst[2]; // invert screen
+                    dst[0] = dst[1] = dst[2] = 255;
+                    dst[3] = 255;
+                } else {
+                    dst[3] = 0;
                 }
-                // a==1, xr==0 -> transparent (leave the screen pixel)
             }
         }
-        return;
+        return true;
     }
 
-    // COLOR and MASKED_COLOR are both 32bpp BGRA.
+    out.width = shapeW;
+    out.height = shapeH;
+    out.bgra.resize(static_cast<size_t>(shapeW) * shapeH * 4);
     const bool masked = pointerShapeInfo_.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR;
     for (int y = 0; y < shapeH; ++y) {
         for (int x = 0; x < shapeW; ++x) {
-            int fx = posX + x, fy = posY + y;
-            if (!inFrame(fx, fy))
-                continue;
             const uint8_t* src = pointerShape_.data() + static_cast<size_t>(y) * pitch + static_cast<size_t>(x) * 4;
-            uint8_t* dst = bgra + static_cast<size_t>(fy) * stride + static_cast<size_t>(fx) * 4;
-            uint8_t alpha = src[3];
+            uint8_t* dst = out.bgra.data() + (static_cast<size_t>(y) * shapeW + x) * 4;
             if (masked) {
-                // MASKED_COLOR: alpha 0 => opaque copy, 0xFF => XOR with screen.
-                if (alpha == 0) {
-                    dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2];
+                if (src[3] == 0) {
+                    dst[0] = src[0];
+                    dst[1] = src[1];
+                    dst[2] = src[2];
+                    dst[3] = 255;
                 } else {
-                    dst[0] ^= src[0]; dst[1] ^= src[1]; dst[2] ^= src[2];
+                    dst[0] = dst[1] = dst[2] = 0;
+                    dst[3] = 0;
                 }
             } else {
-                // COLOR: straight per-pixel alpha blend.
-                dst[0] = static_cast<uint8_t>((src[0] * alpha + dst[0] * (255 - alpha)) / 255);
-                dst[1] = static_cast<uint8_t>((src[1] * alpha + dst[1] * (255 - alpha)) / 255);
-                dst[2] = static_cast<uint8_t>((src[2] * alpha + dst[2] * (255 - alpha)) / 255);
+                dst[0] = src[0];
+                dst[1] = src[1];
+                dst[2] = src[2];
+                dst[3] = src[3];
             }
         }
     }
+    return true;
 }
 
 } // namespace od

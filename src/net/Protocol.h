@@ -11,7 +11,7 @@
 // so a tiny field-scanner is enough and keeps the dependency footprint at zero.
 namespace od {
 
-enum class ControlType { Hello, Touch, Scroll, Pencil, Proximity, Kf, Unknown };
+enum class ControlType { Hello, Touch, Scroll, Pencil, Proximity, Kf, CursorAck, Unknown };
 
 enum class TouchPhase { Began, Moved, Ended, Cancelled, Unknown };
 
@@ -23,6 +23,8 @@ struct HelloMsg {
     int scale = 1;
     std::string device;
     std::string id;
+    // UDP cursor side channel (PROTOCOL 6.3). 0 = absent / stay on TCP.
+    int cursorPort = 0;
 };
 
 struct TouchMsg {

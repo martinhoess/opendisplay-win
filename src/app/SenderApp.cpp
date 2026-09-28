@@ -16,6 +16,8 @@
 #include "encode/H264Encoder.h"
 #include "input/InputInjector.h"
 #include "net/Connection.h"
+#include "net/CursorMessages.h"
+#include "net/CursorUdp.h"
 #include "net/Protocol.h"
 
 namespace od {
@@ -30,6 +32,7 @@ constexpr int kKeepaliveMs = 1000;       // max silence on a static screen; well
 constexpr int kActiveTailMs = 300;       // keep feeding the encoder this long after the last change (drains its 1-frame hold)
 constexpr int kWrongSizeGraceMs = 3000;  // how long the monitor may sit on a foreign size before we rebuild it
 constexpr int kBlockedRetryMs = 5000;    // how often a waiting iPad checks whether the display is free again
+constexpr int kCursorUdpAckMs = 5000;    // drop UDP and stay on TCP if no cursorAck (PROTOCOL 6.3)
 
 // Only one panel size may be on the air at a time.
 //
@@ -111,6 +114,13 @@ uint32_t EvenClamp(int32_t v, uint32_t fallback)
 {
     uint32_t u = v > 0 ? static_cast<uint32_t>(v) : fallback;
     return u & ~1u; // NV12 4:2:0 needs even dimensions
+}
+
+// usbmuxd cannot carry UDP (PROTOCOL 6.3). Loopback dials are the USB
+// binding on Windows when we add it; ignore cursorPort there.
+bool IsUsbLikeHost(const std::string& host)
+{
+    return host == "127.0.0.1" || host == "::1" || host == "localhost";
 }
 
 } // namespace
@@ -337,6 +347,16 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         std::atomic<bool> running{true};
         bool loggedPencil = false; // reader-thread only; one line per connection
 
+        // UDP cursor side channel (PROTOCOL 6.3). Declared before the reader so
+        // cursorAck can mark the channel confirmed. Positions get a session seq;
+        // mirror on TCP until ack, then UDP-only. cursorImg stays TCP.
+        CursorUdp cursorUdp;
+        std::mutex cursorNetMutex;
+        std::atomic<bool> cursorUdpConfirmed{false};
+        uint64_t cursorSeq = 0;
+        std::chrono::steady_clock::time_point cursorUdpOpened{};
+        bool cursorUdpGaveUp = false;
+
         std::thread reader([&] {
             while (running && !stopRequested_) {
                 auto frame = conn->ReadFrame();
@@ -381,6 +401,23 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                             height = h;
                             width_ = w;
                             height_ = h;
+                            // Rotation hello may re-advertise cursorPort; keep the
+                            // flow if the port is unchanged (Mac sender does this).
+                            const int port = msg->hello.cursorPort;
+                            std::lock_guard<std::mutex> clock(cursorNetMutex);
+                            if (port > 0 && port <= 65535 && !IsUsbLikeHost(ip)) {
+                                if (!cursorUdp.Ready()) {
+                                    if (cursorUdp.Open(ip, static_cast<uint16_t>(port))) {
+                                        cursorUdpConfirmed = false;
+                                        cursorUdpGaveUp = false;
+                                        cursorUdpOpened = std::chrono::steady_clock::now();
+                                        Logf(ip, "cursor UDP re-opened on port %d after hello\n", port);
+                                    }
+                                }
+                            } else if (port <= 0) {
+                                cursorUdp.Close();
+                                cursorUdpConfirmed = false;
+                            }
                         } else {
                             Logf(ip, "pipeline rebuild failed, disconnecting\n");
                             running = false;
@@ -420,6 +457,13 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                         input.SetMonitorRect(vdisp.MonitorRect());
                         input.HandleProximity(msg->proximity);
                         break;
+                    case ControlType::CursorAck: {
+                        std::lock_guard<std::mutex> clock(cursorNetMutex);
+                        if (cursorUdp.Ready() && !cursorUdpConfirmed.exchange(true)) {
+                            Logf(ip, "cursor UDP confirmed by receiver (positions leave TCP)\n");
+                        }
+                        break;
+                    }
                     default:
                         break;
                 }
@@ -427,6 +471,8 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         });
 
         std::vector<uint8_t> nv12;
+        std::string pendingCursorImg;
+        std::string pendingCursor;
         auto lastSend = std::chrono::steady_clock::now();
         auto lastChange = std::chrono::steady_clock::now() - std::chrono::milliseconds(kActiveTailMs);
         // A drop is "pending" until something goes out again. Guards the replay
@@ -440,6 +486,35 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         // Watchdog for the panel size (see the check further down): when the
         // monitor is left on a size that isn't this iPad's, this is when it
         // started, and how many rebuilds we already spent on it.
+
+        // WiFi only: dial hello.cursorPort on the same host as TCP.
+        std::string cursorProbe;
+        if (hello.cursorPort > 0 && hello.cursorPort <= 65535 && !IsUsbLikeHost(ip)) {
+            std::lock_guard<std::mutex> lock(cursorNetMutex);
+            if (cursorUdp.Open(ip, static_cast<uint16_t>(hello.cursorPort))) {
+                cursorUdpOpened = std::chrono::steady_clock::now();
+                Logf(ip, "cursor UDP channel opened on %s:%d (mirroring TCP until cursorAck)\n",
+                     ip.c_str(), hello.cursorPort);
+                // Probe immediately so cursorAck does not need a mouse move
+                // (PROTOCOL 6.3; Mac sender probes on UDP .ready).
+                ++cursorSeq;
+                cursorProbe = MakeCursorMessage(false, 0.0, 0.0, cursorSeq);
+                cursorUdp.Send(reinterpret_cast<const uint8_t*>(cursorProbe.data()),
+                               cursorProbe.size());
+            } else {
+                Logf(ip, "cursor UDP open failed for port %d, staying on TCP\n", hello.cursorPort);
+            }
+        } else if (hello.cursorPort > 0 && IsUsbLikeHost(ip)) {
+            Logf(ip, "ignoring cursorPort=%d on USB-like host\n", hello.cursorPort);
+        }
+        if (!cursorProbe.empty()) {
+            // Mirror the probe on TCP until ack (same seq; receiver dedups).
+            if (!conn->SendFrame(reinterpret_cast<const uint8_t*>(cursorProbe.data()),
+                                 static_cast<uint32_t>(cursorProbe.size()))) {
+                running = false;
+            }
+        }
+
         std::chrono::steady_clock::time_point wrongSizeSince{};
         bool sizeRebuildDone = false;
         bool sizeGiveUpLogged = false;
@@ -456,9 +531,27 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
                 std::lock_guard<std::mutex> lock(pipelineMutex);
 
                 nv12.resize(static_cast<size_t>(dup.Width()) * dup.Height() * 3 / 2);
-                // CaptureFrameNv12 returns false on a pure timeout (nothing on
-                // screen or cursor changed since last time).
-                bool changed = dup.CaptureFrameNv12(nv12, 1000 / static_cast<int>(kFps));
+                // CaptureResult: desktopChanged drives encode; cursor*
+                // go out as separate protocol messages (not baked into H.264).
+                CaptureResult cap = dup.CaptureFrameNv12(nv12, 1000 / static_cast<int>(kFps));
+                const bool changed = cap.desktopChanged;
+
+                pendingCursorImg.clear();
+                pendingCursor.clear();
+                if (cap.pointerShapeChanged) {
+                    PointerShapeBgra shape;
+                    if (dup.GetPointerShapeBgra(shape)) {
+                        pendingCursorImg = MakeCursorImgMessage(shape, dup.Width(), dup.Height());
+                    }
+                }
+                if (cap.cursorChanged || !pendingCursorImg.empty()) {
+                    const double invW = dup.Width() ? 1.0 / dup.Width() : 0.0;
+                    const double invH = dup.Height() ? 1.0 / dup.Height() : 0.0;
+                    const double cx = (dup.PointerX() + dup.PointerHotX()) * invW;
+                    const double cy = (dup.PointerY() + dup.PointerHotY()) * invH;
+                    ++cursorSeq;
+                    pendingCursor = MakeCursorMessage(dup.PointerVisible(), cx, cy, cursorSeq);
+                }
 
                 // Rotation or a resolution change made on the Windows side
                 // never sends a `hello`, so nothing rebuilds the pipeline: the
@@ -573,6 +666,46 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
 
                 if (running && (active || keepaliveDue))
                     encoded = encoder.EncodeNv12(nv12.data(), nv12.size());
+            }
+
+            // cursorImg always TCP. Positions: UDP when open; mirror TCP until
+            // cursorAck (or forever if UDP never opens / times out).
+            if (!pendingCursorImg.empty()) {
+                if (!conn->SendFrame(reinterpret_cast<const uint8_t*>(pendingCursorImg.data()),
+                                     static_cast<uint32_t>(pendingCursorImg.size()))) {
+                    running = false;
+                }
+                pendingCursorImg.clear();
+            }
+            if (running && !pendingCursor.empty()) {
+                bool udpOpen = false;
+                bool confirmed = cursorUdpConfirmed.load(std::memory_order_relaxed);
+                {
+                    std::lock_guard<std::mutex> lock(cursorNetMutex);
+                    udpOpen = cursorUdp.Ready();
+                    if (udpOpen) {
+                        cursorUdp.Send(reinterpret_cast<const uint8_t*>(pendingCursor.data()),
+                                       pendingCursor.size());
+                        if (!confirmed && !cursorUdpGaveUp &&
+                            cursorUdpOpened != std::chrono::steady_clock::time_point{} &&
+                            std::chrono::steady_clock::now() - cursorUdpOpened >
+                                std::chrono::milliseconds(kCursorUdpAckMs)) {
+                            cursorUdp.Close();
+                            cursorUdpGaveUp = true;
+                            udpOpen = false;
+                            Logf(ip, "no cursorAck within %dms, falling back to TCP cursor\n",
+                                 kCursorUdpAckMs);
+                        }
+                    }
+                }
+                const bool sendTcp = !udpOpen || !confirmed;
+                if (sendTcp) {
+                    if (!conn->SendFrame(reinterpret_cast<const uint8_t*>(pendingCursor.data()),
+                                         static_cast<uint32_t>(pendingCursor.size()))) {
+                        running = false;
+                    }
+                }
+                pendingCursor.clear();
             }
 
             bool sentSomething = false;
