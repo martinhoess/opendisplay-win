@@ -16,10 +16,13 @@ class Connection;
 // the headless CLI). The reconnect loop runs until stopped.
 class SenderApp {
 public:
-    // Blocked: an iPad with a different panel size is streaming. parsec-vdd
-    // puts one custom resolution on all of its virtual monitors, so this one
-    // would only get a letterboxed picture — it waits for the other to finish.
+    // Blocked: an iPad with a different panel size is streaming. We keep one
+    // panel size on the air (MTT serializes
+    // sizes) so this one waits rather than letterbox until the other finishes.
     enum class State { Idle, Connecting, Streaming, Blocked };
+
+    // How the current (or last) session reached the iPad. None when idle.
+    enum class Transport { None, Usb, Wifi };
 
     SenderApp() = default;
     ~SenderApp();
@@ -40,6 +43,7 @@ public:
 
     bool IsRunning() const { return running_.load(); }
     State GetState() const { return state_.load(); }
+    Transport GetTransport() const { return transport_.load(); }
     uint32_t Width() const { return width_.load(); }   // current capture px, 0 until connected
     uint32_t Height() const { return height_.load(); }
 
@@ -56,6 +60,7 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<bool> stopRequested_{false};
     std::atomic<State> state_{State::Idle};
+    std::atomic<Transport> transport_{Transport::None};
     std::atomic<uint32_t> width_{0};
     std::atomic<uint32_t> height_{0};
     std::atomic<uint32_t> blockedByWidth_{0};

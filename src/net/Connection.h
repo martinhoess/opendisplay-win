@@ -27,6 +27,9 @@ public:
     // Connects to ip:port, sets TCP_NODELAY. Returns nullopt on failure.
     static std::optional<Connection> Connect(const std::string& ip, uint16_t port);
 
+    // Takes ownership of an already-connected socket (usbmux tunnel).
+    static std::optional<Connection> FromSocket(SOCKET s);
+
     // Blocking read of the next framed message. Returns nullopt on
     // disconnect/socket error.
     std::optional<std::vector<uint8_t>> ReadFrame();

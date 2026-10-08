@@ -140,6 +140,7 @@ std::optional<ControlMessage> ParseControlMessage(const uint8_t* data, size_t si
         msg.touch.phase = ParseTouchPhase(FindStringField(json, "phase").value_or(""));
         msg.touch.x = FindNumberField(json, "x").value_or(0.0);
         msg.touch.y = FindNumberField(json, "y").value_or(0.0);
+        msg.touch.id = static_cast<uint32_t>(FindNumberField(json, "id").value_or(0.0));
     } else if (*type == "scroll") {
         msg.type = ControlType::Scroll;
         msg.scroll.dx = FindNumberField(json, "dx").value_or(0.0);
@@ -163,11 +164,15 @@ std::optional<ControlMessage> ParseControlMessage(const uint8_t* data, size_t si
         msg.type = ControlType::CursorAck;
     } else if (*type == "stats") {
         msg.type = ControlType::Stats;
+    } else if (*type == "ping") {
+        msg.type = ControlType::Ping;
+        msg.ping.t = FindNumberField(json, "t").value_or(0.0);
     } else {
-        msg.type = ControlType::Unknown; // e.g. "stats", "pong" -> ignored by caller
+        msg.type = ControlType::Unknown; // e.g. sender ignores receiver "pong"
     }
 
     return msg;
 }
 
 } // namespace od
+

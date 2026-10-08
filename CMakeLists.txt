@@ -16,14 +16,16 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 add_executable(opendisplay-win
   src/main.cpp
   src/net/Connection.cpp
+  src/net/UsbMux.cpp
   src/net/Protocol.cpp
   src/net/CursorMessages.cpp
   src/net/CursorUdp.cpp
   src/net/Mdns.cpp
   src/encode/AnnexB.cpp
   src/encode/H264Encoder.cpp
-  src/display/VirtualDisplay.cpp
   src/display/DesktopDuplication.cpp
+  src/display/ExistingMonitor.cpp
+  src/display/MttVddSettings.cpp
   src/input/InputInjector.cpp
   src/app/Log.cpp
   src/app/SenderApp.cpp
@@ -34,7 +36,6 @@ add_executable(opendisplay-win
 
 target_include_directories(opendisplay-win PRIVATE
   src
-  third_party/parsec-vdd
 )
 
 target_link_libraries(opendisplay-win PRIVATE
@@ -50,6 +51,7 @@ target_link_libraries(opendisplay-win PRIVATE
   setupapi
   cfgmgr32
   shell32
+  comctl32
   gdi32
   windowscodecs
   ole32
@@ -63,10 +65,11 @@ target_compile_definitions(opendisplay-win PRIVATE
 )
 
 # asInvoker (not requireAdministrator): the app runs un-elevated. The only
-# operation that needs admin is registering a new iPad resolution as a
-# parsec-vdd custom mode (one HKLM write); that path self-elevates a one-off
-# (`--register-resolution`). Running the whole app elevated is optional (tray
-# menu) — only needed to inject touch into elevated windows.
+# operations that need admin are writes to the MTT driver's settings dir
+# (C:\VirtualDisplayDriver: user_edid.bin, vdd_settings.xml flags / monitor
+# count); those self-elevate a one-off (`--ensure-mtt-edid`,
+# `--set-mtt-monitor-count`). Running the whole app elevated is optional (tray
+# menu) - only needed to inject touch into elevated windows.
 #
 # GUI subsystem so the tray app doesn't flash a console window, but keep
 # mainCRTStartup as the entry point so we still have a normal main(argc, argv)
@@ -76,3 +79,36 @@ target_link_options(opendisplay-win PRIVATE
   "/SUBSYSTEM:WINDOWS"
   "/ENTRY:mainCRTStartup"
 )
+
+
+# Standalone Media Foundation H.264 encoder probe (no capture/network).
+add_executable(mft_encoder_probe
+  tools/mft_encoder_probe/main.cpp
+)
+target_compile_definitions(mft_encoder_probe PRIVATE
+  UNICODE
+  _UNICODE
+  WIN32_LEAN_AND_MEAN
+  NOMINMAX
+)
+target_link_libraries(mft_encoder_probe PRIVATE
+  mfplat
+  mf
+  mfuuid
+  ole32
+  d3d11
+  dxgi
+)
+# Console subsystem so printf is visible when run from a terminal.
+set_target_properties(mft_encoder_probe PROPERTIES WIN32_EXECUTABLE FALSE)
+
+# Ship MTT CustomEdid binary next to the exe (EnsureCustomEdid looks here first).
+add_custom_command(TARGET opendisplay-win POST_BUILD
+  COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:opendisplay-win>/assets/mtt"
+  COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+          "${CMAKE_SOURCE_DIR}/assets/mtt/user_edid.bin"
+          "$<TARGET_FILE_DIR:opendisplay-win>/assets/mtt/user_edid.bin"
+  COMMENT "Copy MTT user_edid.bin next to opendisplay-win"
+)
+
+

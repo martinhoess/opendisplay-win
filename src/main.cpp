@@ -1,5 +1,6 @@
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fcntl.h>
 #include <io.h>
 #include <string>
@@ -12,10 +13,9 @@
 
 #include "app/SenderApp.h"
 #include "app/TrayApp.h"
-#include "display/VirtualDisplay.h"
+#include "display/MttVddSettings.h"
 #include "net/Mdns.h"
 
-#include "parsec-vdd.h" // VDD_MAX_DISPLAYS, to range-check --remove-display
 
 namespace {
 
@@ -44,6 +44,11 @@ void RedirectLogToFile(const std::string& name)
     FILE* f = nullptr;
     freopen_s(&f, "NUL", "w", stdout);
     freopen_s(&f, "NUL", "w", stderr);
+
+    // Keep the previous run's log (e.g. what Quit / session end did) as
+    // log.prev.txt instead of truncating it away.
+    if (name == "log.txt")
+        (void)MoveFileExA(logPath.c_str(), (dir + "\\log.prev.txt").c_str(), MOVEFILE_REPLACE_EXISTING);
 
     HANDLE h = CreateFileA(logPath.c_str(), GENERIC_WRITE,
                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, CREATE_ALWAYS,
@@ -99,6 +104,26 @@ LONG WINAPI CrashLogger(EXCEPTION_POINTERS* ep)
     return EXCEPTION_EXECUTE_HANDLER; // let the process terminate
 }
 
+// "WxH" in argv[i], or "W H" in argv[i], argv[i+1]. False if absent/invalid.
+bool ParseHelloSizeArgs(int argc, char** argv, int i, uint32_t& w, uint32_t& h)
+{
+    if (i >= argc)
+        return false;
+    unsigned long a = 0, b = 0;
+    char* end = nullptr;
+    a = strtoul(argv[i], &end, 10);
+    if (end && (*end == 'x' || *end == 'X')) {
+        b = strtoul(end + 1, nullptr, 10);
+    } else if (i + 1 < argc) {
+        b = strtoul(argv[i + 1], nullptr, 10);
+    }
+    if (a == 0 || b == 0 || a > 16384 || b > 16384)
+        return false;
+    w = static_cast<uint32_t>(a);
+    h = static_cast<uint32_t>(b);
+    return true;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -122,8 +147,11 @@ int main(int argc, char** argv)
     MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
 
     std::string command = argc >= 2 ? argv[1] : "";
-    bool oneOff = command == "--register-resolution" || command == "--cleanup-monitors" ||
-                  command == "--remove-display" || command == "--browse-mdns";
+    bool oneOff = command == "--browse-mdns" ||
+                  command == "--ensure-mtt-resolutions" || command == "--ensure-mtt-edid" ||
+                  command == "--dump-mtt-edid" ||
+                  command == "--set-mtt-monitor-count" ||
+                  command == "--teardown-mtt-vdd" || command == "--ensure-mtt-vdd";
 
     // A one-off answers into the caller's terminal; a sender writes to the log,
     // and a headless one gets its own file so two of them don't truncate each
@@ -133,6 +161,19 @@ int main(int argc, char** argv)
 
     SetUnhandledExceptionFilter(CrashLogger);
 
+    // Clear leftover DirectX UserGpuPreferences for this exe (Intel-first DXGI).
+    if (!oneOff) {
+        wchar_t exePath[MAX_PATH] = {};
+        if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) && exePath[0]) {
+            HKEY key = nullptr;
+            if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\DirectX\\UserGpuPreferences",
+                              0, KEY_SET_VALUE, &key) == ERROR_SUCCESS) {
+                RegDeleteValueW(key, exePath);
+                RegCloseKey(key);
+            }
+        }
+    }
+
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
         fprintf(stderr, "WSAStartup failed\n");
@@ -140,30 +181,70 @@ int main(int argc, char** argv)
     }
 
     int rc = 0;
-    if (argc >= 4 && std::string(argv[1]) == "--register-resolution") {
-        // Elevated one-off: register a custom resolution (+ its rotation) so the
-        // virtual monitor can use it. Invoked by the self-elevate path or by hand.
-        auto w = static_cast<uint32_t>(strtoul(argv[2], nullptr, 10));
-        auto h = static_cast<uint32_t>(strtoul(argv[3], nullptr, 10));
-        bool ok = w > 0 && h > 0 && od::VirtualDisplay::RegisterResolutions(w, h);
-        printf("register %ux%u: %s\n", w, h, ok ? "ok" : "failed");
+    if ((argc >= 2 && std::string(argv[1]) == "--ensure-mtt-edid") ||
+               (argc >= 2 && std::string(argv[1]) == "--ensure-mtt-resolutions")) {
+        // Elevated one-off (SelfElevateEnsure): with a hello size WxH, generate
+        // that iPad's EDID + XML modes; without, install the shipped
+        // user_edid.bin. Sets CustomEdid/PreventSpoof, reloads MttVDD only if
+        // something changed.
+        uint32_t helloW = 0, helloH = 0;
+        od::MttEnsureResult r = ParseHelloSizeArgs(argc, argv, 2, helloW, helloH)
+                                    ? od::EnsureCustomEdidForHello(helloW, helloH, /*dryRun=*/false)
+                                    : od::EnsureCustomEdid();
+        const bool ok = r.ok;
+        printf("ensure-mtt-edid: %s (added %d, changed=%d) path=%ls detail=%s\n",
+               ok ? "ok" : "failed", r.added, r.changed ? 1 : 0, r.path.c_str(), r.detail.c_str());
         rc = ok ? 0 : 1;
-    } else if (argc >= 3 && std::string(argv[1]) == "--remove-display") {
-        // Explicit one-off: unplug the virtual display at this index. Cleans up
-        // after a sender that was killed rather than stopped — the driver keeps
-        // such a display attached to the desktop for as long as any client
-        // holds the adapter open.
-        // Range-checked before it reaches the driver: the index goes straight
-        // into an IOCTL, and parsec-vdd has VDD_MAX_DISPLAYS slots.
-        int index = atoi(argv[2]);
-        if (index < 0 || index >= parsec_vdd::VDD_MAX_DISPLAYS) {
-            printf("remove display %d: refused, index must be 0..%d\n", index, parsec_vdd::VDD_MAX_DISPLAYS - 1);
+
+    } else if (argc >= 2 && std::string(argv[1]) == "--dump-mtt-edid") {
+        // Diagnostics (no admin, touches nothing): --dump-mtt-edid WxH [out.bin]
+        // prints the generated mode list and writes the EDID bytes, for
+        // byte-comparison with tools/gen_user_edid.py --size WxH.
+        uint32_t helloW = 0, helloH = 0;
+        if (!ParseHelloSizeArgs(argc, argv, 2, helloW, helloH)) {
+            printf("usage: --dump-mtt-edid WxH [out.bin]\n");
             rc = 1;
         } else {
-            bool ok = od::VirtualDisplay::RemoveDisplayIndex(index);
-            printf("remove display %d: %s\n", index, ok ? "sent" : "failed (driver handle?)");
-            rc = ok ? 0 : 1;
+            const std::vector<od::MttMode> modes = od::MttModesForHello(helloW, helloH);
+            const std::vector<uint8_t> edid = od::BuildMttEdid(modes);
+            printf("%ux%u:", helloW, helloH);
+            for (size_t i = 0; i < modes.size(); ++i)
+                printf("%s %ux%u@%u", i ? "," : "", modes[i].width, modes[i].height, modes[i].hz);
+            printf("\n");
+            const bool sizeIsOneArg = strchr(argv[2], 'x') != nullptr || strchr(argv[2], 'X') != nullptr;
+            const int outIdx = sizeIsOneArg ? 3 : 4;
+            if (edid.size() != 128) {
+                printf("EDID generation failed\n");
+                rc = 1;
+            } else if (outIdx < argc) {
+                FILE* f = nullptr;
+                if (fopen_s(&f, argv[outIdx], "wb") == 0 && f) {
+                    fwrite(edid.data(), 1, edid.size(), f);
+                    fclose(f);
+                    printf("wrote %s (128 bytes)\n", argv[outIdx]);
+                } else {
+                    printf("cannot write %s\n", argv[outIdx]);
+                    rc = 1;
+                }
+            }
         }
+    } else if (argc >= 3 && std::string(argv[1]) == "--set-mtt-monitor-count") {
+        // Elevated one-shot: set <monitors><count> in live MTT settings and reload.
+        // Invoked by SelfElevateSetMonitorCount (ensure/teardown path).
+        auto n = static_cast<uint32_t>(strtoul(argv[2], nullptr, 10));
+        od::MttEnsureResult r = od::SetMonitorCount(n);
+        printf("set-mtt-monitor-count %u: %s changed=%d detail=%s\n", n, r.ok ? "ok" : "failed",
+               r.changed ? 1 : 0, r.detail.c_str());
+        rc = r.ok ? 0 : 1;
+    } else if (argc >= 2 && std::string(argv[1]) == "--teardown-mtt-vdd") {
+        // Verify last-client teardown path without an iPad session.
+        bool ok = od::TearDownMttVdd("cli");
+        printf("teardown-mtt-vdd: %s\n", ok ? "ok" : "failed");
+        rc = ok ? 0 : 1;
+    } else if (argc >= 2 && std::string(argv[1]) == "--ensure-mtt-vdd") {
+        bool ok = od::EnsureMttVddAttached("cli");
+        printf("ensure-mtt-vdd: %s\n", ok ? "ok" : "failed");
+        rc = ok ? 0 : 1;
     } else if (argc >= 2 && std::string(argv[1]) == "--browse-mdns") {
         // Checks the response parser against malformed packets, then shows what
         // is actually advertising right now — the parser reads data from
@@ -173,10 +254,11 @@ int main(int argc, char** argv)
             printf("%s  %s  host=%s port=%u id=%s\n", receiver.address.c_str(), receiver.instance.c_str(),
                    receiver.host.c_str(), receiver.port, receiver.id.c_str());
         rc = ok ? 0 : 1;
-    } else if (argc >= 2 && std::string(argv[1]) == "--cleanup-monitors") {
-        // Explicit one-off: drop phantom virtual monitors from earlier runs.
-        int n = od::VirtualDisplay::CleanupGhostMonitors();
-        printf("removed %d leftover virtual monitor(s)\n", n);
+    } else if (argc >= 2 && (std::string(argv[1]) == "--register-resolution" ||
+                              std::string(argv[1]) == "--remove-display" ||
+                              std::string(argv[1]) == "--cleanup-monitors")) {
+        printf("%s: removed (MTT-only fork; use --ensure-mtt-* / --teardown-mtt-vdd)\n", argv[1]);
+        rc = 1;
     } else if (argc >= 2) {
         // Headless CLI mode: stream to the given IP until killed (handy for
         // testing/scripting; logging goes to the inherited/redirected stdout).

@@ -94,6 +94,15 @@ std::optional<Connection> Connection::Connect(const std::string& ip, uint16_t po
     return Connection(s);
 }
 
+std::optional<Connection> Connection::FromSocket(SOCKET s)
+{
+    if (s == INVALID_SOCKET)
+        return std::nullopt;
+    BOOL noDelay = TRUE;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&noDelay), sizeof(noDelay));
+    return Connection(s);
+}
+
 bool Connection::WaitWritable(int timeoutMs)
 {
     if (!IsValid())

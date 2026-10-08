@@ -11,7 +11,7 @@
 // so a tiny field-scanner is enough and keeps the dependency footprint at zero.
 namespace od {
 
-enum class ControlType { Hello, Touch, Scroll, Pencil, Proximity, Kf, CursorAck, Stats, Unknown };
+enum class ControlType { Hello, Touch, Scroll, Pencil, Proximity, Kf, CursorAck, Stats, Ping, Unknown };
 
 enum class TouchPhase { Began, Moved, Ended, Cancelled, Unknown };
 
@@ -31,6 +31,9 @@ struct TouchMsg {
     TouchPhase phase = TouchPhase::Unknown;
     double x = 0.0; // normalized [0,1], origin top-left
     double y = 0.0;
+    // Wire contact id when present; absent => 0. Single-finger today; multi
+    // fingers reuse the same frame shape with distinct ids.
+    uint32_t id = 0;
 };
 
 struct ScrollMsg {
@@ -57,6 +60,10 @@ struct PencilMsg {
     // Pencil Pro, which upstream has not wired up yet. Not parsed.
 };
 
+struct PingMsg {
+    double t = 0.0; // ms since Unix epoch on the receiver's clock
+};
+
 struct ProximityMsg {
     bool entering = false; // pen entered (true) or left (false) hover range
     double x = 0.0;
@@ -70,6 +77,7 @@ struct ControlMessage {
     ScrollMsg scroll;
     PencilMsg pencil;
     ProximityMsg proximity;
+    PingMsg ping;
 };
 
 // Wire classification rule (spec §3 / PhoneReceiver.handleAnnexB):
@@ -77,8 +85,9 @@ struct ControlMessage {
 bool IsControlPayload(const uint8_t* data, size_t size);
 
 // Parses a payload that already passed IsControlPayload(). Unrecognized "type"
-// values (e.g. "stats", "pong") parse successfully as ControlType::Unknown so
+// values (e.g. "pong" from us, unknown future types) parse as ControlType::Unknown so
 // callers can ignore them without treating them as errors.
 std::optional<ControlMessage> ParseControlMessage(const uint8_t* data, size_t size);
 
 } // namespace od
+

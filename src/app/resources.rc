@@ -6,20 +6,66 @@
 // the dialog.
 #pragma code_page(65001)
 
-IDD_SETTINGS DIALOGEX 0, 0, 230, 203
+// Tabbed Settings: General (narrow Nearby | Add/Remove | Your iPads) + Advanced.
+// SysTabControl32 fills the content area above OK/Cancel; TrayApp.cpp uses
+// TCM_ADJUSTRECT and positions page controls inside the display rect.
+// OK/Cancel stay outside/below the tabs. Fixed size (no expand/collapse).
+IDD_SETTINGS DIALOGEX 0, 0, 272, 294
 STYLE DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "opendisplay-win - Settings"
+CAPTION "OpenDisplay - Settings"
 FONT 9, "Segoe UI"
 BEGIN
-    LTEXT           "One iPad per line, address first, then a name of your choosing:", -1, 10, 8, 210, 10
-    EDITTEXT        IDC_IP, 10, 20, 210, 48, ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL | WS_VSCROLL
-    LTEXT           "e.g. 192.168.1.42 Mini — the name is only for the tray menu.", -1, 10, 71, 210, 10
-    LTEXT           "Port:", -1, 10, 86, 40, 10
-    EDITTEXT        IDC_PORT, 55, 84, 55, 13, ES_AUTOHSCROLL | ES_NUMBER
-    AUTOCHECKBOX    "Connect to the iPads automatically when running", IDC_AUTORECONNECT, 10, 104, 210, 10
-    AUTOCHECKBOX    "Start with Windows (launch at logon)", IDC_AUTOSTART, 10, 118, 210, 10
-    LTEXT           "Runs without admin. Admin is only needed once, to register a new iPad's resolution (you'll get a UAC prompt on first connect). ""Run as administrator"" from the tray menu also lets touch control elevated windows.",
-                    -1, 10, 136, 210, 44
-    DEFPUSHBUTTON   "OK", IDOK, 116, 182, 50, 15
-    PUSHBUTTON      "Cancel", IDCANCEL, 170, 182, 50, 15
+    CONTROL         "", IDC_SETTINGS_TABS, "SysTabControl32", WS_CHILD | WS_CLIPSIBLINGS | WS_VISIBLE | WS_TABSTOP, 8, 6, 256, 262
+
+    // --- General tab ---
+    LTEXT           "Open OpenDisplay on your iPad (same Wi-Fi).", IDC_LEAD_HINT, 16, 34, 240, 10
+
+    GROUPBOX        "Nearby", IDC_NEARBY_GROUP, 16, 48, 84, 100
+    LISTBOX         IDC_NEARBY, 22, 60, 72, 64, LBS_NOTIFY | WS_VSCROLL | WS_TABSTOP
+    PUSHBUTTON      "Refresh", IDC_REFRESH_NEARBY, 22, 128, 48, 14
+    LTEXT           "", IDC_NEARBY_HINT, 16, 152, 240, 10
+
+    PUSHBUTTON      "Add >", IDC_ADD_NEARBY, 108, 76, 52, 14
+    PUSHBUTTON      "< Remove", IDC_REMOVE_SAVED, 108, 96, 52, 14
+
+    GROUPBOX        "Your iPads", IDC_SAVED_GROUP, 168, 48, 84, 100
+    LISTBOX         IDC_SAVED, 174, 60, 72, 64, LBS_NOTIFY | WS_VSCROLL | WS_TABSTOP
+
+    GROUPBOX        "Connection", IDC_CONNECTION_GROUP, 16, 166, 240, 54
+    AUTOCHECKBOX    "Connect automatically when OpenDisplay is running", IDC_AUTORECONNECT, 24, 178, 224, 10
+    AUTOCHECKBOX    "Stay connected over Wi-Fi if the USB cable drops.", IDC_USB_WIFI_FAILOVER, 24, 190, 224, 10
+    AUTOCHECKBOX    "Start with Windows", IDC_AUTOSTART, 24, 202, 224, 10
+
+    GROUPBOX        "Quality", IDC_QUALITY_GROUP, 16, 224, 240, 40
+    LTEXT           "Streaming quality:", IDC_QUALITY_LABEL, 24, 238, 100, 10
+    COMBOBOX        IDC_PICTURE_PRESET, 130, 236, 116, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+
+    // --- Advanced tab (same band; shown/hidden by tab selection) ---
+    GROUPBOX        "Manual add / rename", IDC_ADV_MANUAL_GROUP, 16, 34, 240, 70
+    LTEXT           "One per line: address, then an optional nickname.", IDC_ADV_MANUAL_HINT, 24, 46, 224, 10
+    EDITTEXT        IDC_DEVICES, 24, 58, 224, 30, ES_MULTILINE | ES_WANTRETURN | ES_AUTOVSCROLL | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Example: 192.168.1.42 Living Room", IDC_ADV_MANUAL_EXAMPLE, 24, 90, 224, 10
+
+    LTEXT           "Port:", IDC_ADV_PORT_LABEL, 24, 112, 32, 10
+    EDITTEXT        IDC_PORT, 58, 110, 50, 13, ES_AUTOHSCROLL | ES_NUMBER | WS_TABSTOP
+
+    AUTOCHECKBOX    "Separate USB and Wi-Fi quality settings", IDC_SEPARATE_USB_WIFI, 24, 128, 224, 10
+
+    LTEXT           "USB", IDC_ADV_USB_LABEL, 24, 146, 40, 10
+    LTEXT           "Mode:", IDC_ADV_USB_MODE_LABEL, 24, 160, 32, 10
+    COMBOBOX        IDC_USB_ENCODE_MODE, 58, 158, 70, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Preset:", IDC_ADV_USB_PRESET_LABEL, 138, 160, 36, 10
+    COMBOBOX        IDC_USB_ENCODE_PRESET, 176, 158, 72, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+
+    LTEXT           "Wi-Fi", IDC_ADV_WIFI_LABEL, 24, 178, 40, 10
+    LTEXT           "Mode:", IDC_ADV_WIFI_MODE_LABEL, 24, 192, 32, 10
+    COMBOBOX        IDC_WIFI_ENCODE_MODE, 58, 190, 70, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Preset:", IDC_ADV_WIFI_PRESET_LABEL, 138, 192, 36, 10
+    COMBOBOX        IDC_WIFI_ENCODE_PRESET, 176, 190, 72, 60, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+
+    PUSHBUTTON      "Restart as administrator", IDC_RESTART_ADMIN, 24, 214, 140, 14
+    LTEXT           "Admin is only needed so touch works in elevated windows, and once to register a new iPad resolution (Windows may ask for permission).", IDC_ADMIN_NOTE, 24, 232, 224, 28
+
+    DEFPUSHBUTTON   "OK", IDOK, 156, 276, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 214, 276, 50, 14
 END
