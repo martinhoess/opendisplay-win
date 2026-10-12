@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 // Control-message model for the OpenDisplay wire protocol (receiver -> sender).
 // Deliberately not a general JSON library: the protocol only ever carries a
@@ -17,6 +18,16 @@ enum class TouchPhase { Began, Moved, Ended, Cancelled, Unknown };
 
 enum class PencilPhase { Hover, Down, Move, Up, Unknown };
 
+// One hello.videoCaps envelope (PROTOCOL 6.5). 0 = limit absent. All limits
+// in one entry apply together; entries for the same codec are alternatives.
+struct VideoCapEntry {
+    std::string codec; // lowercase token, e.g. "h264", "hevc"
+    uint32_t maxWidth = 0;
+    uint32_t maxHeight = 0;
+    uint32_t maxFrameRate = 0;
+    uint64_t maxPixelsPerSecond = 0;
+};
+
 struct HelloMsg {
     int pixelsWide = 0;
     int pixelsHigh = 0;
@@ -25,7 +36,16 @@ struct HelloMsg {
     std::string id;
     // UDP cursor side channel (PROTOCOL 6.3). 0 = absent / stay on TCP.
     int cursorPort = 0;
+    // pv 3 (PROTOCOL 6.5). 0 = absent (legacy default 60 FPS).
+    uint32_t displayMaxFrameRate = 0;
+    std::vector<VideoCapEntry> videoCaps; // empty = absent (legacy H.264)
 };
+
+// Highest frame rate we may stream to this receiver with `codec` at an
+// encoded raster of width x height: min(displayMaxFrameRate, the best
+// matching videoCaps envelope's maxFrameRate / maxPixelsPerSecond). Absent
+// fields impose nothing; nothing at all means 60.
+uint32_t StreamFpsLimit(const HelloMsg& hello, const char* codec, uint32_t width, uint32_t height);
 
 struct TouchMsg {
     TouchPhase phase = TouchPhase::Unknown;

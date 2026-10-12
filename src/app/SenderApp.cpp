@@ -58,7 +58,6 @@ int NoHelloBackoffMs(int failures)
     return (std::min)(ms, kNoHelloBackoffMaxMs);
 }
 constexpr int kKeepaliveMs = 1000;       // max silence on a static screen; well under the iPad's ~5s watchdog
-constexpr int kActiveTailMs = 300;       // keep feeding the encoder this long after the last change (drains its 1-frame hold)
 constexpr int kWrongSizeGraceMs = 3000;  // how long the monitor may sit on a foreign size before we rebuild it
 constexpr int kBlockedRetryMs = 5000;    // how often a waiting iPad checks whether the display is free again
 constexpr int kCursorUdpAckMs = 5000;    // drop UDP and stay on TCP if no cursorAck (PROTOCOL 6.3)
@@ -795,6 +794,12 @@ while (!stopRequested_) {
         // mirror on TCP until ack, then UDP-only. cursorImg stays TCP.
         CursorUdp cursorUdp;
         std::mutex cursorNetMutex;
+        // The receiver's rate envelope (displayMaxFrameRate + videoCaps) from
+        // the latest hello; the reader updates it on every re-hello and bumps
+        // rateHelloGen so the capture loop recomputes its frame-rate limit.
+        std::mutex rateHelloMutex;
+        HelloMsg rateHello = hello;
+        std::atomic<uint32_t> rateHelloGen{1};
         std::atomic<bool> cursorUdpConfirmed{false};
         std::atomic<bool> cursorForce{false}; // shape changed: resend position now
         uint64_t cursorSeq = 0;                // under cursorNetMutex
@@ -846,6 +851,11 @@ std::thread reader([&] {
                         break;
                     }
                     case ControlType::Hello: {
+                        {
+                            std::lock_guard<std::mutex> rlock(rateHelloMutex);
+                            rateHello = msg->hello;
+                        }
+                        ++rateHelloGen;
                         // Rotation / panel-size change: rebuild. Same-size hello
                         // again (common right after connect) must not tear down
                         // capture+encoder under live input - that flash+crash.
@@ -954,7 +964,6 @@ std::thread reader([&] {
         std::vector<uint8_t> nv12;
         std::string pendingCursorImg;
         auto lastSend = std::chrono::steady_clock::now();
-        auto lastChange = std::chrono::steady_clock::now() - std::chrono::milliseconds(kActiveTailMs);
         // A drop is "pending" until something goes out again. Guards the replay
         // below against re-arming itself on every failed attempt.
         bool dropPending = false;
@@ -1121,10 +1130,20 @@ std::thread reader([&] {
         std::chrono::steady_clock::time_point cadenceSince = std::chrono::steady_clock::now();
         uint32_t cadencePresents = 0;
         uint32_t cadenceEncCalls = 0;
-        // Encode pacing (see the encode step below).
-        std::chrono::steady_clock::time_point lastEncodeAt{};
-        std::chrono::steady_clock::time_point lastPaceCheck{};
-        uint32_t paceHz = static_cast<uint32_t>(kFps);
+        // Frame-rate limiter (no sleeping): at most one encode per slot of
+        // 1/fpsLimit, on an anchored schedule. A frame that arrives early is
+        // held as "pending" (the capture's NV12 buffer/texture always holds
+        // the newest one) and AcquireNextFrame's timeout is shortened to the
+        // slot, so it goes out on time - the only wait is that existing call.
+        using Clock = std::chrono::steady_clock; // QPC on Windows
+        constexpr int kIdleCaptureTimeoutMs = 1000 / static_cast<int>(kFps);
+        uint32_t fpsLimit = 60;
+        uint32_t fpsLimitGen = 0;
+        uint32_t fpsLimitW = 0, fpsLimitH = 0;
+        Clock::duration slot = std::chrono::microseconds(1'000'000 / 60);
+        Clock::duration earlyWindow = slot / 4;
+        Clock::time_point nextSlot{};
+        bool framePending = false;
         uint32_t cadenceAus = 0;
         uint32_t cadenceSends = 0;
         uint32_t cadenceTimeouts = 0;
@@ -1132,6 +1151,39 @@ std::thread reader([&] {
         while (running && !stopRequested_) {
             std::vector<EncodedFrame> encoded;
             int64_t capMs = 0;
+            // Recompute the limit on a new hello or a new encoded raster.
+            if (rateHelloGen.load() != fpsLimitGen || encoder.Width() != fpsLimitW ||
+                encoder.Height() != fpsLimitH) {
+                fpsLimitGen = rateHelloGen.load();
+                fpsLimitW = encoder.Width();
+                fpsLimitH = encoder.Height();
+                HelloMsg rh;
+                {
+                    std::lock_guard<std::mutex> rlock(rateHelloMutex);
+                    rh = rateHello;
+                }
+                const uint32_t limit = StreamFpsLimit(rh, "h264", fpsLimitW, fpsLimitH);
+                if (limit != fpsLimit || fpsLimitGen == 1) {
+                    uint32_t capsRate = 0;
+                    for (const VideoCapEntry& e : rh.videoCaps)
+                        if (e.codec == "h264")
+                            capsRate = (std::max)(capsRate, e.maxFrameRate);
+                    Logf(ip, "fps limit %u (displayMaxFrameRate=%u, h264 videoCaps maxFrameRate=%u, %zu caps, %ux%u)\n",
+                         limit, rh.displayMaxFrameRate, capsRate, rh.videoCaps.size(), fpsLimitW, fpsLimitH);
+                }
+                fpsLimit = limit;
+                slot = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(1.0 / fpsLimit));
+                earlyWindow = slot / 4;
+            }
+            // Capture timeout: up to the next slot while a frame waits,
+            // otherwise the normal idle cadence.
+            int captureTimeoutMs = kIdleCaptureTimeoutMs;
+            if (framePending) {
+                const auto left = nextSlot - Clock::now();
+                const auto leftMs = std::chrono::ceil<std::chrono::milliseconds>(left).count();
+                captureTimeoutMs = static_cast<int>((std::max)(0LL, (std::min)(static_cast<long long>(leftMs),
+                                                                               static_cast<long long>(kIdleCaptureTimeoutMs))));
+            }
             {
                 // Only capture+encode need the pipeline lock (they touch dup
                 // and encoder, which the reader thread may rebuild on
@@ -1147,15 +1199,14 @@ std::thread reader([&] {
                 Microsoft::WRL::ComPtr<ID3D11Texture2D> gpuNv12;
                 CaptureResult cap{};
                 if (gpuNv12Path) {
-                    cap = dup.CaptureFrameNv12Gpu(gpuNv12, encoder.Width(), encoder.Height(),
-                                                  1000 / static_cast<int>(kFps));
+                    cap = dup.CaptureFrameNv12Gpu(gpuNv12, encoder.Width(), encoder.Height(), captureTimeoutMs);
                     if (cap.desktopChanged && !gpuNv12) {
                         // VP convert failed mid-stream - drop to CPU for this process.
                         Logf(ip, "GPU NV12 capture failed - falling back to CPU BGRA->NV12\n");
                         gpuNv12Path = false;
                         haveGpuDesktopFrame = false;
                         nv12.resize(static_cast<size_t>(dup.Width()) * dup.Height() * 3 / 2);
-                        cap = dup.CaptureFrameNv12(nv12, 1000 / static_cast<int>(kFps));
+                        cap = dup.CaptureFrameNv12(nv12, captureTimeoutMs);
                     } else if (cap.desktopChanged && gpuNv12 && !haveGpuDesktopFrame) {
                         // First real present after connect/rebuild: IDR so the iPad
                         // leaves its black decoder state immediately.
@@ -1168,11 +1219,13 @@ std::thread reader([&] {
                     }
                 } else {
                     nv12.resize(static_cast<size_t>(dup.Width()) * dup.Height() * 3 / 2);
-                    cap = dup.CaptureFrameNv12(nv12, 1000 / static_cast<int>(kFps));
+                    cap = dup.CaptureFrameNv12(nv12, captureTimeoutMs);
                 }
                 const bool changed = cap.desktopChanged;
-                if (changed)
+                if (changed) {
                     ++cadencePresents;
+                    framePending = true; // newest image is in nv12 / the GPU texture
+                }
                 else if (!cap.acquired)
                     ++cadenceTimeouts;
 
@@ -1385,47 +1438,31 @@ std::thread reader([&] {
                          dup.Width(), dup.Height(), width, height, width, height);
                 }
 
-                if (changed)
-                    lastChange = now;
-
-                // The async encoder holds one frame until the *next* frame is
-                // fed, so if we stopped feeding the instant the screen went
-                // idle, the last frame of an interaction (a tap, the end of a
-                // scroll) would sit in the encoder until the next change or
-                // keepalive — up to a second later, which feels sluggish. Keep
-                // feeding at capture rate for a short tail after the last
-                // change so the encoder stays drained and interaction stays
-                // low-latency.
-                bool active = now - lastChange < std::chrono::milliseconds(kActiveTailMs);
-
                 // Keepalive re-encodes the last image (a tiny P-frame) so the
                 // iPad's ~5s liveness watchdog (spec §5) never trips on an
                 // otherwise idle desktop. GPU path only encodes once we have a
                 // real present (CaptureFrameNv12Gpu returns null until then);
                 // do not fall through to an empty CPU buffer.
-                bool keepaliveDue = now - lastSend >= std::chrono::milliseconds(kKeepaliveMs);
+                const bool keepaliveDue = now - lastSend >= std::chrono::milliseconds(kKeepaliveMs);
 
-                // Pace: never encode (and so never send) faster than the target
-                // fps or the head's refresh, whichever is lower. Without this
-                // the event-driven encoder re-encoded the held frame as fast as
-                // the loop spun (200+/s of duplicates). Wait out the rest of
-                // the slot rather than skip, so the newest frame still goes.
-                if (running && (active || keepaliveDue)) {
-                    if (now - lastPaceCheck > std::chrono::seconds(1)) {
-                        lastPaceCheck = now;
-                        paceHz = (std::max)(1u, (std::min)(static_cast<uint32_t>(kFps), backend->RefreshHz()));
-                    }
-                    const auto slot = std::chrono::microseconds(1'000'000 / paceHz);
-                    const auto since = std::chrono::steady_clock::now() - lastEncodeAt;
-                    if (since < slot) {
-                        const auto waitMs = std::chrono::duration_cast<std::chrono::milliseconds>(slot - since).count();
-                        if (waitMs > 0)
-                            Sleep(static_cast<DWORD>(waitMs));
-                    }
-                    lastEncodeAt = std::chrono::steady_clock::now();
+                // Encode only a new image (pending) or the keepalive, and only
+                // once its slot opens (a little early is fine). Nothing new
+                // means nothing encoded: no duplicate tail. The async encoder's
+                // held AU is collected below instead.
+                const auto nowEnc = Clock::now();
+                const bool slotOpen = nowEnc >= nextSlot - earlyWindow;
+                const bool doEncode = running && slotOpen && (framePending || keepaliveDue);
+                if (doEncode) {
+                    framePending = false;
+                    nextSlot += slot;
+                    if (nowEnc > nextSlot + slot) // idle or stalled: re-anchor
+                        nextSlot = nowEnc + slot;
+                } else if (running) {
+                    encoded = encoder.CollectPending();
+                    cadenceAus += static_cast<uint32_t>(encoded.size());
                 }
 
-                if (running && (active || keepaliveDue)) {
+                if (doEncode) {
                     if (gpuNv12Path) {
                         // last-good texture from CaptureFrameNv12Gpu (or null
                         // before the first present / after Open reset).
@@ -1543,18 +1580,18 @@ std::thread reader([&] {
                     // image, and Desktop Duplication delivers nothing new once
                     // the desktop goes static, so the correction would wait for
                     // the keepalive — up to a second. Count the drop as a
-                    // change: the active tail re-feeds the last captured buffer
-                    // right away, no second timer needed (upstream does the
-                    // same with a dedicated 30ms replay timer, see #207).
+                    // pending frame: the limiter re-feeds the last captured image
+                    // in the next slot, no second timer needed (upstream does
+                    // the same with a dedicated 30ms replay timer, see #207).
                     //
                     // Only for the *first* drop of an episode. Re-arming on
-                    // every failed attempt would keep `active` true for as long
+                    // every failed attempt would keep a frame pending for as long
                     // as the link stays congested, burning an encode per
                     // WaitWritable timeout on frames nobody can receive. One
                     // prompt replay, then fall back to the keepalive until the
                     // socket drains.
                     if (!dropPending) {
-                        lastChange = std::chrono::steady_clock::now();
+                        framePending = true; // re-send the current image in the next slot
                         dropPending = true;
                         // Once per episode, not per dropped frame: on a link
                         // that stays congested this would otherwise be the

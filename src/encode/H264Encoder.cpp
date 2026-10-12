@@ -1315,5 +1315,12 @@ std::vector<EncodedFrame> H264Encoder::EncodeDxgiNv12(ID3D11Texture2D* nv12)
     return outFrames;
 }
 
-} // namespace od
+std::vector<EncodedFrame> H264Encoder::CollectPending()
+{
+    std::vector<EncodedFrame> outFrames;
+    if (impl_->configured && impl_->isAsync)
+        impl_->DrainAvailableAsync(outFrames);
+    return outFrames;
+}
 
+} // namespace od

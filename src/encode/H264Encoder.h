@@ -67,6 +67,11 @@ public:
     // running count so the sender can fall back to software after N misses.
     bool TookAsyncTimeout() const;
     int ConsecutiveAsyncTimeouts() const;
+
+    // AUs an async MFT finished since the last call, without feeding input
+    // (never blocks). Lets the capture loop drain a held frame instead of
+    // re-encoding duplicates to push it out. Sync MFTs drain on input: empty.
+    std::vector<EncodedFrame> CollectPending();
     void SetAllowHardware(bool allow);
 
     // Create an Intel D3D11 device + DXGI manager for QSV (not the capture /
