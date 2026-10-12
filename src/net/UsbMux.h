@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <winsock2.h>
 
@@ -17,6 +18,10 @@ struct UsbMuxDevice {
 // True when Apple Mobile Device Service (usbmuxd on 127.0.0.1:27015) has a USB
 // iPad. End-user prerequisite is iTunes / Apple Devices; we speak usbmux ourselves.
 bool ProbeUsbMux(UsbMuxDevice& out);
+
+// Every USB-attached device usbmuxd knows (Wi-Fi "Network" entries skipped),
+// in usbmuxd's order. False if usbmuxd could not be asked.
+bool ListUsbMuxDevices(std::vector<UsbMuxDevice>& out);
 
 // In-process localhost forwarder: 127.0.0.1:localPort -> usbmux -> device:devicePort.
 // No external iproxy. Idempotent. Returns the local port on success.

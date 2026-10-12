@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <climits>
 #include <algorithm>
+#include <set>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -221,6 +222,88 @@ bool IsUsbLikeHost(const std::string& host)
     return host == "127.0.0.1" || host == "::1" || host == "localhost";
 }
 
+// One USB cable feeds one sender: serials (or "#deviceId") currently dialed.
+std::mutex g_usbClaimMutex;
+std::set<std::string> g_usbClaims;
+
+std::string UsbClaimKey(const UsbMuxDevice& d)
+{
+    return d.serial.empty() ? "#" + std::to_string(d.deviceId) : d.serial;
+}
+
+struct UsbClaim {
+    std::string key;
+    bool Take(const std::string& k)
+    {
+        std::lock_guard<std::mutex> lock(g_usbClaimMutex);
+        if (!g_usbClaims.insert(k).second)
+            return false;
+        key = k;
+        return true;
+    }
+    ~UsbClaim()
+    {
+        if (key.empty())
+            return;
+        std::lock_guard<std::mutex> lock(g_usbClaimMutex);
+        g_usbClaims.erase(key);
+    }
+};
+
+// Which USB iPad belongs to this sender. expectedId is the entry's Bonjour
+// TXT id (or the id its last hello gave). A device is ours when the
+// serial->id we learned from an earlier USB hello equals it. Without such a
+// match (first USB session for this iPad) a single never-seen device is tried
+// unless strict; the hello then confirms it. No id at all: only when exactly
+// one USB device exists. Devices other senders hold are never picked.
+// needsVerify: the pick was a guess and hello.id must confirm it.
+bool PickUsbForEntry(const std::string& expectedId, const std::string& skipSerial, bool strict, UsbMuxDevice& out,
+                     bool& needsVerify)
+{
+    std::vector<UsbMuxDevice> devices;
+    if (!ListUsbMuxDevices(devices) || devices.empty())
+        return false;
+    const Config cfg = Config::Load();
+    std::vector<UsbMuxDevice> free;
+    {
+        std::lock_guard<std::mutex> lock(g_usbClaimMutex);
+        for (const UsbMuxDevice& d : devices)
+            if (!g_usbClaims.count(UsbClaimKey(d)))
+                free.push_back(d);
+    }
+    needsVerify = false;
+    if (!expectedId.empty()) {
+        for (const UsbMuxDevice& d : free) {
+            if (!d.serial.empty() && cfg.IdForUsbSerial(d.serial) == expectedId) {
+                out = d;
+                return true;
+            }
+        }
+        if (strict)
+            return false;
+        const UsbMuxDevice* unknown = nullptr;
+        int unknownCount = 0;
+        for (const UsbMuxDevice& d : free) {
+            if (d.serial == skipSerial && !skipSerial.empty())
+                continue;
+            if (d.serial.empty() || cfg.IdForUsbSerial(d.serial).empty()) {
+                unknown = &d;
+                ++unknownCount;
+            }
+        }
+        if (unknownCount != 1)
+            return false;
+        out = *unknown;
+        needsVerify = true;
+        return true;
+    }
+    if (strict || devices.size() != 1 || free.size() != 1 ||
+        (!skipSerial.empty() && free.front().serial == skipSerial))
+        return false;
+    out = free.front();
+    return true;
+}
+
 } // namespace
 
 SenderApp::~SenderApp()
@@ -228,10 +311,11 @@ SenderApp::~SenderApp()
     Stop();
 }
 
-void SenderApp::Start(std::string ip, uint16_t port)
+void SenderApp::Start(std::string ip, uint16_t port, std::string entryId)
 {
     if (running_.exchange(true))
         return; // already running
+    entryId_ = std::move(entryId);
 
     stopRequested_ = false;
     worker_ = std::thread([this, ip = std::move(ip), port] { RunLoop(ip, port); });
@@ -416,6 +500,11 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
 
     bool blockedLogged = false; // the wait message belongs in the log once, not every retry
     int noHelloFailures = 0;    // consecutive links that closed before a hello (backoff)
+    // USB matching (see PickUsbForEntry): the id this entry's iPad presents.
+    std::string knownId = entryId_;
+    bool forceWifiOnce = false;           // last USB pick was the wrong iPad
+    std::string rejectedSerial;           // ... and is skipped for a minute
+    std::chrono::steady_clock::time_point rejectedSerialUntil{};
 
         bool stickToUsbAfterSession = false;
 
@@ -464,30 +553,35 @@ while (!stopRequested_) {
         bool usbSession = false;
         std::optional<Connection> conn;
         UsbMuxDevice usbDev{};
+        UsbClaim usbClaim;          // released when this attempt ends
+        bool usbNeedsVerify = false;
         const bool configuredLoopback = IsUsbLikeHost(ip);
-        const bool usbAvailable = !configuredLoopback && ProbeUsbMux(usbDev) && usbDev.present;
-        if (usbAvailable) {
-            Logf(ip, "USB usbmux device %s, preferring 127.0.0.1:%u over Wi-Fi %s:%u\n",
-                 usbDev.serial.empty() ? "?" : usbDev.serial.c_str(), kUsbMuxLocalPort,
-                 ip.c_str(), port);
-            if (EnsureUsbMuxForward(port, kUsbMuxLocalPort))
-                conn = Connection::Connect("127.0.0.1", kUsbMuxLocalPort);
-            if (!conn) {
-                auto sock = ConnectUsbMux(usbDev.deviceId, port);
-                if (sock)
-                    conn = Connection::FromSocket(*sock);
-            }
-            if (conn) {
-                usbSession = true;
-                Logf(ip, "connected via USB (usbmux localhost:%u -> iPad:%u)\n",
-                     kUsbMuxLocalPort, port);
-            } else if (!allowWifiFailover) {
-                Logf(ip, "USB usbmux dial failed, Wi-Fi failover off, retrying USB\n");
-                InterruptibleSleep(kReconnectDelayMs);
-                continue;
+        const bool skipUsb = forceWifiOnce;
+        forceWifiOnce = false;
+        const std::string skipSerial =
+            std::chrono::steady_clock::now() < rejectedSerialUntil ? rejectedSerial : std::string{};
+        if (configuredLoopback) {
+            // Hand-entered 127.0.0.1: the localhost forward (first USB device).
+            (void)EnsureUsbMuxForward(port, kUsbMuxLocalPort);
+        } else if (!skipUsb && PickUsbForEntry(knownId, skipSerial, false, usbDev, usbNeedsVerify)) {
+            if (!usbClaim.Take(UsbClaimKey(usbDev))) {
+                Logf(ip, "USB device %s was just taken by another iPad entry, using Wi-Fi\n", usbDev.serial.c_str());
             } else {
-                Logf(ip, "USB usbmux dial failed, falling back to Wi-Fi %s:%u\n",
-                     ip.c_str(), port);
+                Logf(ip, "USB usbmux device %s (id %u%s), dialing it directly\n",
+                     usbDev.serial.empty() ? "?" : usbDev.serial.c_str(), usbDev.deviceId,
+                     usbNeedsVerify ? ", unconfirmed - checking hello.id" : ", matches learned id");
+                if (auto sock = ConnectUsbMux(usbDev.deviceId, port))
+                    conn = Connection::FromSocket(*sock);
+                if (conn) {
+                    usbSession = true;
+                    Logf(ip, "connected via USB (usbmux device %u -> iPad:%u)\n", usbDev.deviceId, port);
+                } else if (!allowWifiFailover) {
+                    Logf(ip, "USB usbmux dial failed, Wi-Fi failover off, retrying USB\n");
+                    InterruptibleSleep(kReconnectDelayMs);
+                    continue;
+                } else {
+                    Logf(ip, "USB usbmux dial failed, falling back to Wi-Fi %s:%u\n", ip.c_str(), port);
+                }
             }
         }
         if (!conn) {
@@ -543,13 +637,28 @@ while (!stopRequested_) {
         }
         noHelloFailures = 0;
 
-        // Learn USB serial <-> hello.id so Settings can merge Nearby without guessing.
+        // Re-learn USB serial <-> hello.id on every USB hello (the id changes
+        // when the iPad app is reinstalled), so matching and Settings stay right.
         if (usbSession && !usbDev.serial.empty() && !hello.id.empty()) {
             Config learned = Config::Load();
-            learned.RememberUsbSerialId(usbDev.serial, hello.id);
-            learned.Save();
-            Logf(ip, "USB serial %s bound to id %s\n", usbDev.serial.c_str(), hello.id.c_str());
+            if (learned.IdForUsbSerial(usbDev.serial) != hello.id) {
+                learned.RememberUsbSerialId(usbDev.serial, hello.id);
+                learned.Save();
+                Logf(ip, "USB serial %s bound to id %s\n", usbDev.serial.c_str(), hello.id.c_str());
+            }
         }
+        // The cable we dialed must be this entry's iPad.
+        if (usbSession && !knownId.empty() && !hello.id.empty() && hello.id != knownId) {
+            Logf(ip, "USB device %s is iPad id %s, not this entry's %s - closing it and using Wi-Fi\n",
+                 usbDev.serial.empty() ? "?" : usbDev.serial.c_str(), hello.id.c_str(), knownId.c_str());
+            conn->Close();
+            rejectedSerial = usbDev.serial;
+            rejectedSerialUntil = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+            forceWifiOnce = true;
+            continue;
+        }
+        if (entryId_.empty() && !hello.id.empty())
+            knownId = hello.id; // no TXT id configured: follow the iPad we actually reached
 
         // Version handshake (receiver protocol 3+): the iPad only sends
         // `pencil`/`proximity` to a peer that announced protocol >= 3 —
@@ -927,6 +1036,34 @@ std::thread reader([&] {
             if (timer)
                 CloseHandle(timer);
         });
+
+        // Back to USB: on a Wi-Fi session, look for this iPad's cable every
+        // few seconds (strict match on the learned serial->id only). When it
+        // shows up, end this session; the reconnect prefers USB and MTT keeps
+        // its head through the link-loss grace, so the picture comes back on
+        // the same display.
+        std::atomic<bool> movedToUsb{false};
+        std::thread usbWatch;
+        if (!usbSession && !configuredLoopback && !knownId.empty()) {
+            usbWatch = std::thread([&] {
+                int ticks = 0;
+                while (!cursorStop && running && !stopRequested_) {
+                    Sleep(100);
+                    if (++ticks % 30 != 0 || state_ != State::Streaming)
+                        continue;
+                    UsbMuxDevice d;
+                    bool verify = false;
+                    if (PickUsbForEntry(knownId, {}, true, d, verify)) {
+                        Logf(ip, "USB cable for this iPad is back (%s) - moving the session from Wi-Fi to USB\n",
+                             d.serial.c_str());
+                        movedToUsb = true;
+                        running = false;
+                        conn->Close(); // unblock the reader
+                        break;
+                    }
+                }
+            });
+        }
 
         std::chrono::steady_clock::time_point wrongSizeSince{};
         bool sizeRebuildDone = false;
@@ -1397,6 +1534,8 @@ std::thread reader([&] {
 
         cursorStop = true;
         cursorThread.join();
+        if (usbWatch.joinable())
+            usbWatch.join();
         conn->Close();
         reader.join();
         // After the reader is gone, so nothing else touches the injector.
@@ -1415,7 +1554,8 @@ std::thread reader([&] {
         width_ = 0;
         height_ = 0;
         transport_ = Transport::None;
-        Logf(ip, "disconnected%s\n", stopRequested_ ? "" : ", reconnecting");
+        Logf(ip, "disconnected%s\n",
+             stopRequested_ ? "" : (movedToUsb ? ", reconnecting over USB" : ", reconnecting"));
     }
 
     if (ipLock != nullptr)

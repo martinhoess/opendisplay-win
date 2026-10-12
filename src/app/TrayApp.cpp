@@ -382,6 +382,12 @@ std::string ResolveDeviceAddress(const TrayContext* ctx, size_t index)
     return entry.address;
 }
 
+// The iPad's Bonjour TXT id saved with this entry (empty if none).
+std::string EntryId(const TrayContext* ctx, size_t index)
+{
+    return index < ctx->cfg.deviceIds.size() ? ctx->cfg.deviceIds[index] : std::string{};
+}
+
 std::wstring DeviceLabel(const TrayContext* ctx, size_t index)
 {
     DeviceEntry entry = SplitDevice(ctx->cfg.devices[index]);
@@ -493,7 +499,7 @@ void ApplyAndRestart(TrayContext* ctx)
 {
     RebuildSenders(ctx);
     for (size_t i = 0; i < ctx->apps.size(); ++i)
-        ctx->apps[i]->Start(ResolveDeviceAddress(ctx, i), ctx->cfg.port);
+        ctx->apps[i]->Start(ResolveDeviceAddress(ctx, i), ctx->cfg.port, EntryId(ctx, i));
     UpdateStatus(ctx);
 }
 
@@ -1124,7 +1130,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 if (app.IsRunning())
                     app.Stop();
                 else
-                    app.Start(ResolveDeviceAddress(ctx, index), ctx->cfg.port);
+                    app.Start(ResolveDeviceAddress(ctx, index), ctx->cfg.port, EntryId(ctx, index));
                 UpdateStatus(ctx);
                 return 0;
             }
@@ -1132,7 +1138,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             switch (LOWORD(wParam)) {
                 case IDM_CONNECT:
                     for (size_t i = 0; i < ctx->apps.size(); ++i)
-                        ctx->apps[i]->Start(ResolveDeviceAddress(ctx, i), ctx->cfg.port);
+                        ctx->apps[i]->Start(ResolveDeviceAddress(ctx, i), ctx->cfg.port, EntryId(ctx, i));
                     UpdateStatus(ctx);
                     return 0;
                 case IDM_DISCONNECT:
@@ -1274,7 +1280,7 @@ int RunTray(HINSTANCE hInstance)
 
     if (ctx.cfg.autoReconnect)
         for (size_t i = 0; i < ctx.apps.size(); ++i)
-            ctx.apps[i]->Start(ResolveDeviceAddress(&ctx, i), ctx.cfg.port);
+            ctx.apps[i]->Start(ResolveDeviceAddress(&ctx, i), ctx.cfg.port, EntryId(&ctx, i));
     UpdateStatus(&ctx);
 
     MSG msg;

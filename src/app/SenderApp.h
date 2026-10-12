@@ -36,7 +36,9 @@ public:
 
     // Start streaming to ip:port on a background thread. No-op if already
     // running (Stop first to retarget).
-    void Start(std::string ip, uint16_t port);
+    // entryId: the iPad's Bonjour TXT id from Settings (may be empty). Used to
+    // pick this iPad's USB cable when several are plugged in.
+    void Start(std::string ip, uint16_t port, std::string entryId = {});
 
     // Signal stop and join the worker. Safe to call when not running.
     void Stop();
@@ -81,6 +83,7 @@ private:
     std::atomic<uint32_t> height_{0};
     std::atomic<uint32_t> blockedByWidth_{0};
     std::atomic<uint32_t> blockedByHeight_{0};
+    std::string entryId_; // set in Start before the worker runs
     mutable std::mutex detailMutex_;
     std::string statusDetail_;
 
