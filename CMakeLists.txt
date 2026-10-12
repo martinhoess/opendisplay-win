@@ -24,6 +24,8 @@ add_executable(opendisplay-win
   src/encode/AnnexB.cpp
   src/encode/H264Encoder.cpp
   src/display/DesktopDuplication.cpp
+  src/display/DisplayBackend.cpp
+  src/display/VirtualDisplay.cpp
   src/display/ExistingMonitor.cpp
   src/display/MttVddSettings.cpp
   src/input/InputInjector.cpp
@@ -36,6 +38,7 @@ add_executable(opendisplay-win
 
 target_include_directories(opendisplay-win PRIVATE
   src
+  third_party/parsec-vdd
 )
 
 target_link_libraries(opendisplay-win PRIVATE
@@ -67,8 +70,10 @@ target_compile_definitions(opendisplay-win PRIVATE
 # asInvoker (not requireAdministrator): the app runs un-elevated. The only
 # operations that need admin are writes to the MTT driver's settings dir
 # (C:\VirtualDisplayDriver: user_edid.bin, vdd_settings.xml flags / monitor
-# count); those self-elevate a one-off (`--ensure-mtt-edid`,
-# `--set-mtt-monitor-count`). Running the whole app elevated is optional (tray
+# count) and, on the Parsec backend, registering a new iPad resolution as a
+# parsec-vdd custom mode (one HKLM write); those self-elevate a one-off
+# (`--ensure-mtt-edid`, `--set-mtt-monitor-count`, `--register-resolution`).
+# Running the whole app elevated is optional (tray
 # menu) - only needed to inject touch into elevated windows.
 #
 # GUI subsystem so the tray app doesn't flash a console window, but keep

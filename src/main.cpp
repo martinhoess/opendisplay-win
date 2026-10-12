@@ -14,8 +14,10 @@
 #include "app/SenderApp.h"
 #include "app/TrayApp.h"
 #include "display/MttVddSettings.h"
+#include "display/VirtualDisplay.h"
 #include "net/Mdns.h"
 
+#include "parsec-vdd.h" // VDD_MAX_DISPLAYS, to range-check --remove-display
 
 namespace {
 
@@ -147,7 +149,8 @@ int main(int argc, char** argv)
     MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
 
     std::string command = argc >= 2 ? argv[1] : "";
-    bool oneOff = command == "--browse-mdns" ||
+    bool oneOff = command == "--register-resolution" || command == "--cleanup-monitors" ||
+                  command == "--remove-display" || command == "--browse-mdns" ||
                   command == "--ensure-mtt-resolutions" || command == "--ensure-mtt-edid" ||
                   command == "--dump-mtt-edid" ||
                   command == "--set-mtt-monitor-count" ||
@@ -257,11 +260,34 @@ int main(int argc, char** argv)
             printf("%s  %s  host=%s port=%u id=%s\n", receiver.address.c_str(), receiver.instance.c_str(),
                    receiver.host.c_str(), receiver.port, receiver.id.c_str());
         rc = ok ? 0 : 1;
-    } else if (argc >= 2 && (std::string(argv[1]) == "--register-resolution" ||
-                              std::string(argv[1]) == "--remove-display" ||
-                              std::string(argv[1]) == "--cleanup-monitors")) {
-        printf("%s: removed (MTT-only fork; use --ensure-mtt-* / --teardown-mtt-vdd)\n", argv[1]);
-        rc = 1;
+    } else if (argc >= 4 && std::string(argv[1]) == "--register-resolution") {
+        // Elevated one-off: register a custom resolution (+ its rotation) so the
+        // virtual monitor can use it. Invoked by the self-elevate path or by hand.
+        auto w = static_cast<uint32_t>(strtoul(argv[2], nullptr, 10));
+        auto h = static_cast<uint32_t>(strtoul(argv[3], nullptr, 10));
+        bool ok = w > 0 && h > 0 && od::VirtualDisplay::RegisterResolutions(w, h);
+        printf("register %ux%u: %s\n", w, h, ok ? "ok" : "failed");
+        rc = ok ? 0 : 1;
+    } else if (argc >= 3 && std::string(argv[1]) == "--remove-display") {
+        // Explicit one-off: unplug the virtual display at this index. Cleans up
+        // after a sender that was killed rather than stopped — the driver keeps
+        // such a display attached to the desktop for as long as any client
+        // holds the adapter open.
+        // Range-checked before it reaches the driver: the index goes straight
+        // into an IOCTL, and parsec-vdd has VDD_MAX_DISPLAYS slots.
+        int index = atoi(argv[2]);
+        if (index < 0 || index >= parsec_vdd::VDD_MAX_DISPLAYS) {
+            printf("remove display %d: refused, index must be 0..%d\n", index, parsec_vdd::VDD_MAX_DISPLAYS - 1);
+            rc = 1;
+        } else {
+            bool ok = od::VirtualDisplay::RemoveDisplayIndex(index);
+            printf("remove display %d: %s\n", index, ok ? "sent" : "failed (driver handle?)");
+            rc = ok ? 0 : 1;
+        }
+    } else if (argc >= 2 && std::string(argv[1]) == "--cleanup-monitors") {
+        // Explicit one-off: drop phantom virtual monitors from earlier runs.
+        int n = od::VirtualDisplay::CleanupGhostMonitors();
+        printf("removed %d leftover virtual monitor(s)\n", n);
     } else if (argc >= 2) {
         // Headless CLI mode: stream to the given IP until killed (handy for
         // testing/scripting; logging goes to the inherited/redirected stdout).

@@ -66,6 +66,9 @@ struct TrayContext {
     HICON iconGreen = nullptr; // at least one iPad streaming
     HICON iconRed = nullptr;   // configured but nothing streaming
     HICON iconGrey = nullptr;  // no iPad configured
+    // Last display-driver problem shown as a balloon, so it is said once per
+    // distinct problem rather than on every status refresh.
+    std::string shownDriverProblem;
 
     // Names/addresses the iPads advertise over Bonjour. Filled by a background
     // browse so the menu and Settings never wait on the network.
@@ -420,6 +423,8 @@ std::wstring DeviceStatusText(const TrayContext* ctx, size_t index)
             return text + L"  Connecting...";
         case SenderApp::State::Blocked:
             return text + L"  Not connected";
+        case SenderApp::State::DriverMissing:
+            return text + L"  Display driver missing";
         default:
             return text + L"  Not connected";
     }
@@ -439,6 +444,49 @@ void UpdateStatus(TrayContext* ctx)
     wcsncpy_s(ctx->nid.szTip, tip.c_str(), _TRUNCATE);
     ctx->nid.uFlags = NIF_ICON | NIF_TIP;
     Shell_NotifyIconW(NIM_MODIFY, &ctx->nid);
+
+    // The chosen display driver is missing: say so instead of silently using
+    // the other one (Settings > Advanced > Display driver).
+    std::string problem;
+    for (const auto& app : ctx->apps) {
+        if (app->GetState() == SenderApp::State::DriverMissing) {
+            problem = app->StatusDetail();
+            break;
+        }
+    }
+    if (!problem.empty() && problem != ctx->shownDriverProblem) {
+        NOTIFYICONDATAW info = ctx->nid;
+        info.uFlags = NIF_INFO;
+        info.dwInfoFlags = NIIF_WARNING;
+        wcsncpy_s(info.szInfoTitle, L"OpenDisplay", _TRUNCATE);
+        const std::wstring msg = Widen(problem) + L" Change it in Settings > Advanced > Display driver.";
+        wcsncpy_s(info.szInfo, msg.c_str(), _TRUNCATE);
+        Shell_NotifyIconW(NIM_MODIFY, &info);
+    }
+    ctx->shownDriverProblem = problem;
+}
+
+// Settings > Advanced "Display driver" combo; index order matches kBackendValues.
+const char* const kBackendValues[] = {"auto", "mtt", "parsec"};
+
+void FillBackendCombo(HWND dlg, const std::string& value)
+{
+    HWND cb = GetDlgItem(dlg, IDC_DISPLAY_BACKEND);
+    SendMessageW(cb, CB_RESETCONTENT, 0, 0);
+    SendMessageW(cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Automatic"));
+    SendMessageW(cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"MTT VDD"));
+    SendMessageW(cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Parsec VDD"));
+    int sel = 0;
+    for (int i = 0; i < 3; ++i)
+        if (value == kBackendValues[i])
+            sel = i;
+    SendMessageW(cb, CB_SETCURSEL, sel, 0);
+}
+
+std::string ReadBackendCombo(HWND dlg)
+{
+    const LRESULT sel = SendDlgItemMessageW(dlg, IDC_DISPLAY_BACKEND, CB_GETCURSEL, 0, 0);
+    return (sel >= 0 && sel < 3) ? kBackendValues[sel] : "auto";
 }
 
 void ApplyAndRestart(TrayContext* ctx)
@@ -549,7 +597,7 @@ const int kGeneralControlIds[] = {
 
 const int kAdvancedControlIds[] = {
     IDC_ADV_MANUAL_GROUP, IDC_ADV_MANUAL_HINT, IDC_DEVICES, IDC_ADV_MANUAL_EXAMPLE,
-    IDC_ADV_PORT_LABEL, IDC_PORT, IDC_SEPARATE_USB_WIFI,
+    IDC_ADV_PORT_LABEL, IDC_PORT, IDC_ADV_BACKEND_LABEL, IDC_DISPLAY_BACKEND, IDC_SEPARATE_USB_WIFI,
     IDC_ADV_USB_LABEL, IDC_ADV_USB_MODE_LABEL, IDC_USB_ENCODE_MODE,
     IDC_ADV_USB_PRESET_LABEL, IDC_USB_ENCODE_PRESET,
     IDC_ADV_WIFI_LABEL, IDC_ADV_WIFI_MODE_LABEL, IDC_WIFI_ENCODE_MODE,
@@ -881,6 +929,7 @@ INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lPara
             FillPictureCombo(dlg);
             SelectPictureCombo(dlg, cfg->picturePreset);
             FillEncodeCombos(dlg);
+            FillBackendCombo(dlg, cfg->displayBackend);
             SelectEncodeCombos(dlg, *cfg);
 
             InitSettingsTabs(dlg);
@@ -950,6 +999,7 @@ INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lPara
                     cfg->port = static_cast<uint16_t>(port);
                 cfg->autoReconnect = IsDlgButtonChecked(dlg, IDC_AUTORECONNECT) == BST_CHECKED;
                 cfg->usbWifiFailover = IsDlgButtonChecked(dlg, IDC_USB_WIFI_FAILOVER) == BST_CHECKED;
+                cfg->displayBackend = ReadBackendCombo(dlg);
                 SetAutostart(IsDlgButtonChecked(dlg, IDC_AUTOSTART) == BST_CHECKED);
                 cfg->picturePreset = ReadPictureCombo(dlg);
                 cfg->separateUsbWifiPicture = IsDlgButtonChecked(dlg, IDC_SEPARATE_USB_WIFI) == BST_CHECKED;
@@ -1011,6 +1061,7 @@ void OpenSettingsAndApply(HWND hwnd, TrayContext* ctx)
     const std::string oldPicture = ctx->cfg.picturePreset;
     const bool oldSeparate = ctx->cfg.separateUsbWifiPicture;
     const bool oldFailover = ctx->cfg.usbWifiFailover;
+    const std::string oldBackend = ctx->cfg.displayBackend;
 
     SettingsDlgState state;
     state.tray = ctx;
@@ -1035,7 +1086,9 @@ void OpenSettingsAndApply(HWND hwnd, TrayContext* ctx)
         ctx->cfg.picturePreset != oldPicture || ctx->cfg.separateUsbWifiPicture != oldSeparate;
     // Failover is read each connect; no restart required. Targets/encode still are.
     (void)oldFailover;
-    if (targetsChanged || encodeChanged)
+    // A different display driver means new heads: reconnect everything.
+    const bool backendChanged = ctx->cfg.displayBackend != oldBackend;
+    if (targetsChanged || encodeChanged || backendChanged)
         ApplyAndRestart(ctx);
 }
 

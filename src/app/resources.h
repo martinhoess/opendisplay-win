@@ -42,3 +42,5 @@
 #define IDC_CONNECTION_GROUP        1038
 #define IDC_QUALITY_GROUP           1039
 #define IDC_QUALITY_LABEL           1040
+#define IDC_ADV_BACKEND_LABEL       1041
+#define IDC_DISPLAY_BACKEND         1042

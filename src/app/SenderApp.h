@@ -5,6 +5,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 
 namespace od {
 
@@ -16,10 +17,13 @@ class Connection;
 // the headless CLI). The reconnect loop runs until stopped.
 class SenderApp {
 public:
-    // Blocked: an iPad with a different panel size is streaming. We keep one
-    // panel size on the air (MTT serializes
-    // sizes) so this one waits rather than letterbox until the other finishes.
-    enum class State { Idle, Connecting, Streaming, Blocked };
+    // Blocked: an iPad with a different panel size is streaming. parsec-vdd
+    // puts one custom resolution on all of its virtual monitors (and MTT has
+    // one head), so this one would only get a letterboxed picture - it waits
+    // for the other to finish.
+    // DriverMissing: the display driver chosen in Settings (or, on auto, any
+    // supported one) is not installed; StatusDetail() says which.
+    enum class State { Idle, Connecting, Streaming, Blocked, DriverMissing };
 
     // How the current (or last) session reached the iPad. None when idle.
     enum class Transport { None, Usb, Wifi };
@@ -52,9 +56,21 @@ public:
     uint32_t BlockedByWidth() const { return blockedByWidth_.load(); }
     uint32_t BlockedByHeight() const { return blockedByHeight_.load(); }
 
+    // Human-readable reason for DriverMissing (empty otherwise).
+    std::string StatusDetail() const
+    {
+        std::lock_guard<std::mutex> lock(detailMutex_);
+        return statusDetail_;
+    }
+
 private:
     void RunLoop(std::string ip, uint16_t port);
     void InterruptibleSleep(int ms);
+    void SetStatusDetail(std::string detail)
+    {
+        std::lock_guard<std::mutex> lock(detailMutex_);
+        statusDetail_ = std::move(detail);
+    }
 
     std::thread worker_;
     std::atomic<bool> running_{false};
@@ -65,6 +81,8 @@ private:
     std::atomic<uint32_t> height_{0};
     std::atomic<uint32_t> blockedByWidth_{0};
     std::atomic<uint32_t> blockedByHeight_{0};
+    mutable std::mutex detailMutex_;
+    std::string statusDetail_;
 
     // Lets Stop() close the socket the worker is currently blocked on
     // (Connect's result / ReadFrame), so a stop doesn't wait for the next
