@@ -18,6 +18,9 @@
 #include <utility>
 
 #include <winsock2.h>
+#include <windows.h>
+#include <timeapi.h>
+#pragma comment(lib, "winmm.lib")
 
 #include "display/DesktopDuplication.h"
 #include "display/DisplayBackend.h"
@@ -221,6 +224,21 @@ bool IsUsbLikeHost(const std::string& host)
 {
     return host == "127.0.0.1" || host == "::1" || host == "localhost";
 }
+
+// 1 ms system timer resolution for the length of a streaming session: a
+// backstop so any remaining Sleep()/timed wait on the capture path is not
+// rounded up to 15.6 ms. Released when the session ends.
+struct TimerResolution1ms {
+    bool on = timeBeginPeriod(1) == TIMERR_NOERROR;
+    ~TimerResolution1ms()
+    {
+        if (on)
+            timeEndPeriod(1);
+    }
+    TimerResolution1ms() = default;
+    TimerResolution1ms(const TimerResolution1ms&) = delete;
+    TimerResolution1ms& operator=(const TimerResolution1ms&) = delete;
+};
 
 // One USB cable feeds one sender: serials (or "#deviceId") currently dialed.
 std::mutex g_usbClaimMutex;
@@ -433,13 +451,15 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         gpuNv12Path = false;
         encoder.SetAllowHardware(true);
         {
-            bool haveIntelD3d = false;
+            // Share the capture device with the encoder whatever its vendor;
+            // without one, a separate Intel device still serves QSV.
+            bool haveEncoderD3d = false;
             if (dup.Device() && dup.Context() && encoder.AdoptD3DDevice(dup.Device(), dup.Context()))
-                haveIntelD3d = true;
+                haveEncoderD3d = true;
             else if (encoder.EnsureIntelEncoderDevice())
-                haveIntelD3d = true;
-            if (!haveIntelD3d)
-                Logf(ip, "Intel encoder D3D device unavailable - HW encode may fall back\n");
+                haveEncoderD3d = true;
+            if (!haveEncoderD3d)
+                Logf(ip, "no D3D device for the encoder - HW encode may use system memory or fall back\n");
         }
         if (!encoder.Configure(encW, encH, kFps, sessionEncode.peakBitrateBps,
                                sessionEncode.qualityVsSpeed, sessionEncode.gopSeconds,
@@ -681,6 +701,7 @@ while (!stopRequested_) {
         // AcquirePanel). A different one hangs up and keeps checking back, so
         // it starts by itself once the other iPad disconnects.
         PanelHolder panel;
+        TimerResolution1ms timerResolution;
         uint32_t activeWidth = 0, activeHeight = 0;
         panel.held = AcquirePanel(width, height, activeWidth, activeHeight);
         if (!panel.held) {

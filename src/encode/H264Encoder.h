@@ -73,8 +73,9 @@ public:
     // Parsec adapter). Call before Configure(). Returns false if no Intel GPU.
     bool EnsureIntelEncoderDevice();
 
-    // Prefer the capture D3D device when it is Intel (MTT path): one device for
-    // VideoProcessor convert + QSV DXGI input. Call before Configure().
+    // Share the capture D3D device (any vendor) with the encoder: one device
+    // for VideoProcessor convert + DXGI input to a D3D11-aware hardware MFT.
+    // An MFT that refuses it gets system-memory input. Call before Configure().
     bool AdoptD3DDevice(ID3D11Device* device, ID3D11DeviceContext* context);
 
     bool UsesDxgiInput() const;
