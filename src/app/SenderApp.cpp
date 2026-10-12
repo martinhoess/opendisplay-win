@@ -41,6 +41,18 @@ constexpr int kSendTimeoutMs = 500;      // backpressure: how long to wait for t
 constexpr int kDynamicHealthyMs = 5000;  // climb peak back toward ceiling after this quiet stretch
 constexpr int kDynamicLogMinMs = 2000;   // sparse Dynamic peak-change logging
 constexpr int kReconnectDelayMs = 2000;
+constexpr int kNoHelloBackoffMinMs = 500;    // first retry after a link that closed before hello
+constexpr int kNoHelloBackoffMaxMs = 30000;  // cap: an iPad with the app closed is checked twice a minute
+
+// Exponential backoff for links that accept and close without a hello (iPad
+// app backgrounded, usbmux forward to a closed port): 0.5s, 1s, 2s ... 30s.
+int NoHelloBackoffMs(int failures)
+{
+    int ms = kNoHelloBackoffMinMs;
+    for (int i = 1; i < failures && ms < kNoHelloBackoffMaxMs; ++i)
+        ms *= 2;
+    return (std::min)(ms, kNoHelloBackoffMaxMs);
+}
 constexpr int kKeepaliveMs = 1000;       // max silence on a static screen; well under the iPad's ~5s watchdog
 constexpr int kActiveTailMs = 300;       // keep feeding the encoder this long after the last change (drains its 1-frame hold)
 constexpr int kWrongSizeGraceMs = 3000;  // how long the monitor may sit on a foreign size before we rebuild it
@@ -403,6 +415,7 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
     };
 
     bool blockedLogged = false; // the wait message belongs in the log once, not every retry
+    int noHelloFailures = 0;    // consecutive links that closed before a hello (backoff)
 
         bool stickToUsbAfterSession = false;
 
@@ -516,8 +529,19 @@ while (!stopRequested_) {
                 gotHello = true;
             }
         }
-        if (!gotHello)
+        if (!gotHello) {
+            conn->Close();
+            if (stopRequested_)
+                continue;
+            ++noHelloFailures;
+            const int waitMs = NoHelloBackoffMs(noHelloFailures);
+            // Log the first few and then only when the delay changes (the cap).
+            if (noHelloFailures <= 3 || waitMs != NoHelloBackoffMs(noHelloFailures - 1))
+                Logf(ip, "link closed before hello (%d in a row), retrying in %dms\n", noHelloFailures, waitMs);
+            InterruptibleSleep(waitMs);
             continue;
+        }
+        noHelloFailures = 0;
 
         // Learn USB serial <-> hello.id so Settings can merge Nearby without guessing.
         if (usbSession && !usbDev.serial.empty() && !hello.id.empty()) {
