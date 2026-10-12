@@ -248,19 +248,36 @@ void AcceptLoop()
 
 } // namespace
 
+// What usbmuxd last reported, logged only when it changes (-1 = not reachable).
+static std::atomic<int> g_lastUsbMuxCount{-2};
+
+static void NoteUsbMuxCount(int count)
+{
+    if (g_lastUsbMuxCount.exchange(count) == count)
+        return;
+    if (count < 0)
+        Logf("usb", "usbmux: not reachable (Apple Devices / iTunes not running?)\n");
+    else
+        Logf("usb", "usbmux: %d USB device%s\n", count, count == 1 ? "" : "s");
+}
+
 bool ListUsbMuxDevices(std::vector<UsbMuxDevice>& out)
 {
     out.clear();
     SOCKET s = ConnectLocal(kUsbmuxPort, 400);
-    if (s == INVALID_SOCKET)
+    if (s == INVALID_SOCKET) {
+        NoteUsbMuxCount(-1);
         return false;
+    }
     bool ok = SendPlist(s, 1, ListDevicesPlist());
     std::string xml;
     if (ok)
         ok = RecvPlist(s, xml);
     closesocket(s);
-    if (!ok)
+    if (!ok) {
+        NoteUsbMuxCount(-1);
         return false;
+    }
 
     // Each DeviceList entry carries DeviceID twice (entry and its Properties
     // dict); ConnectionType + SerialNumber sit next to the second. Split on
@@ -299,6 +316,7 @@ bool ListUsbMuxDevices(std::vector<UsbMuxDevice>& out)
         d.serial = info.serial;
         out.push_back(std::move(d));
     }
+    NoteUsbMuxCount(static_cast<int>(out.size()));
     return true;
 }
 
@@ -345,7 +363,8 @@ std::optional<SOCKET> ConnectUsbMux(uint32_t deviceId, uint16_t devicePort)
     uint32_t number = 0xFFFFFFFFu;
     ExtractKeyInteger(xml, "Number", number);
     if (number != 0) {
-        Logf("usb", "usbmux Connect Result=%u (device %u port %u)\n", number, deviceId, devicePort);
+        Logf("usb", "usbmux Connect Result=%u (device %u port %u)%s\n", number, deviceId, devicePort,
+             number == 3 ? " (iPad app not listening yet)" : "");
         closesocket(s);
         return std::nullopt;
     }

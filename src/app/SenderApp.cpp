@@ -1121,6 +1121,10 @@ std::thread reader([&] {
         std::chrono::steady_clock::time_point cadenceSince = std::chrono::steady_clock::now();
         uint32_t cadencePresents = 0;
         uint32_t cadenceEncCalls = 0;
+        // Encode pacing (see the encode step below).
+        std::chrono::steady_clock::time_point lastEncodeAt{};
+        std::chrono::steady_clock::time_point lastPaceCheck{};
+        uint32_t paceHz = static_cast<uint32_t>(kFps);
         uint32_t cadenceAus = 0;
         uint32_t cadenceSends = 0;
         uint32_t cadenceTimeouts = 0;
@@ -1400,6 +1404,26 @@ std::thread reader([&] {
                 // real present (CaptureFrameNv12Gpu returns null until then);
                 // do not fall through to an empty CPU buffer.
                 bool keepaliveDue = now - lastSend >= std::chrono::milliseconds(kKeepaliveMs);
+
+                // Pace: never encode (and so never send) faster than the target
+                // fps or the head's refresh, whichever is lower. Without this
+                // the event-driven encoder re-encoded the held frame as fast as
+                // the loop spun (200+/s of duplicates). Wait out the rest of
+                // the slot rather than skip, so the newest frame still goes.
+                if (running && (active || keepaliveDue)) {
+                    if (now - lastPaceCheck > std::chrono::seconds(1)) {
+                        lastPaceCheck = now;
+                        paceHz = (std::max)(1u, (std::min)(static_cast<uint32_t>(kFps), backend->RefreshHz()));
+                    }
+                    const auto slot = std::chrono::microseconds(1'000'000 / paceHz);
+                    const auto since = std::chrono::steady_clock::now() - lastEncodeAt;
+                    if (since < slot) {
+                        const auto waitMs = std::chrono::duration_cast<std::chrono::milliseconds>(slot - since).count();
+                        if (waitMs > 0)
+                            Sleep(static_cast<DWORD>(waitMs));
+                    }
+                    lastEncodeAt = std::chrono::steady_clock::now();
+                }
 
                 if (running && (active || keepaliveDue)) {
                     if (gpuNv12Path) {
