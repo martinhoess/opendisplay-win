@@ -312,14 +312,22 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         if (!mttModesEnsured) {
             const uint32_t edidW = mttHelloW ? mttHelloW : width;
             const uint32_t edidH = mttHelloH ? mttHelloH : height;
-            (void)EnsureMttResolutionsForHello(edidW, edidH, ip);
+            (void)EnsureMttResolutionsForHello(edidW, edidH, ip, &stopRequested_);
             mttModesEnsured = true; // even on UAC decline: one prompt per connection
         }
 
         // Re-attach MTT head if a prior last-client teardown dropped it.
         Logf(ip, "mtt: ensuring VDD for hello\n");
-        (void)EnsureMttVddAttached(ip);
+        (void)EnsureMttVddAttached(ip, &stopRequested_);
         usingMttVdd = FindMttVirtualMonitor(mttMon);
+        if (usingMttVdd && !mttHelloModeForced) {
+            // First build of the connection: prove the driver actually offers
+            // this iPad's modes before applying / saving any of them. (A
+            // reload that did not happen leaves MttVDD on its stock 800x600+
+            // list; that layout must never reach mtt_display.json.)
+            (void)VerifyMttModesOffered(ip, 6000);
+            usingMttVdd = FindMttVirtualMonitor(mttMon); // a restart can renumber \\.\DISPLAYn
+        }
         if (usingMttVdd) {
             Logf(ip, "using MTT virtual monitor %ls (%ls)\n",
                  mttMon.deviceName.c_str(), mttMon.deviceString.c_str());

@@ -192,9 +192,12 @@ int main(int argc, char** argv)
                                     ? od::EnsureCustomEdidForHello(helloW, helloH, /*dryRun=*/false)
                                     : od::EnsureCustomEdid();
         const bool ok = r.ok;
-        printf("ensure-mtt-edid: %s (added %d, changed=%d) path=%ls detail=%s\n",
-               ok ? "ok" : "failed", r.added, r.changed ? 1 : 0, r.path.c_str(), r.detail.c_str());
-        rc = ok ? 0 : 1;
+        printf("ensure-mtt-edid: %s (added %d, changed=%d, reload=%s) path=%ls detail=%s\n",
+               ok ? "ok" : "failed", r.added, r.changed ? 1 : 0,
+               !r.changed ? "not needed" : r.reloadFailed ? "FAILED" : "ok", r.path.c_str(), r.detail.c_str());
+        // 2 = files written but the MttVDD adapter did not restart (the
+        // parent logs that instead of claiming success).
+        rc = !ok ? 1 : (r.changed && r.reloadFailed) ? 2 : 0;
 
     } else if (argc >= 2 && std::string(argv[1]) == "--dump-mtt-edid") {
         // Diagnostics (no admin, touches nothing): --dump-mtt-edid WxH [out.bin]
@@ -235,7 +238,7 @@ int main(int argc, char** argv)
         od::MttEnsureResult r = od::SetMonitorCount(n);
         printf("set-mtt-monitor-count %u: %s changed=%d detail=%s\n", n, r.ok ? "ok" : "failed",
                r.changed ? 1 : 0, r.detail.c_str());
-        rc = r.ok ? 0 : 1;
+        rc = !r.ok ? 1 : (r.changed && r.reloadFailed) ? 2 : 0;
     } else if (argc >= 2 && std::string(argv[1]) == "--teardown-mtt-vdd") {
         // Verify last-client teardown path without an iPad session.
         bool ok = od::TearDownMttVdd("cli");
