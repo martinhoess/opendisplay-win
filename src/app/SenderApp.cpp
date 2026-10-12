@@ -644,7 +644,8 @@ while (!stopRequested_) {
         CursorUdp cursorUdp;
         std::mutex cursorNetMutex;
         std::atomic<bool> cursorUdpConfirmed{false};
-        uint64_t cursorSeq = 0;
+        std::atomic<bool> cursorForce{false}; // shape changed: resend position now
+        uint64_t cursorSeq = 0;                // under cursorNetMutex
         std::chrono::steady_clock::time_point cursorUdpOpened{};
         bool cursorUdpGaveUp = false;
 
@@ -800,7 +801,6 @@ std::thread reader([&] {
 
         std::vector<uint8_t> nv12;
         std::string pendingCursorImg;
-        std::string pendingCursor;
         auto lastSend = std::chrono::steady_clock::now();
         auto lastChange = std::chrono::steady_clock::now() - std::chrono::milliseconds(kActiveTailMs);
         // A drop is "pending" until something goes out again. Guards the replay
@@ -827,7 +827,7 @@ std::thread reader([&] {
                      ip.c_str(), hello.cursorPort);
                 // Probe immediately so cursorAck does not need a mouse move
                 // (PROTOCOL 6.3; Mac sender probes on UDP .ready).
-                ++cursorSeq;
+                ++cursorSeq; // cursorNetMutex held
                 cursorProbe = MakeCursorMessage(false, 0.0, 0.0, cursorSeq);
                 cursorUdp.Send(reinterpret_cast<const uint8_t*>(cursorProbe.data()),
                                cursorProbe.size());
@@ -844,6 +844,89 @@ std::thread reader([&] {
                 running = false;
             }
         }
+
+        // Cursor thread: polls GetCursorInfo at the head's refresh rate and
+        // sends positions on its own, so the pointer is not tied to the
+        // encode loop (which runs at the capture/encode cadence, ~30 fps on a
+        // busy link). UDP when open; mirrored on TCP until cursorAck, or for
+        // good on USB / when UDP never confirms. SendFrame is thread-safe.
+        std::atomic<bool> cursorStop{false};
+        std::thread cursorThread([&] {
+            HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                                  TIMER_ALL_ACCESS);
+            uint32_t hz = backend->RefreshHz();
+            auto lastHzCheck = std::chrono::steady_clock::now();
+            bool haveLast = false;
+            bool lastVisible = false;
+            LONG lastX = 0, lastY = 0;
+            while (!cursorStop && running && !stopRequested_) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now - lastHzCheck > std::chrono::seconds(1)) {
+                    lastHzCheck = now;
+                    hz = backend->RefreshHz();
+                }
+                const uint32_t tickHz = (std::max)(30u, (std::min)(hz, 240u));
+                const RECT r = backend->CurrentRect();
+                CURSORINFO ci{};
+                ci.cbSize = sizeof(ci);
+                const bool gotInfo = GetCursorInfo(&ci) != FALSE;
+                const LONG rw = r.right - r.left, rh = r.bottom - r.top;
+                // ptScreenPos is already the hotspot, in desktop coordinates.
+                const bool inside = gotInfo && rw > 0 && rh > 0 && ci.ptScreenPos.x >= r.left &&
+                                    ci.ptScreenPos.x < r.right && ci.ptScreenPos.y >= r.top &&
+                                    ci.ptScreenPos.y < r.bottom;
+                const bool visible = inside && (ci.flags & CURSOR_SHOWING) != 0;
+                const LONG x = inside ? ci.ptScreenPos.x - r.left : lastX;
+                const LONG y = inside ? ci.ptScreenPos.y - r.top : lastY;
+                const bool force = cursorForce.exchange(false);
+                if (gotInfo && (force || !haveLast || visible != lastVisible || (visible && (x != lastX || y != lastY)))) {
+                    haveLast = true;
+                    lastVisible = visible;
+                    lastX = x;
+                    lastY = y;
+                    bool udpOpen = false;
+                    bool sendTcp = true;
+                    std::string msg;
+                    {
+                        std::lock_guard<std::mutex> lock(cursorNetMutex);
+                        ++cursorSeq;
+                        msg = MakeCursorMessage(visible, static_cast<double>(x) / rw, static_cast<double>(y) / rh,
+                                                cursorSeq);
+                        const bool confirmed = cursorUdpConfirmed.load(std::memory_order_relaxed);
+                        udpOpen = cursorUdp.Ready();
+                        if (udpOpen) {
+                            cursorUdp.Send(reinterpret_cast<const uint8_t*>(msg.data()), msg.size());
+                            if (!confirmed && !cursorUdpGaveUp &&
+                                cursorUdpOpened != std::chrono::steady_clock::time_point{} &&
+                                std::chrono::steady_clock::now() - cursorUdpOpened >
+                                    std::chrono::milliseconds(kCursorUdpAckMs)) {
+                                cursorUdp.Close();
+                                cursorUdpGaveUp = true;
+                                udpOpen = false;
+                                Logf(ip, "no cursorAck within %dms, falling back to TCP cursor\n", kCursorUdpAckMs);
+                            }
+                        }
+                        sendTcp = !udpOpen || !confirmed;
+                    }
+                    if (sendTcp &&
+                        !conn->SendFrame(reinterpret_cast<const uint8_t*>(msg.data()), static_cast<uint32_t>(msg.size())))
+                        running = false;
+                }
+                const LONGLONG periodNs100 = 10'000'000LL / tickHz;
+                if (timer) {
+                    LARGE_INTEGER due{};
+                    due.QuadPart = -periodNs100;
+                    if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE))
+                        WaitForSingleObject(timer, 100);
+                    else
+                        Sleep(1);
+                } else {
+                    Sleep(1);
+                }
+            }
+            if (timer)
+                CloseHandle(timer);
+        });
 
         std::chrono::steady_clock::time_point wrongSizeSince{};
         bool sizeRebuildDone = false;
@@ -967,21 +1050,16 @@ std::thread reader([&] {
                 }
 
                 pendingCursorImg.clear();
-                pendingCursor.clear();
                 if (cap.pointerShapeChanged) {
                     PointerShapeBgra shape;
                     if (dup.GetPointerShapeBgra(shape)) {
                         pendingCursorImg = MakeCursorImgMessage(shape, dup.Width(), dup.Height());
                     }
                 }
-                if (cap.cursorChanged || !pendingCursorImg.empty()) {
-                    const double invW = dup.Width() ? 1.0 / dup.Width() : 0.0;
-                    const double invH = dup.Height() ? 1.0 / dup.Height() : 0.0;
-                    const double cx = (dup.PointerX() + dup.PointerHotX()) * invW;
-                    const double cy = (dup.PointerY() + dup.PointerHotY()) * invH;
-                    ++cursorSeq;
-                    pendingCursor = MakeCursorMessage(dup.PointerVisible(), cx, cy, cursorSeq);
-                }
+                // Positions come from the cursor thread (refresh rate, not
+                // encode rate); a new shape makes it resend the position.
+                if (!pendingCursorImg.empty())
+                    cursorForce = true;
 
                 // Rotation or a resolution change made on the Windows side
                 // never sends a `hello`, so nothing rebuilds the pipeline: the
@@ -1199,37 +1277,6 @@ std::thread reader([&] {
                 }
                 pendingCursorImg.clear();
             }
-            if (running && !pendingCursor.empty()) {
-                bool udpOpen = false;
-                bool confirmed = cursorUdpConfirmed.load(std::memory_order_relaxed);
-                {
-                    std::lock_guard<std::mutex> lock(cursorNetMutex);
-                    udpOpen = cursorUdp.Ready();
-                    if (udpOpen) {
-                        cursorUdp.Send(reinterpret_cast<const uint8_t*>(pendingCursor.data()),
-                                       pendingCursor.size());
-                        if (!confirmed && !cursorUdpGaveUp &&
-                            cursorUdpOpened != std::chrono::steady_clock::time_point{} &&
-                            std::chrono::steady_clock::now() - cursorUdpOpened >
-                                std::chrono::milliseconds(kCursorUdpAckMs)) {
-                            cursorUdp.Close();
-                            cursorUdpGaveUp = true;
-                            udpOpen = false;
-                            Logf(ip, "no cursorAck within %dms, falling back to TCP cursor\n",
-                                 kCursorUdpAckMs);
-                        }
-                    }
-                }
-                const bool sendTcp = !udpOpen || !confirmed;
-                if (sendTcp) {
-                    if (!conn->SendFrame(reinterpret_cast<const uint8_t*>(pendingCursor.data()),
-                                         static_cast<uint32_t>(pendingCursor.size()))) {
-                        running = false;
-                    }
-                }
-                pendingCursor.clear();
-            }
-
             bool sentSomething = false;
             // Reply to receiver ping(s) before video so clock offset stays fresh.
             {
@@ -1348,6 +1395,8 @@ std::thread reader([&] {
             }
         }
 
+        cursorStop = true;
+        cursorThread.join();
         conn->Close();
         reader.join();
         // After the reader is gone, so nothing else touches the injector.

@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -39,6 +41,8 @@ public:
     // Sends the whole frame or fails — never a partial write on the wire
     // (sends are blocking, so a real error is the only way this stops early),
     // which is what keeps the receiver's length-prefixed framing in sync.
+    // Safe to call from several threads (capture loop, cursor thread): frames
+    // are serialized whole, so they never interleave on the wire.
     bool SendFrame(const uint8_t* data, uint32_t size);
 
     // Returns true if the socket can accept data now (send buffer has room).
@@ -57,6 +61,8 @@ private:
     bool WriteExact(const uint8_t* buffer, size_t size);
 
     SOCKET socket_ = INVALID_SOCKET;
+    // Heap-held so Connection stays movable; moved-from objects have none.
+    std::unique_ptr<std::mutex> sendMutex_ = std::make_unique<std::mutex>();
 };
 
 } // namespace od
