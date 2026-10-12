@@ -80,6 +80,8 @@ struct PanelState {
     uint32_t width = 0;
     uint32_t height = 0;
     int holders = 0;
+    bool exclusive = false;     // MTT: one iPad on the head at a time
+    const void* first = nullptr; // sender that took the panel first (for "in use by")
 };
 
 PanelState& Panel()
@@ -89,15 +91,22 @@ PanelState& Panel()
 }
 
 // Takes a share of the display for w x h. Returns false when a different size
-// holds it, and then reports that size in activeW/activeH.
-bool AcquirePanel(uint32_t w, uint32_t h, uint32_t& activeW, uint32_t& activeH)
+// holds it - or, exclusive (MTT: one head), when anyone holds it - and then
+// reports that size in activeW/activeH and the holding sender in holder.
+bool AcquirePanel(uint32_t w, uint32_t h, bool exclusive, const void* self, uint32_t& activeW, uint32_t& activeH,
+                  const void*& holder)
 {
     PanelState& panel = Panel();
     std::lock_guard<std::mutex> lock(panel.mutex);
-    if (panel.holders > 0 && (panel.width != w || panel.height != h)) {
+    if (panel.holders > 0 && (exclusive || panel.exclusive || panel.width != w || panel.height != h)) {
         activeW = panel.width;
         activeH = panel.height;
+        holder = panel.first;
         return false;
+    }
+    if (panel.holders == 0) {
+        panel.exclusive = exclusive;
+        panel.first = self;
     }
     panel.width = w;
     panel.height = h;
@@ -114,6 +123,8 @@ bool ReleasePanel()
         panel.holders = 0;
         panel.width = 0;
         panel.height = 0;
+        panel.exclusive = false;
+        panel.first = nullptr;
         return true;
     }
     return false;
@@ -703,18 +714,27 @@ while (!stopRequested_) {
         PanelHolder panel;
         TimerResolution1ms timerResolution;
         uint32_t activeWidth = 0, activeHeight = 0;
-        panel.held = AcquirePanel(width, height, activeWidth, activeHeight);
+        const bool exclusiveHead = backend->Kind() == DisplayBackendKind::Mtt;
+        const void* holder = nullptr;
+        panel.held = AcquirePanel(width, height, exclusiveHead, this, activeWidth, activeHeight, holder);
         if (!panel.held) {
             blockedByWidth_ = activeWidth;
             blockedByHeight_ = activeHeight;
+            blockedByApp_ = holder;
+            blockedExclusive_ = exclusiveHead;
             state_ = State::Blocked;
             // Once per episode, not on every check: this comes back every few
             // seconds for as long as the other iPad streams.
             if (!blockedLogged) {
                 blockedLogged = true;
-                Logf(ip, "waiting: an iPad with a %ux%u panel is streaming and this one is %ux%u - %s only "
-                         "holds one panel size at a time\n",
-                     activeWidth, activeHeight, width, height, DisplayBackendName(backend->Kind()));
+                if (exclusiveHead)
+                    Logf(ip, "waiting: another iPad (%ux%u) is on the MTT display - MTT drives one iPad at a "
+                             "time (Parsec supports several)\n",
+                         activeWidth, activeHeight);
+                else
+                    Logf(ip, "waiting: an iPad with a %ux%u panel is streaming and this one is %ux%u - %s only "
+                             "holds one panel size at a time\n",
+                         activeWidth, activeHeight, width, height, DisplayBackendName(backend->Kind()));
             }
             conn->Close();
             InterruptibleSleep(kBlockedRetryMs);
@@ -722,6 +742,8 @@ while (!stopRequested_) {
         }
         blockedByWidth_ = 0;
         blockedByHeight_ = 0;
+        blockedByApp_ = nullptr;
+        blockedExclusive_ = false;
         blockedLogged = false;
 
         {

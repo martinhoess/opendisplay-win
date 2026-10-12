@@ -69,6 +69,8 @@ struct TrayContext {
     // Last display-driver problem shown as a balloon, so it is said once per
     // distinct problem rather than on every status refresh.
     std::string shownDriverProblem;
+    // Per sender: already told the user its MTT screen is in use (once per wait).
+    std::vector<bool> shownInUse;
 
     // Names/addresses the iPads advertise over Bonjour. Filled by a background
     // browse so the menu and Settings never wait on the network.
@@ -406,6 +408,16 @@ std::wstring DeviceLabel(const TrayContext* ctx, size_t index)
     return Widen(discovered != ctx->discovered.end() ? discovered->second : entry.address);
 }
 
+// Label of the iPad whose sender holds the display this one waits for.
+std::wstring HolderLabel(const TrayContext* ctx, const SenderApp& app)
+{
+    const void* holder = app.BlockedByApp();
+    for (size_t i = 0; holder && i < ctx->apps.size() && i < ctx->cfg.devices.size(); ++i)
+        if (ctx->apps[i].get() == holder)
+            return DeviceLabel(ctx, i);
+    return {};
+}
+
 std::wstring DeviceStatusText(const TrayContext* ctx, size_t index)
 {
     std::wstring text = DeviceLabel(ctx, index);
@@ -427,8 +439,12 @@ std::wstring DeviceStatusText(const TrayContext* ctx, size_t index)
         }
         case SenderApp::State::Connecting:
             return text + L"  Connecting...";
-        case SenderApp::State::Blocked:
+        case SenderApp::State::Blocked: {
+            const std::wstring holder = HolderLabel(ctx, app);
+            if (app.BlockedExclusive() && !holder.empty())
+                return text + L"  Waiting - screen in use by " + holder;
             return text + L"  Not connected";
+        }
         case SenderApp::State::DriverMissing:
             return text + L"  Display driver missing";
         default:
@@ -470,6 +486,32 @@ void UpdateStatus(TrayContext* ctx)
         Shell_NotifyIconW(NIM_MODIFY, &info);
     }
     ctx->shownDriverProblem = problem;
+
+    // MTT drives one iPad: a second one that connects waits, and says so once.
+    ctx->shownInUse.resize(ctx->apps.size(), false);
+    for (size_t i = 0; i < ctx->apps.size() && i < ctx->cfg.devices.size(); ++i) {
+        const SenderApp& app = *ctx->apps[i];
+        const bool waiting = app.GetState() == SenderApp::State::Blocked && app.BlockedExclusive();
+        if (!waiting) {
+            ctx->shownInUse[i] = false;
+            continue;
+        }
+        if (ctx->shownInUse[i])
+            continue;
+        const std::wstring holder = HolderLabel(ctx, app);
+        if (holder.empty())
+            continue;
+        ctx->shownInUse[i] = true;
+        NOTIFYICONDATAW info = ctx->nid;
+        info.uFlags = NIF_INFO;
+        info.dwInfoFlags = NIIF_INFO;
+        wcsncpy_s(info.szInfoTitle, L"OpenDisplay", _TRUNCATE);
+        const std::wstring msg = DeviceLabel(ctx, i) + L" is waiting: the screen is in use by " + holder +
+                                 L". It connects when that iPad disconnects. (Parsec in Settings > Advanced "
+                                 L"drives several iPads.)";
+        wcsncpy_s(info.szInfo, msg.c_str(), _TRUNCATE);
+        Shell_NotifyIconW(NIM_MODIFY, &info);
+    }
 }
 
 // Settings > Advanced "Display driver" combo; index order matches kBackendValues.
@@ -479,9 +521,9 @@ void FillBackendCombo(HWND dlg, const std::string& value)
 {
     HWND cb = GetDlgItem(dlg, IDC_DISPLAY_BACKEND);
     SendMessageW(cb, CB_RESETCONTENT, 0, 0);
-    SendMessageW(cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Automatic"));
-    SendMessageW(cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"MTT VDD"));
-    SendMessageW(cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Parsec VDD"));
+    SendMessageW(cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Auto"));
+    SendMessageW(cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"MTT (1 iPad)"));
+    SendMessageW(cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Parsec (multiple iPads)"));
     int sel = 0;
     for (int i = 0; i < 3; ++i)
         if (value == kBackendValues[i])
@@ -1031,7 +1073,9 @@ void ShowContextMenu(HWND hwnd, TrayContext* ctx)
 
     bool several = ctx->cfg.devices.size() > 1;
     for (size_t i = 0; i < ctx->cfg.devices.size(); ++i) {
-        UINT flags = MF_STRING | (ctx->apps[i]->GetState() != SenderApp::State::Idle ? MF_CHECKED : 0);
+        // One toggle per iPad (connect / disconnect just that one); the check
+        // mark means it is streaming right now.
+        UINT flags = MF_STRING | (ctx->apps[i]->GetState() == SenderApp::State::Streaming ? MF_CHECKED : 0);
         AppendMenuW(menu, flags, IDM_DEVICE_FIRST + static_cast<UINT>(i), DeviceStatusText(ctx, i).c_str());
     }
     if (!ctx->cfg.devices.empty())

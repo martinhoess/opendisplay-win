@@ -57,6 +57,10 @@ public:
     // can name what this iPad is waiting for. Zero otherwise.
     uint32_t BlockedByWidth() const { return blockedByWidth_.load(); }
     uint32_t BlockedByHeight() const { return blockedByHeight_.load(); }
+    // While Blocked: the sender holding the display (identity only - compare,
+    // never dereference) and whether it is MTT's one-iPad-at-a-time head.
+    const void* BlockedByApp() const { return blockedByApp_.load(); }
+    bool BlockedExclusive() const { return blockedExclusive_.load(); }
 
     // Human-readable reason for DriverMissing (empty otherwise).
     std::string StatusDetail() const
@@ -82,6 +86,8 @@ private:
     std::atomic<uint32_t> width_{0};
     std::atomic<uint32_t> height_{0};
     std::atomic<uint32_t> blockedByWidth_{0};
+    std::atomic<const void*> blockedByApp_{nullptr};
+    std::atomic<bool> blockedExclusive_{false};
     std::atomic<uint32_t> blockedByHeight_{0};
     std::string entryId_; // set in Start before the worker runs
     mutable std::mutex detailMutex_;
