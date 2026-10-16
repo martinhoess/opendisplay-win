@@ -1166,6 +1166,8 @@ std::thread reader([&] {
         uint32_t fpsLimit = 60;
         uint32_t fpsLimitGen = 0;
         uint32_t fpsLimitW = 0, fpsLimitH = 0;
+        uint32_t fpsLimitHz = backend->RefreshHz();
+        Clock::time_point fpsHzCheck = Clock::now();
         Clock::duration slot = std::chrono::microseconds(1'000'000 / 60);
         Clock::duration earlyWindow = slot / 4;
         Clock::time_point nextSlot{};
@@ -1177,8 +1179,16 @@ std::thread reader([&] {
         while (running && !stopRequested_) {
             std::vector<EncodedFrame> encoded;
             int64_t capMs = 0;
-            // Recompute the limit on a new hello or a new encoded raster.
-            if (rateHelloGen.load() != fpsLimitGen || encoder.Width() != fpsLimitW ||
+            // Recompute the limit on a new hello, a new encoded raster or a
+            // new refresh rate on the head (polled once a second).
+            bool hzChanged = false;
+            if (Clock::now() - fpsHzCheck > std::chrono::seconds(1)) {
+                fpsHzCheck = Clock::now();
+                const uint32_t hzNow = backend->RefreshHz();
+                hzChanged = hzNow != fpsLimitHz;
+                fpsLimitHz = hzNow;
+            }
+            if (hzChanged || rateHelloGen.load() != fpsLimitGen || encoder.Width() != fpsLimitW ||
                 encoder.Height() != fpsLimitH) {
                 fpsLimitGen = rateHelloGen.load();
                 fpsLimitW = encoder.Width();
@@ -1188,14 +1198,22 @@ std::thread reader([&] {
                     std::lock_guard<std::mutex> rlock(rateHelloMutex);
                     rh = rateHello;
                 }
-                const uint32_t limit = StreamFpsLimit(rh, "h264", fpsLimitW, fpsLimitH);
+                // Never above the rate the encoder is configured for (kFps:
+                // timestamps, bitrate and GOP assume it) or the head's refresh.
+                const uint32_t receiverLimit = StreamFpsLimit(rh, "h264", fpsLimitW, fpsLimitH);
+                uint32_t limit = (std::min)(receiverLimit, kFps);
+                if (fpsLimitHz > 0)
+                    limit = (std::min)(limit, fpsLimitHz);
+                limit = (std::max)(limit, 1u);
                 if (limit != fpsLimit || fpsLimitGen == 1) {
                     uint32_t capsRate = 0;
                     for (const VideoCapEntry& e : rh.videoCaps)
                         if (e.codec == "h264")
                             capsRate = (std::max)(capsRate, e.maxFrameRate);
-                    Logf(ip, "fps limit %u (displayMaxFrameRate=%u, h264 videoCaps maxFrameRate=%u, %zu caps, %ux%u)\n",
-                         limit, rh.displayMaxFrameRate, capsRate, rh.videoCaps.size(), fpsLimitW, fpsLimitH);
+                    Logf(ip, "fps limit %u (receiver %u: displayMaxFrameRate=%u, h264 videoCaps maxFrameRate=%u, %zu caps; "
+                             "encoder %u, head %u Hz, %ux%u)\n",
+                         limit, receiverLimit, rh.displayMaxFrameRate, capsRate, rh.videoCaps.size(), kFps, fpsLimitHz,
+                         fpsLimitW, fpsLimitH);
                 }
                 fpsLimit = limit;
                 slot = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(1.0 / fpsLimit));
