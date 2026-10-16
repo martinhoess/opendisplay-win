@@ -443,7 +443,12 @@ std::wstring DeviceStatusText(const TrayContext* ctx, size_t index)
             const std::wstring holder = HolderLabel(ctx, app);
             if (app.BlockedExclusive() && !holder.empty())
                 return text + L"  Waiting - screen in use by " + holder;
-            return text + L"  Not connected";
+            const uint32_t bw = app.BlockedByWidth(), bh = app.BlockedByHeight();
+            if (bw && bh)
+                return text + L"  Waiting for " + std::to_wstring(bw) + L"x" + std::to_wstring(bh);
+            if (!holder.empty())
+                return text + L"  Waiting for " + holder;
+            return text + L"  Waiting for the display";
         }
         case SenderApp::State::DriverMissing:
             return text + L"  Display driver missing";
