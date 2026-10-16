@@ -485,6 +485,11 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         } else if (encoder.UsesDxgiInput()) {
             Logf(ip, "DXGI NV12 encode ready; GPU convert unbound - CPU BGRA->NV12 fallback\n");
         }
+        // The probe in Configure used up its forced IDR. The GPU path asks for
+        // one on its first present; the CPU path must ask here, or the iPad
+        // gets P-frames until the next GOP after a reconnect or rotation.
+        if (!gpuNv12Path)
+            encoder.RequestKeyFrame();
         {
             const std::wstring mftW = encoder.MftName();
             std::string mft;
@@ -1520,6 +1525,7 @@ std::thread reader([&] {
                                                sessionEncode.rcQuality)) {
                             Logf(ip, "software encoder fallback failed\n");
                         } else {
+                            encoder.RequestKeyFrame(); // new encoder: start on an IDR
                             const std::wstring mft = encoder.MftName();
                             std::string mftA;
                             for (wchar_t c : mft)
