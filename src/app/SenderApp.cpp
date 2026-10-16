@@ -283,7 +283,8 @@ struct UsbClaim {
 // serial->id we learned from an earlier USB hello equals it. Without such a
 // match (first USB session for this iPad) a single never-seen device is tried
 // unless strict; the hello then confirms it. No id at all: only when exactly
-// one USB device exists. Devices other senders hold are never picked.
+// Entries without an id (typed-in IP) never use USB: the cable could carry any
+// iPad. Devices other senders hold are never picked.
 // needsVerify: the pick was a guess and hello.id must confirm it.
 bool PickUsbForEntry(const std::string& expectedId, const std::string& skipSerial, bool strict, UsbMuxDevice& out,
                      bool& needsVerify)
@@ -325,11 +326,7 @@ bool PickUsbForEntry(const std::string& expectedId, const std::string& skipSeria
         needsVerify = true;
         return true;
     }
-    if (strict || devices.size() != 1 || free.size() != 1 ||
-        (!skipSerial.empty() && free.front().serial == skipSerial))
-        return false;
-    out = free.front();
-    return true;
+    return false;
 }
 
 } // namespace
@@ -536,7 +533,10 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
     std::string rejectedSerial;           // ... and is skipped for a minute
     std::chrono::steady_clock::time_point rejectedSerialUntil{};
 
-        bool stickToUsbAfterSession = false;
+    bool stickToUsbAfterSession = false;
+    // An entry without an id (typed-in IP) is Wi-Fi only: whatever iPad is on
+    // the cable is not necessarily the one at that address.
+    const bool usbAllowed = !entryId_.empty();
 
 while (!stopRequested_) {
         // A blocked sender keeps checking back every few seconds; flipping it to
@@ -593,7 +593,7 @@ while (!stopRequested_) {
         if (configuredLoopback) {
             // Hand-entered 127.0.0.1: the localhost forward (first USB device).
             (void)EnsureUsbMuxForward(port, kUsbMuxLocalPort);
-        } else if (!skipUsb && PickUsbForEntry(knownId, skipSerial, false, usbDev, usbNeedsVerify)) {
+        } else if (usbAllowed && !skipUsb && PickUsbForEntry(knownId, skipSerial, false, usbDev, usbNeedsVerify)) {
             if (!usbClaim.Take(UsbClaimKey(usbDev))) {
                 Logf(ip, "USB device %s was just taken by another iPad entry, using Wi-Fi\n", usbDev.serial.c_str());
             } else {
@@ -1096,7 +1096,7 @@ std::thread reader([&] {
         // the same display.
         std::atomic<bool> movedToUsb{false};
         std::thread usbWatch;
-        if (!usbSession && !configuredLoopback && !knownId.empty()) {
+        if (!usbSession && !configuredLoopback && usbAllowed && !knownId.empty()) {
             usbWatch = std::thread([&] {
                 int ticks = 0;
                 while (!cursorStop && running && !stopRequested_) {
