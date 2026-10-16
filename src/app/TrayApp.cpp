@@ -1106,6 +1106,9 @@ void ShowContextMenu(HWND hwnd, TrayContext* ctx)
 
 void OpenSettingsAndApply(HWND hwnd, TrayContext* ctx)
 {
+    // Senders write to the config at runtime (USB serial->id bindings); start
+    // from the file, not the tray's copy from launch.
+    ctx->cfg = Config::Load();
     std::vector<std::string> oldDevices = ctx->cfg.devices;
     std::vector<std::string> oldIds = ctx->cfg.deviceIds;
     uint16_t oldPort = ctx->cfg.port;
@@ -1125,6 +1128,14 @@ void OpenSettingsAndApply(HWND hwnd, TrayContext* ctx)
     if (DialogBoxParamW(ctx->hInstance, MAKEINTRESOURCEW(IDD_SETTINGS), hwnd, SettingsDlgProc,
                         reinterpret_cast<LPARAM>(&state)) != IDOK)
         return;
+
+    // Bindings learned while the dialog was open: keep the file's, the dialog
+    // never edits them.
+    {
+        const Config onDisk = Config::Load();
+        ctx->cfg.usbLinkSerials = onDisk.usbLinkSerials;
+        ctx->cfg.usbLinkIds = onDisk.usbLinkIds;
+    }
 
     if (state.restartAdminRequested) {
         ctx->cfg.Save();
