@@ -537,6 +537,18 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
     // An entry without an id (typed-in IP) is Wi-Fi only: whatever iPad is on
     // the cable is not necessarily the one at that address.
     const bool usbAllowed = !entryId_.empty();
+    // USB dial/hello failures on this iPad's cable: the connect path and
+    // Back-to-USB skip USB until the backoff runs out, so a cable whose app is
+    // not listening does not bounce the Wi-Fi session every few seconds.
+    int usbFailCount = 0;
+    std::chrono::steady_clock::time_point usbFailUntil{};
+    auto noteUsbFailure = [&](const std::string& serial) {
+        usbFailCount = (std::min)(usbFailCount + 1, 6);
+        const int sec = 10 << (usbFailCount - 1); // 10 s .. 320 s
+        usbFailUntil = std::chrono::steady_clock::now() + std::chrono::seconds(sec);
+        Logf(ip, "USB %s failed (%d in a row) - Wi-Fi only for %d s\n", serial.empty() ? "?" : serial.c_str(),
+             usbFailCount, sec);
+    };
 
 while (!stopRequested_) {
         // A blocked sender keeps checking back every few seconds; flipping it to
@@ -586,7 +598,8 @@ while (!stopRequested_) {
         UsbClaim usbClaim;          // released when this attempt ends
         bool usbNeedsVerify = false;
         const bool configuredLoopback = IsUsbLikeHost(ip);
-        const bool skipUsb = forceWifiOnce;
+        const bool skipUsb = forceWifiOnce ||
+                             (allowWifiFailover && usbFailCount > 0 && std::chrono::steady_clock::now() < usbFailUntil);
         forceWifiOnce = false;
         const std::string skipSerial =
             std::chrono::steady_clock::now() < rejectedSerialUntil ? rejectedSerial : std::string{};
@@ -611,6 +624,7 @@ while (!stopRequested_) {
                     continue;
                 } else {
                     Logf(ip, "USB usbmux dial failed, falling back to Wi-Fi %s:%u\n", ip.c_str(), port);
+                    noteUsbFailure(usbDev.serial);
                 }
             }
         }
@@ -658,6 +672,8 @@ while (!stopRequested_) {
             if (stopRequested_)
                 continue;
             ++noHelloFailures;
+            if (usbSession && allowWifiFailover)
+                noteUsbFailure(usbDev.serial);
             const int waitMs = NoHelloBackoffMs(noHelloFailures);
             // Log the first few and then only when the delay changes (the cap).
             if (noHelloFailures <= 3 || waitMs != NoHelloBackoffMs(noHelloFailures - 1))
@@ -666,6 +682,8 @@ while (!stopRequested_) {
             continue;
         }
         noHelloFailures = 0;
+        if (usbSession)
+            usbFailCount = 0;
 
         // Re-learn USB serial <-> hello.id on every USB hello (the id changes
         // when the iPad app is reinstalled), so matching and Settings stay right.
@@ -1105,6 +1123,9 @@ std::thread reader([&] {
                         continue;
                     UsbMuxDevice d;
                     bool verify = false;
+                    // Set before this session started; read-only while it runs.
+                    if (usbFailCount > 0 && std::chrono::steady_clock::now() < usbFailUntil)
+                        continue;
                     if (PickUsbForEntry(knownId, {}, true, d, verify)) {
                         Logf(ip, "USB cable for this iPad is back (%s) - moving the session from Wi-Fi to USB\n",
                              d.serial.c_str());
