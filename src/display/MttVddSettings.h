@@ -74,10 +74,6 @@ MttEnsureResult EnsureCustomEdidForHello(uint32_t helloW, uint32_t helloH, bool 
 // Needs admin to write the live path; returns ok=false with detail on denial.
 MttEnsureResult EnsureResolutions(const std::vector<MttMode>& wanted);
 
-// Elevated one-shot: runs `--ensure-mtt-edid WxH` (shipped file when 0x0).
-// Bounded wait (no INFINITE); see EnsureMttResolutionsForHello for cancel.
-bool SelfElevateEnsure(uint32_t helloW, uint32_t helloH);
-
 // Sender entry, called before the MTT head attaches: generate the EDID for
 // this hello size; if bytes / flags / XML modes differ from what is installed,
 // show the one-time notice and self-elevate to write + reload MttVDD. No
@@ -111,9 +107,6 @@ int ReadMonitorCount();
 // Write <monitors><count>N</count> and reload MttVDD. Idempotent when already N.
 // Needs admin to write the live path. The first rewrite keeps a .bak copy.
 MttEnsureResult SetMonitorCount(uint32_t count);
-
-// Elevated one-shot used by --set-mtt-monitor-count.
-bool SelfElevateSetMonitorCount(uint32_t count);
 
 // Ensure at least one MTT head is attached (set count>=1 + reload if needed).
 // Logs via Logf. Cancels any pending link-loss grace teardown.

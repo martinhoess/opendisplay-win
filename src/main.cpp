@@ -186,7 +186,7 @@ int main(int argc, char** argv)
     int rc = 0;
     if ((argc >= 2 && std::string(argv[1]) == "--ensure-mtt-edid") ||
                (argc >= 2 && std::string(argv[1]) == "--ensure-mtt-resolutions")) {
-        // Elevated one-off (SelfElevateEnsure): with a hello size WxH, generate
+        // Elevated one-off (RunElevatedSelf): with a hello size WxH, generate
         // that iPad's EDID + XML modes; without, install the shipped
         // user_edid.bin. Sets CustomEdid/PreventSpoof, reloads MttVDD only if
         // something changed.
@@ -236,7 +236,7 @@ int main(int argc, char** argv)
         }
     } else if (argc >= 3 && std::string(argv[1]) == "--set-mtt-monitor-count") {
         // Elevated one-shot: set <monitors><count> in live MTT settings and reload.
-        // Invoked by SelfElevateSetMonitorCount (ensure/teardown path).
+        // Elevated child of the MTT ensure/teardown path.
         auto n = static_cast<uint32_t>(strtoul(argv[2], nullptr, 10));
         od::MttEnsureResult r = od::SetMonitorCount(n);
         printf("set-mtt-monitor-count %u: %s changed=%d detail=%s\n", n, r.ok ? "ok" : "failed",

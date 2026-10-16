@@ -1782,12 +1782,6 @@ std::wstring EnsureEdidArgs(uint32_t helloW, uint32_t helloH)
 
 } // namespace
 
-bool SelfElevateEnsure(uint32_t helloW, uint32_t helloH)
-{
-    return RunElevatedSelf(EnsureEdidArgs(helloW, helloH), "mtt", nullptr, kElevatedTimeoutMs) ==
-           ElevatedOutcome::Ok;
-}
-
 bool VerifyMttModesOffered(const std::string& logTag, int timeoutMs)
 {
     const std::vector<MttMode> expected = CurrentMttModes();
@@ -2012,12 +2006,6 @@ MttEnsureResult SetMonitorCount(uint32_t count)
         r.detail += " (reload soft-failed)";
     r.ok = settled;
     return r;
-}
-
-bool SelfElevateSetMonitorCount(uint32_t count)
-{
-    const std::wstring args = L"--set-mtt-monitor-count " + std::to_wstring(count);
-    return RunElevatedSelf(args, "mtt", nullptr, kElevatedTimeoutMs) == ElevatedOutcome::Ok;
 }
 
 bool EnsureMttVddAttached(const std::string& logTag, const std::atomic<bool>* cancel)
