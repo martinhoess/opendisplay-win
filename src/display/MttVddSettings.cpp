@@ -7,6 +7,7 @@
 #include <windows.h>
 
 #include <cfgmgr32.h>
+#include <objbase.h>
 #include <setupapi.h>
 #include <shellapi.h>
 
@@ -21,10 +22,12 @@
 #include <cstdint>
 #include <fstream>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace od {
@@ -202,138 +205,334 @@ bool SameModeSet(std::vector<ModeKey> a, std::vector<ModeKey> b)
     return a == b;
 }
 
-// Ask the MttVDD driver to re-read vdd_settings.xml without ChangeDisplaySettings.
-// Prefer pnputil /restart-device on Root\MttVDD. Fall back to disable/enable of the
-// MTT1337 *monitor* only - never DICS_DISABLE the display adapter (that can leave
-// CM_PROB_DISABLED / pending reboot on this class of device).
-bool ReloadMttVddDevice(std::string& detail)
+// True when `deviceName` lists w x h (either orientation) in its mode table.
+bool MonitorOffersModeImpl(const std::wstring& deviceName, uint32_t w, uint32_t h)
 {
-    auto findMttAdapterInstanceId = [](std::wstring& outId) -> bool {
-        HDEVINFO devInfo = SetupDiGetClassDevsW(&kDisplayClassGuid, nullptr, nullptr, DIGCF_PRESENT);
-        if (devInfo == INVALID_HANDLE_VALUE)
-            return false;
-        SP_DEVINFO_DATA did{};
-        did.cbSize = sizeof(did);
-        bool found = false;
-        for (DWORD i = 0; SetupDiEnumDeviceInfo(devInfo, i, &did); ++i) {
-            wchar_t hwIds[1024] = {};
-            if (!SetupDiGetDeviceRegistryPropertyW(devInfo, &did, SPDRP_HARDWAREID, nullptr,
-                                                   reinterpret_cast<PBYTE>(hwIds), sizeof(hwIds), nullptr))
-                continue;
-            bool match = false;
-            for (const wchar_t* p = hwIds; *p; p += wcslen(p) + 1) {
-                if (_wcsicmp(p, L"Root\\MttVDD") == 0) {
-                    match = true;
-                    break;
-                }
-            }
-            if (!match)
-                continue;
-            wchar_t instanceId[256];
-            if (!SetupDiGetDeviceInstanceIdW(devInfo, &did, instanceId, 256, nullptr))
-                continue;
-            outId = instanceId;
-            found = true;
-            break;
-        }
-        SetupDiDestroyDeviceInfoList(devInfo);
-        return found;
-    };
-
-    auto runPnputilRestart = [](const std::wstring& instanceId, std::string& detailOut) -> bool {
-        std::wstring args = L"/restart-device "" + instanceId + L""";
-        SHELLEXECUTEINFOW sei{};
-        sei.cbSize = sizeof(sei);
-        sei.fMask = SEE_MASK_NOCLOSEPROCESS;
-        sei.lpVerb = L"open";
-        sei.lpFile = L"pnputil.exe";
-        sei.lpParameters = args.c_str();
-        sei.nShow = SW_HIDE;
-        if (!ShellExecuteExW(&sei) || sei.hProcess == nullptr) {
-            detailOut = "pnputil launch failed";
-            return false;
-        }
-        WaitForSingleObject(sei.hProcess, 30000);
-        DWORD code = 1;
-        GetExitCodeProcess(sei.hProcess, &code);
-        CloseHandle(sei.hProcess);
-        if (code == 0) {
-            detailOut = "reloaded MttVDD via pnputil /restart-device";
-            Sleep(1000);
+    DEVMODEW dm{};
+    dm.dmSize = sizeof(dm);
+    for (DWORD i = 0; EnumDisplaySettingsW(deviceName.c_str(), i, &dm); ++i) {
+        if ((dm.dmPelsWidth == w && dm.dmPelsHeight == h) || (dm.dmPelsWidth == h && dm.dmPelsHeight == w))
             return true;
-        }
-        char buf[96];
-        snprintf(buf, sizeof(buf), "pnputil /restart-device exit=%lu", static_cast<unsigned long>(code));
-        detailOut = buf;
-        return false;
-    };
-
-    // Monitor-class bounce: DISPLAY\MTT1337\... - softer than killing the adapter.
-    auto bounceMttMonitor = [](std::string& detailOut) -> bool {
-        static const GUID kMonitorClass = {
-            0x4d36e96e, 0xe325, 0x11ce, {0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18}};
-        HDEVINFO devInfo = SetupDiGetClassDevsW(&kMonitorClass, nullptr, nullptr, DIGCF_PRESENT);
-        if (devInfo == INVALID_HANDLE_VALUE) {
-            detailOut = "monitor SetupDiGetClassDevs failed";
-            return false;
-        }
-        SP_DEVINFO_DATA did{};
-        did.cbSize = sizeof(did);
-        bool ok = false;
-        for (DWORD i = 0; SetupDiEnumDeviceInfo(devInfo, i, &did); ++i) {
-            wchar_t instanceId[256];
-            if (!SetupDiGetDeviceInstanceIdW(devInfo, &did, instanceId, 256, nullptr))
-                continue;
-            if (wcsstr(instanceId, L"MTT1337") == nullptr)
-                continue;
-
-            auto propChange = [&](DWORD state) -> bool {
-                SP_PROPCHANGE_PARAMS pcp{};
-                pcp.ClassInstallHeader.cbSize = sizeof(SP_CLASSINSTALL_HEADER);
-                pcp.ClassInstallHeader.InstallFunction = DIF_PROPERTYCHANGE;
-                pcp.StateChange = state;
-                pcp.Scope = DICS_FLAG_GLOBAL;
-                pcp.HwProfile = 0;
-                if (!SetupDiSetClassInstallParamsW(devInfo, &did, &pcp.ClassInstallHeader, sizeof(pcp)))
-                    return false;
-                return SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, devInfo, &did) != FALSE;
-            };
-
-            const bool disabled = propChange(DICS_DISABLE);
-            Sleep(800);
-            const bool enabled = propChange(DICS_ENABLE);
-            ok = disabled && enabled;
-            detailOut = ok ? "reloaded MTT monitor via SetupAPI disable/enable (MTT1337)"
-                           : "MTT1337 monitor disable/enable failed";
-            break;
-        }
-        SetupDiDestroyDeviceInfoList(devInfo);
-        if (!ok && detailOut.empty())
-            detailOut = "MTT1337 monitor not found";
-        return ok;
-    };
-
-    std::wstring instanceId;
-    if (!findMttAdapterInstanceId(instanceId)) {
-        detail = "MttVDD root device (Root\\MttVDD) not found";
-        return false;
+        dm = {};
+        dm.dmSize = sizeof(dm);
     }
-
-    std::string step;
-    if (runPnputilRestart(instanceId, step)) {
-        detail = step;
-        return true;
-    }
-    detail = step + "; ";
-    if (bounceMttMonitor(step)) {
-        detail += step;
-        return true;
-    }
-    detail += step + " (modes written; Windows may need a display re-plug)";
     return false;
 }
 
+// "800x600, 1024x768, ... 3840x2160 (14 sizes)" - for the verify-failed log line.
+std::string DescribeOfferedModes(const std::wstring& deviceName)
+{
+    std::vector<std::pair<uint32_t, uint32_t>> sizes;
+    DEVMODEW dm{};
+    dm.dmSize = sizeof(dm);
+    for (DWORD i = 0; EnumDisplaySettingsW(deviceName.c_str(), i, &dm); ++i) {
+        std::pair<uint32_t, uint32_t> s{dm.dmPelsWidth, dm.dmPelsHeight};
+        if (s.second > s.first)
+            std::swap(s.first, s.second);
+        if (std::find(sizes.begin(), sizes.end(), s) == sizes.end())
+            sizes.push_back(s);
+        dm = {};
+        dm.dmSize = sizeof(dm);
+    }
+    std::sort(sizes.begin(), sizes.end());
+    std::string out;
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        if (sizes.size() > 8 && i == 4) {
+            out += ", ...";
+            i = sizes.size() - 3;
+        }
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%s%ux%u", out.empty() ? "" : ", ", sizes[i].first, sizes[i].second);
+        out += buf;
+    }
+    char tail[32];
+    snprintf(tail, sizeof(tail), " (%zu sizes)", sizes.size());
+    return out.empty() ? std::string("none") : out + tail;
+}
 
+// Copy `path` to `path.bak` once (first time OpenDisplay rewrites it), so the
+// pre-OpenDisplay driver config can always be put back by hand.
+void BackupOnce(const std::wstring& path, std::vector<std::string>& notes)
+{
+    if (!FileExists(path.c_str()))
+        return;
+    const std::wstring bak = path + L".bak";
+    if (FileExists(bak.c_str()))
+        return;
+    if (CopyFileW(path.c_str(), bak.c_str(), TRUE))
+        notes.push_back("backed up " + NarrowPath(bak));
+    else
+        notes.push_back("backup of " + NarrowPath(path) + " failed (err=" + std::to_string(GetLastError()) + ")");
+}
+
+// ---- MttVDD adapter restart ---------------------------------------------------
+//
+// MttVDD only re-reads vdd_settings.xml / user_edid.bin when the *adapter*
+// (Root\MttVDD, display class) restarts - bouncing the MTT1337 monitor is not
+// enough, and `pnputil /restart-device` returns ERROR_NOT_SUPPORTED (50) on
+// some installs. So, in order, each step logged with its result code:
+//   1. SetupAPI DIF_PROPERTYCHANGE / DICS_PROPCHANGE (Device Manager's restart)
+//   2. SetupAPI DICS_DISABLE + DICS_ENABLE (what VDD Control "Restart Driver" does)
+//   3. pnputil /restart-device "<instance id>" (fallback)
+// After a step the adapter must be DN_STARTED with no problem code. When an MTT
+// head is on the desktop and an expected mode is given, that mode must also be
+// offered (EnumDisplaySettings) before the step counts; otherwise the next step
+// runs. Needs admin (the --ensure-mtt-edid / --set-mtt-monitor-count helpers).
+
+bool FindMttAdapterInstanceIdImpl(std::wstring& outId)
+{
+    HDEVINFO devInfo = SetupDiGetClassDevsW(&kDisplayClassGuid, nullptr, nullptr, DIGCF_PRESENT);
+    if (devInfo == INVALID_HANDLE_VALUE)
+        return false;
+    SP_DEVINFO_DATA did{};
+    did.cbSize = sizeof(did);
+    bool found = false;
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(devInfo, i, &did); ++i) {
+        wchar_t hwIds[1024] = {};
+        if (!SetupDiGetDeviceRegistryPropertyW(devInfo, &did, SPDRP_HARDWAREID, nullptr,
+                                               reinterpret_cast<PBYTE>(hwIds), sizeof(hwIds) - sizeof(wchar_t),
+                                               nullptr))
+            continue;
+        bool match = false;
+        for (const wchar_t* p = hwIds; *p; p += wcslen(p) + 1) {
+            if (_wcsicmp(p, L"Root\\MttVDD") == 0) {
+                match = true;
+                break;
+            }
+        }
+        if (!match)
+            continue;
+        wchar_t instanceId[256];
+        if (!SetupDiGetDeviceInstanceIdW(devInfo, &did, instanceId, 256, nullptr))
+            continue;
+        outId = instanceId;
+        found = true;
+        break;
+    }
+    SetupDiDestroyDeviceInfoList(devInfo);
+    return found;
+}
+
+struct AdapterStatus {
+    bool found = false;
+    bool started = false;
+    ULONG problem = 0;
+    CONFIGRET cr = CR_SUCCESS;
+};
+
+AdapterStatus QueryAdapterStatus(const std::wstring& instanceId)
+{
+    AdapterStatus s;
+    DEVINST inst = 0;
+    s.cr = CM_Locate_DevNodeW(&inst, const_cast<DEVINSTID_W>(instanceId.c_str()), CM_LOCATE_DEVNODE_NORMAL);
+    if (s.cr != CR_SUCCESS)
+        return s;
+    s.found = true;
+    ULONG status = 0;
+    s.cr = CM_Get_DevNode_Status(&status, &s.problem, inst, 0);
+    if (s.cr != CR_SUCCESS)
+        return s;
+    s.started = (status & DN_STARTED) != 0 && (status & DN_HAS_PROBLEM) == 0;
+    if ((status & DN_HAS_PROBLEM) == 0)
+        s.problem = 0;
+    return s;
+}
+
+AdapterStatus WaitAdapterStarted(const std::wstring& instanceId, int timeoutMs)
+{
+    AdapterStatus s = QueryAdapterStatus(instanceId);
+    for (int waited = 0; !s.started && waited < timeoutMs; waited += 250) {
+        Sleep(250);
+        s = QueryAdapterStatus(instanceId);
+    }
+    return s;
+}
+
+std::string DescribeAdapter(const AdapterStatus& s)
+{
+    char buf[96];
+    if (!s.found)
+        snprintf(buf, sizeof(buf), "adapter not found (cr=%lu)", static_cast<unsigned long>(s.cr));
+    else
+        snprintf(buf, sizeof(buf), "%s, problem=%lu", s.started ? "started" : "NOT started",
+                 static_cast<unsigned long>(s.problem));
+    return buf;
+}
+
+// One DIF_PROPERTYCHANGE on the adapter. err = GetLastError on failure;
+// needReboot when SetupAPI says the change only applies after a restart.
+bool AdapterPropertyChange(const std::wstring& instanceId, DWORD stateChange, DWORD& err, bool& needReboot)
+{
+    err = 0;
+    needReboot = false;
+    HDEVINFO devInfo = SetupDiCreateDeviceInfoList(&kDisplayClassGuid, nullptr);
+    if (devInfo == INVALID_HANDLE_VALUE) {
+        err = GetLastError();
+        return false;
+    }
+    SP_DEVINFO_DATA did{};
+    did.cbSize = sizeof(did);
+    if (!SetupDiOpenDeviceInfoW(devInfo, instanceId.c_str(), nullptr, 0, &did)) {
+        err = GetLastError();
+        SetupDiDestroyDeviceInfoList(devInfo);
+        return false;
+    }
+    SP_PROPCHANGE_PARAMS pcp{};
+    pcp.ClassInstallHeader.cbSize = sizeof(SP_CLASSINSTALL_HEADER);
+    pcp.ClassInstallHeader.InstallFunction = DIF_PROPERTYCHANGE;
+    pcp.StateChange = stateChange;
+    pcp.Scope = DICS_FLAG_GLOBAL;
+    pcp.HwProfile = 0;
+    bool ok = SetupDiSetClassInstallParamsW(devInfo, &did, &pcp.ClassInstallHeader, sizeof(pcp)) != FALSE;
+    if (ok)
+        ok = SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, devInfo, &did) != FALSE;
+    if (!ok)
+        err = GetLastError();
+    SP_DEVINSTALL_PARAMS_W dip{};
+    dip.cbSize = sizeof(dip);
+    if (SetupDiGetDeviceInstallParamsW(devInfo, &did, &dip))
+        needReboot = (dip.Flags & (DI_NEEDREBOOT | DI_NEEDRESTART)) != 0;
+    SetupDiDestroyDeviceInfoList(devInfo);
+    return ok;
+}
+
+std::string StepResult(const char* name, bool ok, DWORD err, bool needReboot)
+{
+    char buf[128];
+    snprintf(buf, sizeof(buf), "%s %s (err=%lu%s)", name, ok ? "ok" : "FAILED", static_cast<unsigned long>(err),
+             needReboot ? ", needs reboot" : "");
+    return buf;
+}
+
+// Expected mode check after a restart. "unverifiable" (no MTT head on the
+// desktop) counts as success here; the sender re-verifies after attach.
+enum class ModeCheck { Offered, NotOffered, NoHead };
+
+ModeCheck WaitForModeOffered(uint32_t w, uint32_t h, int timeoutMs)
+{
+    bool sawHead = false;
+    for (int waited = 0;; waited += 250) {
+        ExistingMonitor mon{};
+        if (FindMttVirtualMonitor(mon)) {
+            sawHead = true;
+            if (MonitorOffersModeImpl(mon.deviceName, w, h))
+                return ModeCheck::Offered;
+        }
+        if (waited >= timeoutMs)
+            break;
+        Sleep(250);
+    }
+    return sawHead ? ModeCheck::NotOffered : ModeCheck::NoHead;
+}
+
+bool RunPnputilRestart(const std::wstring& instanceId, std::string& stepOut)
+{
+    // Quoted instance id: Root\MttVDD\0000 has no spaces today, but quote anyway.
+    const std::wstring args = L"/restart-device \"" + instanceId + L"\"";
+    SHELLEXECUTEINFOW sei{};
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+    sei.lpVerb = L"open";
+    sei.lpFile = L"pnputil.exe";
+    sei.lpParameters = args.c_str();
+    sei.nShow = SW_HIDE;
+    if (!ShellExecuteExW(&sei) || sei.hProcess == nullptr) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "pnputil launch FAILED (err=%lu)", static_cast<unsigned long>(GetLastError()));
+        stepOut = buf;
+        return false;
+    }
+    const DWORD wait = WaitForSingleObject(sei.hProcess, 30000);
+    DWORD code = 1;
+    if (wait == WAIT_OBJECT_0)
+        GetExitCodeProcess(sei.hProcess, &code);
+    CloseHandle(sei.hProcess);
+    char buf[96];
+    if (wait != WAIT_OBJECT_0)
+        snprintf(buf, sizeof(buf), "pnputil /restart-device timed out (30s)");
+    else
+        snprintf(buf, sizeof(buf), "pnputil /restart-device exit=%lu%s", static_cast<unsigned long>(code),
+                 code == ERROR_NOT_SUPPORTED ? " (ERROR_NOT_SUPPORTED)" : "");
+    stepOut = buf;
+    return wait == WAIT_OBJECT_0 && code == 0;
+}
+
+// expect: preferred mode the driver must offer afterwards (nullptr = only
+// require the adapter to come back started, e.g. a monitor-count change).
+bool ReloadMttVddDevice(std::string& detail, const MttMode* expect)
+{
+    std::wstring instanceId;
+    if (!FindMttAdapterInstanceIdImpl(instanceId)) {
+        detail = "reload: MttVDD adapter (Root\\MttVDD) not found";
+        return false;
+    }
+    detail = "reload " + NarrowPath(instanceId) + ":";
+
+    // A step "took" when the adapter is started again and (if checkable) the
+    // expected mode is offered.
+    auto settle = [&](const char* step) -> bool {
+        const AdapterStatus st = WaitAdapterStarted(instanceId, 10000);
+        detail += std::string(" [") + step + " -> " + DescribeAdapter(st);
+        if (!st.started) {
+            detail += "]";
+            return false;
+        }
+        if (expect == nullptr || expect->width == 0) {
+            detail += "]";
+            return true;
+        }
+        const ModeCheck mc = WaitForModeOffered(expect->width, expect->height, 5000);
+        char buf[96];
+        snprintf(buf, sizeof(buf), "; %ux%u %s]", expect->width, expect->height,
+                 mc == ModeCheck::Offered      ? "offered"
+                 : mc == ModeCheck::NoHead     ? "unverified (no head on desktop yet)"
+                                               : "NOT offered");
+        detail += buf;
+        return mc != ModeCheck::NotOffered;
+    };
+
+    // 1) DICS_PROPCHANGE: stop + restart the adapter in place.
+    {
+        DWORD err = 0;
+        bool reboot = false;
+        const bool ok = AdapterPropertyChange(instanceId, DICS_PROPCHANGE, err, reboot);
+        detail += " " + StepResult("propchange", ok, err, reboot);
+        if (ok && !reboot && settle("propchange"))
+            return true;
+    }
+
+    // 2) Disable + enable (VDD Control's "Restart Driver"). Always try to
+    //    re-enable, twice if needed, so the adapter is never left disabled.
+    {
+        DWORD err = 0;
+        bool reboot = false;
+        const bool disabled = AdapterPropertyChange(instanceId, DICS_DISABLE, err, reboot);
+        detail += "; " + StepResult("disable", disabled, err, reboot);
+        Sleep(1000);
+        bool enabled = AdapterPropertyChange(instanceId, DICS_ENABLE, err, reboot);
+        if (!enabled) {
+            Sleep(1000);
+            enabled = AdapterPropertyChange(instanceId, DICS_ENABLE, err, reboot);
+        }
+        detail += "; " + StepResult("enable", enabled, err, reboot);
+        if (disabled && enabled && !reboot && settle("disable/enable"))
+            return true;
+    }
+
+    // 3) pnputil fallback.
+    {
+        std::string step;
+        const bool ok = RunPnputilRestart(instanceId, step);
+        detail += "; " + step;
+        if (ok && settle("pnputil"))
+            return true;
+    }
+
+    const AdapterStatus last = QueryAdapterStatus(instanceId);
+    detail += "; all reload steps failed, adapter " + DescribeAdapter(last) +
+              " (files are written; use VDD Control > Restart Driver or reboot)";
+    return false;
+}
 
 int ParseMonitorCount(const std::string& xml)
 {
@@ -662,6 +861,45 @@ std::atomic<bool> g_mttPositionedThisAttach{false};
 // Set on Quit / session end: EnsureMttVddAttached must not re-attach the head
 // from a racing pipeline rebuild while we are tearing it down for exit.
 std::atomic<bool> g_mttShuttingDown{false};
+
+// True once this session confirmed (EnumDisplaySettings) that the MTT head
+// offers the preferred mode from vdd_settings.xml, i.e. the driver really
+// reloaded the per-iPad EDID/XML. Layouts are only saved while true, so an
+// 800x600 fallback head can never overwrite mtt_display.json.
+std::atomic<bool> g_mttModesVerified{false};
+
+// Ownership: OpenDisplay only detaches an MTT head it attached itself. The
+// marker survives a crash so a head left over by a previous run is still ours;
+// a head set up by another tool (VDD Control, count > 1, ...) is used for
+// streaming but never moved or removed.
+std::wstring MttOwnerPathW()
+{
+    return AppDataDirW() + L"\\mtt_head_owned.txt";
+}
+
+std::atomic<int> g_mttOwnedState{-1}; // -1 unknown (read marker), 0 no, 1 yes
+
+bool MttHeadOwned()
+{
+    int s = g_mttOwnedState.load();
+    if (s < 0) {
+        s = FileExists(MttOwnerPathW().c_str()) ? 1 : 0;
+        g_mttOwnedState = s;
+    }
+    return s == 1;
+}
+
+void SetMttHeadOwned(bool owned, const ExistingMonitor* mon)
+{
+    const std::wstring path = MttOwnerPathW();
+    if (owned) {
+        CreateDirectoryW(AppDataDirW().c_str(), nullptr);
+        (void)WriteFileUtf8Atomic(path, mon ? NarrowPath(mon->deviceId) + "\n" : std::string("owned\n"));
+    } else {
+        DeleteFileW(path.c_str());
+    }
+    g_mttOwnedState = owned ? 1 : 0;
+}
 
 // Our own topology applies (attach, restore) stamp NoteSelfDisplayChange();
 // observers ignore display changes within this window.
@@ -1194,6 +1432,13 @@ MttEnsureResult EnsureCustomEdidBytes(const std::vector<uint8_t>& edid, const st
     }
 
     std::vector<std::string> notes;
+    bool xmlBackedUp = false;
+    auto backupXml = [&]() {
+        if (!dryRun && !xmlBackedUp) {
+            BackupOnce(r.path, notes);
+            xmlBackedUp = true;
+        }
+    };
     auto writeFail = [&](const char* what) {
         const DWORD err = GetLastError();
         char buf[112];
@@ -1209,6 +1454,8 @@ MttEnsureResult EnsureCustomEdidBytes(const std::vector<uint8_t>& edid, const st
     const bool edidSame = edidPresent && live == edid;
     if (!edidSame) {
         notes.push_back(edidPresent ? "user_edid.bin differs" : "user_edid.bin missing");
+        if (!dryRun)
+            BackupOnce(kLiveEdidPath, notes);
         if (!dryRun && !WriteFileBytesAtomic(kLiveEdidPath, edid))
             return writeFail("edid");
     }
@@ -1234,6 +1481,7 @@ MttEnsureResult EnsureCustomEdidBytes(const std::vector<uint8_t>& edid, const st
             }
             next = n2;
         }
+        backupXml();
         if (!dryRun && !WriteFileUtf8Atomic(r.path, next))
             return writeFail("options");
         xml = next;
@@ -1249,6 +1497,7 @@ MttEnsureResult EnsureCustomEdidBytes(const std::vector<uint8_t>& edid, const st
             r.detail = "malformed XML (no <resolutions>)";
             return r;
         }
+        backupXml();
         if (!dryRun && !WriteFileUtf8Atomic(r.path, rewritten))
             return writeFail("resolutions");
         xml = rewritten;
@@ -1270,10 +1519,11 @@ MttEnsureResult EnsureCustomEdidBytes(const std::vector<uint8_t>& edid, const st
         return r;
 
     std::string reloadDetail;
-    const bool reloaded = ReloadMttVddDevice(reloadDetail);
+    const bool reloaded = ReloadMttVddDevice(reloadDetail, &modes.front());
     r.detail += "; " + reloadDetail;
+    r.reloadFailed = !reloaded;
     if (!reloaded)
-        r.detail += " (reload soft-failed; files written)";
+        r.detail += " (files written, driver NOT reloaded)";
     return r;
 }
 
@@ -1342,6 +1592,8 @@ MttEnsureResult EnsureResolutions(const std::vector<MttMode>& wanted)
 
     const int removed = static_cast<int>(present.size()) - static_cast<int>(need.size());
     r.added = static_cast<int>(need.size());
+    std::vector<std::string> backupNotes;
+    BackupOnce(r.path, backupNotes);
     if (!WriteFileUtf8Atomic(r.path, rewritten)) {
         const DWORD err = GetLastError();
         char buf[96];
@@ -1353,7 +1605,8 @@ MttEnsureResult EnsureResolutions(const std::vector<MttMode>& wanted)
     }
 
     std::string reloadDetail;
-    const bool reloaded = ReloadMttVddDevice(reloadDetail);
+    const bool reloaded = ReloadMttVddDevice(reloadDetail, wanted.empty() ? nullptr : &wanted.front());
+    r.reloadFailed = !reloaded;
 
     r.ok = true;
     r.changed = true;
@@ -1367,32 +1620,210 @@ MttEnsureResult EnsureResolutions(const std::vector<MttMode>& wanted)
 
 }
 
-bool SelfElevateEnsure(uint32_t helloW, uint32_t helloH)
+namespace {
+
+// ---- Elevated helper (self, "runas") ------------------------------------------
+//
+// ShellExecuteEx("runas") blocks for as long as the UAC prompt is open, and the
+// helper itself can take a while (driver restart). Both run off the sender
+// thread's critical path: the launch happens on a detached thread and the
+// caller polls with a deadline and a cancel flag (tray Disconnect / Quit), so
+// the tray never hangs on an unanswered prompt. A cancelled or timed-out
+// helper is abandoned, not killed (an unelevated process cannot terminate an
+// elevated one); every helper step is bounded, so it finishes on its own.
+constexpr int kElevatedTimeoutMs = 180000;
+
+enum class ElevatedOutcome { Ok, ReloadFailed, Failed, Declined, TimedOut, Cancelled };
+
+struct ElevatedLaunch {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool done = false;
+    bool abandoned = false;
+    HANDLE process = nullptr;
+    DWORD err = 0;
+};
+
+// The helper is a one-off with no console, so it logs to
+// %APPDATA%\opendisplay-win\log-<pid>.txt. Copy those lines into this log so
+// one file tells the whole story (reload step results included).
+void ImportElevatedChildLog(DWORD pid, const std::string& logTag)
+{
+    if (pid == 0)
+        return;
+    const std::wstring path = AppDataDirW() + L"\\log-" + std::to_wstring(pid) + L".txt";
+    std::string body;
+    if (!ReadFileUtf8(path, body)) {
+        Logf(logTag, "mtt: elevated helper log %s not found (approved with a different admin account?)\n",
+             NarrowPath(path).c_str());
+        return;
+    }
+    std::istringstream in(body);
+    std::string line;
+    while (std::getline(in, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
+            line.pop_back();
+        if (!line.empty())
+            Logf(logTag, "mtt: [elevated %lu] %s\n", static_cast<unsigned long>(pid), line.c_str());
+    }
+    DeleteFileW(path.c_str());
+}
+
+ElevatedOutcome RunElevatedSelf(const std::wstring& args, const std::string& logTag,
+                                const std::atomic<bool>* cancel, int timeoutMs)
 {
     wchar_t exe[MAX_PATH];
     if (GetModuleFileNameW(nullptr, exe, MAX_PATH) == 0)
-        return false;
+        return ElevatedOutcome::Failed;
+    const std::wstring exePath = exe;
+    auto cancelled = [cancel]() { return g_mttShuttingDown.load() || (cancel != nullptr && cancel->load()); };
+
+    auto st = std::make_shared<ElevatedLaunch>();
+    std::thread([st, exePath, args]() {
+        const HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        SHELLEXECUTEINFOW sei{};
+        sei.cbSize = sizeof(sei);
+        sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+        sei.lpVerb = L"runas";
+        sei.lpFile = exePath.c_str();
+        sei.lpParameters = args.c_str();
+        sei.nShow = SW_HIDE;
+        const BOOL ok = ShellExecuteExW(&sei);
+        const DWORD err = ok ? 0 : GetLastError();
+        {
+            std::lock_guard<std::mutex> lock(st->mu);
+            st->done = true;
+            st->err = err;
+            if (ok && sei.hProcess != nullptr) {
+                if (st->abandoned)
+                    CloseHandle(sei.hProcess);
+                else
+                    st->process = sei.hProcess;
+            } else if (ok) {
+                st->err = ERROR_INVALID_HANDLE;
+            }
+        }
+        st->cv.notify_all();
+        if (SUCCEEDED(hr))
+            CoUninitialize();
+    }).detach();
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    HANDLE process = nullptr;
+    DWORD err = 0;
+    {
+        std::unique_lock<std::mutex> lock(st->mu);
+        while (!st->done) {
+            if (cancelled()) {
+                st->abandoned = true;
+                Logf(logTag, "mtt: stopped waiting for the admin prompt (disconnect/quit); the prompt stays "
+                             "open until answered\n");
+                return ElevatedOutcome::Cancelled;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                st->abandoned = true;
+                Logf(logTag, "mtt: admin prompt not answered within %d s - continuing without it\n",
+                     timeoutMs / 1000);
+                return ElevatedOutcome::TimedOut;
+            }
+            st->cv.wait_for(lock, std::chrono::milliseconds(200));
+        }
+        process = st->process;
+        err = st->err;
+    }
+    if (process == nullptr) {
+        if (err == ERROR_CANCELLED)
+            return ElevatedOutcome::Declined;
+        Logf(logTag, "mtt: elevated helper launch failed (err=%lu)\n", static_cast<unsigned long>(err));
+        return ElevatedOutcome::Failed;
+    }
+
+    const DWORD pid = GetProcessId(process);
+    for (;;) {
+        const DWORD w = WaitForSingleObject(process, 200);
+        if (w == WAIT_OBJECT_0)
+            break;
+        if (w == WAIT_FAILED) {
+            CloseHandle(process);
+            Logf(logTag, "mtt: waiting for elevated helper failed (err=%lu)\n",
+                 static_cast<unsigned long>(GetLastError()));
+            return ElevatedOutcome::Failed;
+        }
+        if (cancelled() || std::chrono::steady_clock::now() >= deadline) {
+            const bool wasCancel = cancelled();
+            CloseHandle(process);
+            Logf(logTag, "mtt: %s waiting for elevated helper pid %lu - it finishes on its own\n",
+                 wasCancel ? "stopped" : "timed out", static_cast<unsigned long>(pid));
+            return wasCancel ? ElevatedOutcome::Cancelled : ElevatedOutcome::TimedOut;
+        }
+    }
+    DWORD code = 1;
+    GetExitCodeProcess(process, &code);
+    CloseHandle(process);
+    ImportElevatedChildLog(pid, logTag);
+    Logf(logTag, "mtt: elevated helper pid %lu exit=%lu\n", static_cast<unsigned long>(pid),
+         static_cast<unsigned long>(code));
+    if (code == 0)
+        return ElevatedOutcome::Ok;
+    if (code == 2)
+        return ElevatedOutcome::ReloadFailed;
+    return ElevatedOutcome::Failed;
+}
+
+std::wstring EnsureEdidArgs(uint32_t helloW, uint32_t helloH)
+{
     // The elevated child regenerates the same bytes from the hello size
-    // (deterministic), writes them and reloads MttVDD. No size -> shipped file.
+    // (deterministic), writes them and restarts MttVDD. No size -> shipped file.
     std::wstring args = L"--ensure-mtt-edid";
     if (helloW && helloH)
         args += L" " + std::to_wstring(helloW) + L"x" + std::to_wstring(helloH);
+    return args;
+}
 
-    SHELLEXECUTEINFOW sei{};
-    sei.cbSize = sizeof(sei);
-    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
-    sei.lpVerb = L"runas";
-    sei.lpFile = exe;
-    sei.lpParameters = args.c_str();
-    sei.nShow = SW_HIDE;
-    if (!ShellExecuteExW(&sei) || sei.hProcess == nullptr)
-        return false; // UAC declined or launch failed
+} // namespace
 
-    WaitForSingleObject(sei.hProcess, INFINITE);
-    DWORD code = 1;
-    GetExitCodeProcess(sei.hProcess, &code);
-    CloseHandle(sei.hProcess);
-    return code == 0;
+bool VerifyMttModesOffered(const std::string& logTag, int timeoutMs)
+{
+    const std::vector<MttMode> expected = CurrentMttModes();
+    const MttMode& want = expected.front();
+    ExistingMonitor mon{};
+    bool sawHead = false;
+    for (int waited = 0;; waited += 250) {
+        if (FindMttVirtualMonitor(mon)) {
+            sawHead = true;
+            if (MonitorOffersModeImpl(mon.deviceName, want.width, want.height)) {
+                if (!g_mttModesVerified.exchange(true))
+                    Logf(logTag, "mtt: verified - %ls offers %ux%u (expected modes: %s)\n", mon.deviceName.c_str(),
+                         want.width, want.height, FormatModes(expected).c_str());
+                return true;
+            }
+        }
+        if (waited >= timeoutMs)
+            break;
+        Sleep(250);
+    }
+    g_mttModesVerified = false;
+    if (!sawHead) {
+        Logf(logTag, "mtt: verify skipped - no MTT head on the desktop\n");
+        return false;
+    }
+    Logf(logTag,
+         "mtt: VERIFY FAILED - %ls does not offer %ux%u after %d ms; driver offers %s. vdd_settings.xml / "
+         "user_edid.bin list %s but MttVDD has not reloaded them. No layout is saved until this passes. "
+         "Fix: VDD Control > Restart Driver, then reconnect.\n",
+         mon.deviceName.c_str(), want.width, want.height, timeoutMs, DescribeOfferedModes(mon.deviceName).c_str(),
+         FormatModes(expected).c_str());
+    return false;
+}
+
+bool MttModesVerified()
+{
+    return g_mttModesVerified.load();
+}
+
+bool FindMttAdapterInstanceId(std::wstring& instanceId)
+{
+    return FindMttAdapterInstanceIdImpl(instanceId);
 }
 
 namespace {
@@ -1402,10 +1833,14 @@ namespace {
 std::atomic<uint64_t> g_mttEdidDeclinedKey{0};
 } // namespace
 
-bool EnsureMttResolutionsForHello(uint32_t helloW, uint32_t helloH, const std::string& logTag)
+bool EnsureMttResolutionsForHello(uint32_t helloW, uint32_t helloH, const std::string& logTag,
+                                  const std::atomic<bool>* cancel)
 {
     // Runs BEFORE the MTT head is attached (SenderApp::buildPipeline). Same
-    // iPad again = bytes/XML already match = no UAC, no reload.
+    // iPad again = bytes/XML already match = no UAC, no reload. Whatever
+    // happens here, the sender re-verifies the offered modes after attach
+    // (VerifyMttModesOffered) before trusting or saving any layout.
+    g_mttModesVerified = false;
     const std::vector<MttMode> modes = MttModesForHello(helloW, helloH);
     Logf(logTag, "mtt: EDID modes for hello %ux%u: %s\n", helloW, helloH, FormatModes(modes).c_str());
 
@@ -1422,10 +1857,11 @@ bool EnsureMttResolutionsForHello(uint32_t helloW, uint32_t helloH, const std::s
 
     if (ProcessIsElevated()) {
         const MttEnsureResult r = EnsureCustomEdidForHello(helloW, helloH, /*dryRun=*/false);
-        Logf(logTag, "mtt: EDID install %s (%s)\n", r.ok ? "done" : "failed", r.detail.c_str());
+        Logf(logTag, "mtt: EDID install %s (%s)\n",
+             !r.ok ? "failed" : r.reloadFailed ? "written, driver NOT restarted" : "done", r.detail.c_str());
         if (r.ok)
             g_mttPositionedThisAttach = false; // head re-enumerated: apply saved layout once
-        return r.ok;
+        return r.ok && !r.reloadFailed;
     }
 
     const uint64_t key = (static_cast<uint64_t>(helloW) << 32) | helloH;
@@ -1436,26 +1872,49 @@ bool EnsureMttResolutionsForHello(uint32_t helloW, uint32_t helloH, const std::s
     }
 
     NotifyUser(L"Setting up this iPad's screen size (one time only).");
-    Logf(logTag, "mtt: EDID install needs admin, elevating...\n");
-    if (!SelfElevateEnsure(helloW, helloH)) {
-        Logf(logTag, "mtt: UAC declined or elevated EDID install failed - connecting with the installed EDID\n");
-        g_mttEdidDeclinedKey.store(key);
-        if (!FileExists(kLiveEdidPath)) {
-            // Nothing installed at all: best effort with the shipped 11" file
-            // (may still need admin to reload; never blocks the connection).
-            const MttEnsureResult fb = EnsureCustomEdid();
-            Logf(logTag, "mtt: shipped fallback EDID %s (%s)\n", fb.ok ? "installed" : "not installed",
-                 fb.detail.c_str());
+    Logf(logTag, "mtt: EDID install needs admin, elevating (--ensure-mtt-edid %ux%u)...\n", helloW, helloH);
+    const ElevatedOutcome outcome =
+        RunElevatedSelf(EnsureEdidArgs(helloW, helloH), logTag, cancel, kElevatedTimeoutMs);
+    if (outcome == ElevatedOutcome::Ok || outcome == ElevatedOutcome::ReloadFailed) {
+        g_mttPositionedThisAttach = false; // head re-enumerated: apply saved layout once
+        const MttEnsureResult after = EnsureCustomEdidForHello(helloW, helloH, /*dryRun=*/true);
+        if (!after.ok || after.changed) {
+            Logf(logTag, "mtt: EDID still differs after elevated install (%s)\n", after.detail.c_str());
+            return false;
         }
-        return false;
+        if (outcome == ElevatedOutcome::ReloadFailed) {
+            Logf(logTag, "mtt: EDID files installed for hello %ux%u, but the MttVDD adapter did NOT restart "
+                         "(see [elevated] lines above) - the driver keeps its old modes until it restarts\n",
+                 helloW, helloH);
+            return false;
+        }
+        Logf(logTag, "mtt: EDID files installed for hello %ux%u and MttVDD restarted - modes are verified "
+                     "after attach\n",
+             helloW, helloH);
+        return true;
     }
-    const MttEnsureResult after = EnsureCustomEdidForHello(helloW, helloH, /*dryRun=*/true);
-    if (after.ok && !after.changed)
-        Logf(logTag, "mtt: EDID installed for hello %ux%u (driver reloaded)\n", helloW, helloH);
-    else
-        Logf(logTag, "mtt: EDID still differs after elevated install (%s)\n", after.detail.c_str());
-    g_mttPositionedThisAttach = false; // head re-enumerated: apply saved layout once
-    return after.ok && !after.changed;
+    switch (outcome) {
+        case ElevatedOutcome::Declined:
+            Logf(logTag, "mtt: UAC declined - connecting with the installed EDID\n");
+            break;
+        case ElevatedOutcome::Cancelled:
+            return false; // disconnect / quit: no fallback work
+        case ElevatedOutcome::TimedOut:
+            Logf(logTag, "mtt: elevated EDID install timed out - connecting with the installed EDID\n");
+            break;
+        default:
+            Logf(logTag, "mtt: elevated EDID install failed - connecting with the installed EDID\n");
+            break;
+    }
+    g_mttEdidDeclinedKey.store(key);
+    if (!FileExists(kLiveEdidPath)) {
+        // Nothing installed at all: best effort with the shipped 11" file
+        // (may still need admin to reload; never blocks the connection).
+        const MttEnsureResult fb = EnsureCustomEdid();
+        Logf(logTag, "mtt: shipped fallback EDID %s (%s)\n", fb.ok ? "installed" : "not installed",
+             fb.detail.c_str());
+    }
+    return false;
 }
 
 
@@ -1511,6 +1970,8 @@ MttEnsureResult SetMonitorCount(uint32_t count)
             r.detail = "malformed XML (no <monitors>)";
             return r;
         }
+        std::vector<std::string> backupNotes;
+        BackupOnce(r.path, backupNotes);
         if (!WriteFileUtf8Atomic(r.path, rewritten)) {
             const DWORD err = GetLastError();
             char buf[96];
@@ -1523,7 +1984,8 @@ MttEnsureResult SetMonitorCount(uint32_t count)
     }
 
     std::string reloadDetail;
-    const bool reloaded = ReloadMttVddDevice(reloadDetail);
+    const bool reloaded = ReloadMttVddDevice(reloadDetail, nullptr);
+    r.reloadFailed = !reloaded;
     bool settled = false;
     if (count == 0) {
         settled = WaitForMttMonitor(/*wantPresent=*/false, 4000);
@@ -1538,41 +2000,15 @@ MttEnsureResult SetMonitorCount(uint32_t count)
 
     r.changed = true;
     r.added = 0;
-    char buf[192];
-    snprintf(buf, sizeof(buf), "set monitors count=%u (was %d); %s; settle=%s",
-             count, cur, reloadDetail.c_str(), settled ? "ok" : "timeout");
-    r.detail = buf;
+    r.detail = "set monitors count=" + std::to_string(count) + " (was " + std::to_string(cur) + "); " +
+               reloadDetail + "; settle=" + (settled ? "ok" : "timeout");
     if (!reloaded)
         r.detail += " (reload soft-failed)";
     r.ok = settled;
     return r;
 }
 
-bool SelfElevateSetMonitorCount(uint32_t count)
-{
-    wchar_t exe[MAX_PATH];
-    if (GetModuleFileNameW(nullptr, exe, MAX_PATH) == 0)
-        return false;
-    std::wstring args = L"--set-mtt-monitor-count " + std::to_wstring(count);
-
-    SHELLEXECUTEINFOW sei{};
-    sei.cbSize = sizeof(sei);
-    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
-    sei.lpVerb = L"runas";
-    sei.lpFile = exe;
-    sei.lpParameters = args.c_str();
-    sei.nShow = SW_HIDE;
-    if (!ShellExecuteExW(&sei) || sei.hProcess == nullptr)
-        return false;
-
-    WaitForSingleObject(sei.hProcess, INFINITE);
-    DWORD code = 1;
-    GetExitCodeProcess(sei.hProcess, &code);
-    CloseHandle(sei.hProcess);
-    return code == 0;
-}
-
-bool EnsureMttVddAttached(const std::string& logTag)
+bool EnsureMttVddAttached(const std::string& logTag, const std::atomic<bool>* cancel)
 {
     if (g_mttShuttingDown.load()) {
         Logf(logTag, "mtt: exiting - not attaching VDD\n");
@@ -1593,28 +2029,46 @@ bool EnsureMttVddAttached(const std::string& logTag)
         // rebuild, hello-again, link-flap reconnect) leave the user's layout
         // alone - re-applying here is what snapped Display Settings moves back.
         if (!g_mttPositionedThisAttach.exchange(true)) {
-            Logf(logTag, "mtt: adopting MTT head already on the desktop (%ls) - applying saved layout once\n",
-                 mon.deviceName.c_str());
-            (void)RestoreMttDisplayTopology(logTag);
+            if (MttHeadOwned()) {
+                Logf(logTag, "mtt: adopting MTT head already on the desktop (%ls) - applying saved layout once\n",
+                     mon.deviceName.c_str());
+                (void)RestoreMttDisplayTopology(logTag);
+            } else {
+                Logf(logTag, "mtt: using MTT head %ls that OpenDisplay did not create - not moving it, and it "
+                             "is not removed on disconnect/quit\n",
+                     mon.deviceName.c_str());
+            }
         } else {
             Logf(logTag, "mtt: VDD already attached (%ls) - keeping current layout\n", mon.deviceName.c_str());
         }
         return true;
     }
 
-    // Make sure the driver is willing to expose a head.
-    MttEnsureResult r = SetMonitorCount(1);
+    // Make sure the driver is willing to expose a head. Only ever raise
+    // <count> (0 -> 1); a higher count set by another tool is left as is.
+    const int curCount = ReadMonitorCount();
+    const uint32_t wantCount = curCount >= 1 ? static_cast<uint32_t>(curCount) : 1u;
+    MttEnsureResult r = SetMonitorCount(wantCount);
     if (!r.ok && r.detail.find("access denied") != std::string::npos) {
-        Logf(logTag, "mtt: set count=1 needs admin, elevating...\n");
-        if (!SelfElevateSetMonitorCount(1)) {
-            Logf(logTag, "mtt: elevate failed or UAC declined - VDD may be missing\n");
+        Logf(logTag, "mtt: set count=%u needs admin, elevating...\n", wantCount);
+        const ElevatedOutcome o = RunElevatedSelf(L"--set-mtt-monitor-count " + std::to_wstring(wantCount),
+                                                  logTag, cancel, kElevatedTimeoutMs);
+        if (o == ElevatedOutcome::ReloadFailed)
+            Logf(logTag, "mtt: monitor count written but the MttVDD adapter did not restart cleanly\n");
+        if (o != ElevatedOutcome::Ok && o != ElevatedOutcome::ReloadFailed) {
+            Logf(logTag, "mtt: elevated monitor-count change %s - VDD may be missing\n",
+                 o == ElevatedOutcome::Declined    ? "declined"
+                 : o == ElevatedOutcome::Cancelled ? "cancelled"
+                 : o == ElevatedOutcome::TimedOut  ? "timed out"
+                                                   : "failed");
             return false;
         }
-        r = SetMonitorCount(1);
+        r = SetMonitorCount(wantCount);
     }
 
     if (FindMttVirtualMonitor(mon)) {
         Logf(logTag, "mtt: VDD attached (%ls) [%s]\n", mon.deviceName.c_str(), r.detail.c_str());
+        SetMttHeadOwned(true, &mon);
         g_mttPositionedThisAttach = true;
         (void)RestoreMttDisplayTopology(logTag);
         return true;
@@ -1658,6 +2112,7 @@ bool EnsureMttVddAttached(const std::string& logTag)
             WaitForMttMonitor(/*wantPresent=*/true, 5000)) {
             if (FindMttVirtualMonitor(mon)) {
                 Logf(logTag, "mtt: VDD attached via CDS (%ls)\n", mon.deviceName.c_str());
+                SetMttHeadOwned(true, &mon);
                 g_mttPositionedThisAttach = true;
                 (void)RestoreMttDisplayTopology(logTag);
                 return true;
@@ -1720,6 +2175,7 @@ bool EnsureMttVddAttached(const std::string& logTag)
 
     if (FindMttVirtualMonitor(mon)) {
         Logf(logTag, "mtt: VDD attached (%ls) [%s]\n", mon.deviceName.c_str(), r.detail.c_str());
+        SetMttHeadOwned(true, &mon);
         g_mttPositionedThisAttach = true;
         (void)RestoreMttDisplayTopology(logTag);
         return true;
@@ -1733,6 +2189,12 @@ bool TearDownMttVdd(const std::string& logTag)
     ExistingMonitor mon{};
     if (!FindMttVirtualMonitor(mon) && ReadMonitorCount() <= 0) {
         Logf(logTag, "mtt: VDD already down\n");
+        return true;
+    }
+    if (!MttHeadOwned()) {
+        Logf(logTag, "mtt: MTT head was not created by OpenDisplay - leaving it attached\n");
+        g_mttPositionedThisAttach = false;
+        g_mttModesVerified = false;
         return true;
     }
 
@@ -1754,6 +2216,8 @@ bool TearDownMttVdd(const std::string& logTag)
     if (!FindMttVirtualMonitor(mon)) {
         Logf(logTag, "mtt: VDD torn down [%s]\n", r.detail.c_str());
         g_mttPositionedThisAttach = false;
+        g_mttModesVerified = false;
+        SetMttHeadOwned(false, nullptr);
         // Make the detach stick: commit the MTT-less topology to the CCD
         // database, otherwise Windows may re-extend the head on the next
         // display re-enumeration or reboot ("still connected after exit").
@@ -1795,6 +2259,8 @@ bool TearDownMttVdd(const std::string& logTag)
         if (disabled && WaitForMttMonitor(/*wantPresent=*/false, 4000)) {
             Logf(logTag, "mtt: VDD torn down via SetupAPI disable [%s]\n", r.detail.c_str());
             g_mttPositionedThisAttach = false;
+            g_mttModesVerified = false;
+            SetMttHeadOwned(false, nullptr);
             return true;
         }
     }
@@ -1922,6 +2388,24 @@ bool SaveMttDisplayTopology(const std::string& logTag)
             w = prev.width;
             h = prev.height;
             hz = prev.hz;
+        }
+    }
+
+    // Never persist a mode the driver was not supposed to offer (e.g. the
+    // 800x600 head MttVDD shows when it did not reload the per-iPad EDID).
+    {
+        std::string skip;
+        if (!g_mttModesVerified.load())
+            skip = "driver modes not verified this session";
+        else if (!ModeOffered(CurrentMttModes(), w, h))
+            skip = "mode " + std::to_string(w) + "x" + std::to_string(h) + " is not one of the expected modes (" +
+                   FormatModes(CurrentMttModes()) + ")";
+        if (!skip.empty()) {
+            if (skip != s_lastSkip) {
+                Logf(logTag, "mtt: not saving layout (%s)\n", skip.c_str());
+                s_lastSkip = skip;
+            }
+            return false;
         }
     }
 
@@ -2059,6 +2543,11 @@ bool ShutdownMttVddForExit(const std::string& logTag)
         Logf(logTag, "mtt: exit - no MTT head on the desktop\n");
         return true;
     }
+    if (!MttHeadOwned()) {
+        Logf(logTag, "mtt: exit - MTT head %ls was not created by OpenDisplay, leaving it\n",
+             mon.deviceName.c_str());
+        return true;
+    }
     Logf(logTag, "mtt: exit - tearing down MTT head %ls\n", mon.deviceName.c_str());
     (void)SaveMttDisplayTopology(logTag);
     return TearDownMttVdd(logTag);
@@ -2069,6 +2558,11 @@ void AdoptStaleMttHeadAtStartup(const std::string& logTag, int graceMs)
     ExistingMonitor mon{};
     if (!FindMttVirtualMonitor(mon))
         return;
+    if (!MttHeadOwned()) {
+        Logf(logTag, "mtt: MTT head %ls on the desktop at startup was not created by OpenDisplay - leaving it\n",
+             mon.deviceName.c_str());
+        return;
+    }
     Logf(logTag,
          "mtt: MTT head %ls already on the desktop at startup (left over from a previous run) - "
          "adopting; removed in %d ms unless an iPad connects\n",

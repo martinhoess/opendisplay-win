@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <climits>
 #include <algorithm>
+#include <set>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -17,8 +18,12 @@
 #include <utility>
 
 #include <winsock2.h>
+#include <windows.h>
+#include <timeapi.h>
+#pragma comment(lib, "winmm.lib")
 
 #include "display/DesktopDuplication.h"
+#include "display/DisplayBackend.h"
 
 #include <wrl/client.h>
 #include "display/ExistingMonitor.h"
@@ -40,18 +45,31 @@ constexpr int kSendTimeoutMs = 500;      // backpressure: how long to wait for t
 constexpr int kDynamicHealthyMs = 5000;  // climb peak back toward ceiling after this quiet stretch
 constexpr int kDynamicLogMinMs = 2000;   // sparse Dynamic peak-change logging
 constexpr int kReconnectDelayMs = 2000;
+constexpr int kNoHelloBackoffMinMs = 500;    // first retry after a link that closed before hello
+constexpr int kNoHelloBackoffMaxMs = 30000;  // cap: an iPad with the app closed is checked twice a minute
+
+// Exponential backoff for links that accept and close without a hello (iPad
+// app backgrounded, usbmux forward to a closed port): 0.5s, 1s, 2s ... 30s.
+int NoHelloBackoffMs(int failures)
+{
+    int ms = kNoHelloBackoffMinMs;
+    for (int i = 1; i < failures && ms < kNoHelloBackoffMaxMs; ++i)
+        ms *= 2;
+    return (std::min)(ms, kNoHelloBackoffMaxMs);
+}
 constexpr int kKeepaliveMs = 1000;       // max silence on a static screen; well under the iPad's ~5s watchdog
-constexpr int kActiveTailMs = 300;       // keep feeding the encoder this long after the last change (drains its 1-frame hold)
 constexpr int kWrongSizeGraceMs = 3000;  // how long the monitor may sit on a foreign size before we rebuild it
 constexpr int kBlockedRetryMs = 5000;    // how often a waiting iPad checks whether the display is free again
 constexpr int kCursorUdpAckMs = 5000;    // drop UDP and stay on TCP if no cursorAck (PROTOCOL 6.3)
 
 // Only one panel size may be on the air at a time.
 //
-// MTT VDD: modes are independent per monitor (merged into vdd_settings.xml),
-// but we still serialize panel sizes so two senders never fight over rebuilds.
-// Same-size iPads share; a different size waits until the display is free.
-// (Parsec VDD path removed - this fork is MTT-only.)
+// parsec-vdd puts a single custom resolution on all of its virtual monitors:
+// whichever sender sets its size last drags every other monitor along, and
+// those iPads then show a letterboxed desktop at the wrong aspect. MTT has one
+// shared head whose modes come from one iPad's EDID. Either way, iPads of the
+// same panel size run together and a different one waits until the display
+// is free again.
 //
 // Process-wide, because the tray drives every sender. A headless CLI sender
 // started next to the tray is outside this and can still take the mode with
@@ -61,6 +79,8 @@ struct PanelState {
     uint32_t width = 0;
     uint32_t height = 0;
     int holders = 0;
+    bool exclusive = false;     // MTT: one iPad on the head at a time
+    const void* first = nullptr; // sender that took the panel first (for "in use by")
 };
 
 PanelState& Panel()
@@ -70,15 +90,22 @@ PanelState& Panel()
 }
 
 // Takes a share of the display for w x h. Returns false when a different size
-// holds it, and then reports that size in activeW/activeH.
-bool AcquirePanel(uint32_t w, uint32_t h, uint32_t& activeW, uint32_t& activeH)
+// holds it - or, exclusive (MTT: one head), when anyone holds it - and then
+// reports that size in activeW/activeH and the holding sender in holder.
+bool AcquirePanel(uint32_t w, uint32_t h, bool exclusive, const void* self, uint32_t& activeW, uint32_t& activeH,
+                  const void*& holder)
 {
     PanelState& panel = Panel();
     std::lock_guard<std::mutex> lock(panel.mutex);
-    if (panel.holders > 0 && (panel.width != w || panel.height != h)) {
+    if (panel.holders > 0 && (exclusive || panel.exclusive || panel.width != w || panel.height != h)) {
         activeW = panel.width;
         activeH = panel.height;
+        holder = panel.first;
         return false;
+    }
+    if (panel.holders == 0) {
+        panel.exclusive = exclusive;
+        panel.first = self;
     }
     panel.width = w;
     panel.height = h;
@@ -95,6 +122,8 @@ bool ReleasePanel()
         panel.holders = 0;
         panel.width = 0;
         panel.height = 0;
+        panel.exclusive = false;
+        panel.first = nullptr;
         return true;
     }
     return false;
@@ -206,6 +235,100 @@ bool IsUsbLikeHost(const std::string& host)
     return host == "127.0.0.1" || host == "::1" || host == "localhost";
 }
 
+// 1 ms system timer resolution for the length of a streaming session: a
+// backstop so any remaining Sleep()/timed wait on the capture path is not
+// rounded up to 15.6 ms. Released when the session ends.
+struct TimerResolution1ms {
+    bool on = timeBeginPeriod(1) == TIMERR_NOERROR;
+    ~TimerResolution1ms()
+    {
+        if (on)
+            timeEndPeriod(1);
+    }
+    TimerResolution1ms() = default;
+    TimerResolution1ms(const TimerResolution1ms&) = delete;
+    TimerResolution1ms& operator=(const TimerResolution1ms&) = delete;
+};
+
+// One USB cable feeds one sender: serials (or "#deviceId") currently dialed.
+std::mutex g_usbClaimMutex;
+std::set<std::string> g_usbClaims;
+
+std::string UsbClaimKey(const UsbMuxDevice& d)
+{
+    return d.serial.empty() ? "#" + std::to_string(d.deviceId) : d.serial;
+}
+
+struct UsbClaim {
+    std::string key;
+    bool Take(const std::string& k)
+    {
+        std::lock_guard<std::mutex> lock(g_usbClaimMutex);
+        if (!g_usbClaims.insert(k).second)
+            return false;
+        key = k;
+        return true;
+    }
+    ~UsbClaim()
+    {
+        if (key.empty())
+            return;
+        std::lock_guard<std::mutex> lock(g_usbClaimMutex);
+        g_usbClaims.erase(key);
+    }
+};
+
+// Which USB iPad belongs to this sender. expectedId is the entry's Bonjour
+// TXT id (or the id its last hello gave). A device is ours when the
+// serial->id we learned from an earlier USB hello equals it. Without such a
+// match (first USB session for this iPad) a single never-seen device is tried
+// unless strict; the hello then confirms it. No id at all: only when exactly
+// Entries without an id (typed-in IP) never use USB: the cable could carry any
+// iPad. Devices other senders hold are never picked.
+// needsVerify: the pick was a guess and hello.id must confirm it.
+bool PickUsbForEntry(const std::string& expectedId, const std::string& skipSerial, bool strict, UsbMuxDevice& out,
+                     bool& needsVerify)
+{
+    std::vector<UsbMuxDevice> devices;
+    if (!ListUsbMuxDevices(devices) || devices.empty())
+        return false;
+    const Config cfg = Config::Load();
+    std::vector<UsbMuxDevice> free;
+    {
+        std::lock_guard<std::mutex> lock(g_usbClaimMutex);
+        for (const UsbMuxDevice& d : devices)
+            if (!g_usbClaims.count(UsbClaimKey(d)))
+                free.push_back(d);
+    }
+    needsVerify = false;
+    if (!expectedId.empty()) {
+        for (const UsbMuxDevice& d : free) {
+            if (!d.serial.empty() && cfg.IdForUsbSerial(d.serial) == expectedId) {
+                out = d;
+                return true;
+            }
+        }
+        if (strict)
+            return false;
+        const UsbMuxDevice* unknown = nullptr;
+        int unknownCount = 0;
+        for (const UsbMuxDevice& d : free) {
+            if (d.serial == skipSerial && !skipSerial.empty())
+                continue;
+            if (d.serial.empty() || cfg.IdForUsbSerial(d.serial).empty()) {
+                unknown = &d;
+                ++unknownCount;
+            }
+        }
+        if (unknownCount != 1)
+            return false;
+        out = *unknown;
+        needsVerify = true;
+        return true;
+    }
+    return false;
+}
+
 } // namespace
 
 SenderApp::~SenderApp()
@@ -213,10 +336,11 @@ SenderApp::~SenderApp()
     Stop();
 }
 
-void SenderApp::Start(std::string ip, uint16_t port)
+void SenderApp::Start(std::string ip, uint16_t port, std::string entryId)
 {
     if (running_.exchange(true))
         return; // already running
+    entryId_ = std::move(entryId);
 
     stopRequested_ = false;
     worker_ = std::thread([this, ip = std::move(ip), port] { RunLoop(ip, port); });
@@ -281,109 +405,42 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
     // (destroyed LAST) — otherwise DesktopDuplication's D3D11/DXGI COM objects
     // would be released after CoUninitialize(), an access violation on Stop().
     H264Encoder encoder;
+    // Virtual display driver behind the head (MTT or Parsec, see
+    // DisplayBackend.h). Between encoder and dup on purpose: the duplication
+    // must be released before the head goes away. Picked per connection
+    // attempt from config (displayBackend), so a Settings change applies on
+    // the next connect.
+    std::unique_ptr<DisplayBackend> backend;
     DesktopDuplication dup;
     InputInjector input;
     std::mutex pipelineMutex;
     bool gpuNv12Path = false; // VideoProcessor BGRA->NV12 + EncodeDxgiNv12
     bool haveGpuDesktopFrame = false; // true after first successful GPU present
 
-    // MTT-only: capture + QSV share the Intel VDD. No Parsec fallback.
-    bool usingMttVdd = false;
-    bool mttModesEnsured = false; // once per connection; Ensure is idempotent too
-    // Raw hello pixelsWide/High (unaligned): the per-iPad EDID is generated
-    // from the panel size the iPad reports, not the 16-aligned capture size.
-    uint32_t mttHelloW = 0, mttHelloH = 0;
-    bool mttHelloModeForced = false; // force hello WxH once; later honor Keep
-    ExistingMonitor mttMon{};
     // Updated once the dial settles (USB vs Wi-Fi); buildPipeline / reconfigure read these.
     EncodeKnobs sessionEncode;
     EncodeMode sessionEncodeMode = EncodeMode::Dynamic;
     EncodePreset sessionEncodePreset = EncodePreset::Speed;
 
-    auto buildPipeline = [&](uint32_t width, uint32_t height) {
+    auto buildPipeline = [&](uint32_t width, uint32_t height, BuildReason reason = BuildReason::Hello) {
         // Caller holds pipelineMutex.
         dup.Close();
-
-        // Per-iPad EDID BEFORE the head attaches: modes generated from this
-        // hello size (first build of a connection = hello WxH). Same iPad
-        // again = no-op; a size change self-elevates once (tray notice first)
-        // and reloads MttVDD. UAC decline keeps the installed EDID and still
-        // connects. Never re-run on capture rebuilds.
-        if (!mttModesEnsured) {
-            const uint32_t edidW = mttHelloW ? mttHelloW : width;
-            const uint32_t edidH = mttHelloH ? mttHelloH : height;
-            (void)EnsureMttResolutionsForHello(edidW, edidH, ip);
-            mttModesEnsured = true; // even on UAC decline: one prompt per connection
-        }
-
-        // Re-attach MTT head if a prior last-client teardown dropped it.
-        Logf(ip, "mtt: ensuring VDD for hello\n");
-        (void)EnsureMttVddAttached(ip);
-        usingMttVdd = FindMttVirtualMonitor(mttMon);
-        if (usingMttVdd) {
-            Logf(ip, "using MTT virtual monitor %ls (%ls)\n",
-                 mttMon.deviceName.c_str(), mttMon.deviceString.c_str());
-            // First hello of a connection: restore the saved mode (the user's
-            // Display Settings pick) only if this iPad's EDID offers it;
-            // otherwise the preferred mode. Later rebuilds honor Keep and only
-            // fix orientation / refresh.
-            if (!mttHelloModeForced) {
-                uint32_t savedW = 0, savedH = 0, savedHz = 0;
-                if (QueryMttSavedMode(savedW, savedH, savedHz)) {
-                    const uint32_t applyHz = savedHz ? savedHz : kFps;
-                    if (!EnsureMonitorMode(mttMon.deviceName, savedW, savedH, applyHz)) {
-                        Logf(ip, "mtt: restoring saved mode %ux%u@%u failed (keeping current)\n",
-                             savedW, savedH, applyHz);
-                        if (EnsureMonitorLandscapeOrientation(mttMon.deviceName))
-                            Logf(ip, "MTT orientation ensured landscape (resolution unchanged)\n");
-                        if (!EnsureMonitorRefresh(mttMon.deviceName, applyHz))
-                            Logf(ip, "MTT refresh %u Hz request failed (keeping current)\n", applyHz);
-                    } else {
-                        Logf(ip, "mtt: restoring saved mode %ux%u@%u\n", savedW, savedH, applyHz);
-                    }
-                } else {
-                    // No saved mode, or it is not offered by this iPad's EDID:
-                    // use the preferred (landscape hello-native) mode.
-                    const MttMode preferred = CurrentMttModes().front();
-                    if (!EnsureMonitorMode(mttMon.deviceName, preferred.width, preferred.height, kFps)) {
-                        Logf(ip, "mtt: no usable saved mode - preferred %ux%u failed "
-                                 "(keeping current)\n",
-                             preferred.width, preferred.height);
-                        if (!EnsureMonitorRefresh(mttMon.deviceName, kFps))
-                            Logf(ip, "MTT refresh %u Hz request failed (keeping current)\n", kFps);
-                        else
-                            Logf(ip, "MTT refresh set to %u Hz\n", kFps);
-                    } else {
-                        Logf(ip, "mtt: no usable saved mode - using preferred %ux%u\n", preferred.width,
-                             preferred.height);
-                    }
-                }
-                mttHelloModeForced = true;
-            } else {
-                if (EnsureMonitorLandscapeOrientation(mttMon.deviceName))
-                    Logf(ip, "MTT orientation ensured landscape (resolution unchanged)\n");
-                else
-                    Logf(ip, "MTT landscape orientation request failed (keeping current)\n");
-                if (!EnsureMonitorRefresh(mttMon.deviceName, kFps))
-                    Logf(ip, "MTT refresh %u Hz request failed (keeping current)\n", kFps);
-            }
-            if (!dup.Open(mttMon.deviceName)) {
-                Logf(ip, "DesktopDuplication::Open failed on MTT device\n");
-                return false;
-            }
-            if (!GetMonitorRectByDeviceName(mttMon.deviceName, mttMon.rect)) {
-                // keep prior mttMon.rect if Enum failed
-            }
-            input.SetMonitorRect(mttMon.rect);
-            Logf(ip, "mtt: input rect %ls L=%ld T=%ld R=%ld B=%ld\n", mttMon.deviceName.c_str(),
-                 mttMon.rect.left, mttMon.rect.top, mttMon.rect.right, mttMon.rect.bottom);
-        } else {
-            Logf(ip, "MTT virtual monitor not found (Intel VDD required; Parsec path removed)\n");
+        if (!backend || !backend->Prepare(width, height, reason))
             return false;
+        const std::wstring headName = backend->DeviceName();
+        if (!dup.Open(headName)) {
+            Logf(ip, "DesktopDuplication::Open failed on %ls\n", headName.c_str());
+            return false;
+        }
+        {
+            const RECT r = backend->CurrentRect();
+            input.SetMonitorRect(r);
+            Logf(ip, "input rect %ls L=%ld T=%ld R=%ld B=%ld\n", headName.c_str(), r.left, r.top, r.right,
+                 r.bottom);
         }
         // Bind encoder here (not later on size-flip with HW disabled): QSV needs
         // an Intel D3D device + SET_D3D_MANAGER before the first Configure.
-        // Prefer the capture device when it is Intel (MTT) so VideoProcessor
+        // Prefer the capture device when it is Intel so VideoProcessor
         // NV12 and QSV share one D3D11 device — no CPU BGRA->NV12 bounce.
         // Encode to the size the caller requested (capture WxH that triggered
         // rebuild). Open() ModeDesc often stays hello landscape while DXGI
@@ -401,13 +458,15 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         gpuNv12Path = false;
         encoder.SetAllowHardware(true);
         {
-            bool haveIntelD3d = false;
+            // Share the capture device with the encoder whatever its vendor;
+            // without one, a separate Intel device still serves QSV.
+            bool haveEncoderD3d = false;
             if (dup.Device() && dup.Context() && encoder.AdoptD3DDevice(dup.Device(), dup.Context()))
-                haveIntelD3d = true;
+                haveEncoderD3d = true;
             else if (encoder.EnsureIntelEncoderDevice())
-                haveIntelD3d = true;
-            if (!haveIntelD3d)
-                Logf(ip, "Intel encoder D3D device unavailable - HW encode may fall back\n");
+                haveEncoderD3d = true;
+            if (!haveEncoderD3d)
+                Logf(ip, "no D3D device for the encoder - HW encode may use system memory or fall back\n");
         }
         if (!encoder.Configure(encW, encH, kFps, sessionEncode.peakBitrateBps,
                                sessionEncode.qualityVsSpeed, sessionEncode.gopSeconds,
@@ -426,6 +485,11 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         } else if (encoder.UsesDxgiInput()) {
             Logf(ip, "DXGI NV12 encode ready; GPU convert unbound - CPU BGRA->NV12 fallback\n");
         }
+        // The probe in Configure used up its forced IDR. The GPU path asks for
+        // one on its first present; the CPU path must ask here, or the iPad
+        // gets P-frames until the next GOP after a reconnect or rotation.
+        if (!gpuNv12Path)
+            encoder.RequestKeyFrame();
         {
             const std::wstring mftW = encoder.MftName();
             std::string mft;
@@ -467,8 +531,29 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
     };
 
     bool blockedLogged = false; // the wait message belongs in the log once, not every retry
+    int noHelloFailures = 0;    // consecutive links that closed before a hello (backoff)
+    // USB matching (see PickUsbForEntry): the id this entry's iPad presents.
+    std::string knownId = entryId_;
+    bool forceWifiOnce = false;           // last USB pick was the wrong iPad
+    std::string rejectedSerial;           // ... and is skipped for a minute
+    std::chrono::steady_clock::time_point rejectedSerialUntil{};
 
-        bool stickToUsbAfterSession = false;
+    bool stickToUsbAfterSession = false;
+    // An entry without an id (typed-in IP) is Wi-Fi only: whatever iPad is on
+    // the cable is not necessarily the one at that address.
+    const bool usbAllowed = !entryId_.empty();
+    // USB dial/hello failures on this iPad's cable: the connect path and
+    // Back-to-USB skip USB until the backoff runs out, so a cable whose app is
+    // not listening does not bounce the Wi-Fi session every few seconds.
+    int usbFailCount = 0;
+    std::chrono::steady_clock::time_point usbFailUntil{};
+    auto noteUsbFailure = [&](const std::string& serial) {
+        usbFailCount = (std::min)(usbFailCount + 1, 6);
+        const int sec = 10 << (usbFailCount - 1); // 10 s .. 320 s
+        usbFailUntil = std::chrono::steady_clock::now() + std::chrono::seconds(sec);
+        Logf(ip, "USB %s failed (%d in a row) - Wi-Fi only for %d s\n", serial.empty() ? "?" : serial.c_str(),
+             usbFailCount, sec);
+    };
 
 while (!stopRequested_) {
         // A blocked sender keeps checking back every few seconds; flipping it to
@@ -486,33 +571,66 @@ while (!stopRequested_) {
         const Config connectCfg = Config::Load();
         const bool allowWifiFailover = connectCfg.usbWifiFailover;
 
+        // Display driver for this attempt. An explicit choice whose driver is
+        // missing is reported (tray + log) and waited on, never swapped.
+        {
+            const DisplayBackendSelection sel = SelectDisplayBackend(connectCfg.displayBackend);
+            if (!sel.driverInstalled) {
+                SetStatusDetail(sel.problem);
+                if (state_ != State::DriverMissing)
+                    Logf(ip, "display: %s - not connecting until it is installed or Settings change\n",
+                         sel.problem.c_str());
+                state_ = State::DriverMissing;
+                InterruptibleSleep(kBlockedRetryMs);
+                continue;
+            }
+            if (state_ == State::DriverMissing)
+                state_ = State::Connecting;
+            SetStatusDetail({});
+            if (!backend || backend->Kind() != sel.kind) {
+                std::lock_guard<std::mutex> lock(pipelineMutex);
+                dup.Close();
+                backend.reset();
+                backend = MakeDisplayBackend(sel.kind, ip, kFps, &stopRequested_);
+                Logf(ip, "display backend: %s (%s)\n", DisplayBackendName(sel.kind),
+                     sel.automatic ? "auto" : "selected in Settings");
+            }
+        }
+
         bool usbSession = false;
         std::optional<Connection> conn;
         UsbMuxDevice usbDev{};
+        UsbClaim usbClaim;          // released when this attempt ends
+        bool usbNeedsVerify = false;
         const bool configuredLoopback = IsUsbLikeHost(ip);
-        const bool usbAvailable = !configuredLoopback && ProbeUsbMux(usbDev) && usbDev.present;
-        if (usbAvailable) {
-            Logf(ip, "USB usbmux device %s, preferring 127.0.0.1:%u over Wi-Fi %s:%u\n",
-                 usbDev.serial.empty() ? "?" : usbDev.serial.c_str(), kUsbMuxLocalPort,
-                 ip.c_str(), port);
-            if (EnsureUsbMuxForward(port, kUsbMuxLocalPort))
-                conn = Connection::Connect("127.0.0.1", kUsbMuxLocalPort);
-            if (!conn) {
-                auto sock = ConnectUsbMux(usbDev.deviceId, port);
-                if (sock)
-                    conn = Connection::FromSocket(*sock);
-            }
-            if (conn) {
-                usbSession = true;
-                Logf(ip, "connected via USB (usbmux localhost:%u -> iPad:%u)\n",
-                     kUsbMuxLocalPort, port);
-            } else if (!allowWifiFailover) {
-                Logf(ip, "USB usbmux dial failed, Wi-Fi failover off, retrying USB\n");
-                InterruptibleSleep(kReconnectDelayMs);
-                continue;
+        const bool skipUsb = forceWifiOnce ||
+                             (allowWifiFailover && usbFailCount > 0 && std::chrono::steady_clock::now() < usbFailUntil);
+        forceWifiOnce = false;
+        const std::string skipSerial =
+            std::chrono::steady_clock::now() < rejectedSerialUntil ? rejectedSerial : std::string{};
+        if (configuredLoopback) {
+            // Hand-entered 127.0.0.1: the localhost forward (first USB device).
+            (void)EnsureUsbMuxForward(port, kUsbMuxLocalPort);
+        } else if (usbAllowed && !skipUsb && PickUsbForEntry(knownId, skipSerial, false, usbDev, usbNeedsVerify)) {
+            if (!usbClaim.Take(UsbClaimKey(usbDev))) {
+                Logf(ip, "USB device %s was just taken by another iPad entry, using Wi-Fi\n", usbDev.serial.c_str());
             } else {
-                Logf(ip, "USB usbmux dial failed, falling back to Wi-Fi %s:%u\n",
-                     ip.c_str(), port);
+                Logf(ip, "USB usbmux device %s (id %u%s), dialing it directly\n",
+                     usbDev.serial.empty() ? "?" : usbDev.serial.c_str(), usbDev.deviceId,
+                     usbNeedsVerify ? ", unconfirmed - checking hello.id" : ", matches learned id");
+                if (auto sock = ConnectUsbMux(usbDev.deviceId, port))
+                    conn = Connection::FromSocket(*sock);
+                if (conn) {
+                    usbSession = true;
+                    Logf(ip, "connected via USB (usbmux device %u -> iPad:%u)\n", usbDev.deviceId, port);
+                } else if (!allowWifiFailover) {
+                    Logf(ip, "USB usbmux dial failed, Wi-Fi failover off, retrying USB\n");
+                    InterruptibleSleep(kReconnectDelayMs);
+                    continue;
+                } else {
+                    Logf(ip, "USB usbmux dial failed, falling back to Wi-Fi %s:%u\n", ip.c_str(), port);
+                    noteUsbFailure(usbDev.serial);
+                }
             }
         }
         if (!conn) {
@@ -554,16 +672,46 @@ while (!stopRequested_) {
                 gotHello = true;
             }
         }
-        if (!gotHello)
+        if (!gotHello) {
+            conn->Close();
+            if (stopRequested_)
+                continue;
+            ++noHelloFailures;
+            if (usbSession && allowWifiFailover)
+                noteUsbFailure(usbDev.serial);
+            const int waitMs = NoHelloBackoffMs(noHelloFailures);
+            // Log the first few and then only when the delay changes (the cap).
+            if (noHelloFailures <= 3 || waitMs != NoHelloBackoffMs(noHelloFailures - 1))
+                Logf(ip, "link closed before hello (%d in a row), retrying in %dms\n", noHelloFailures, waitMs);
+            InterruptibleSleep(waitMs);
             continue;
+        }
+        noHelloFailures = 0;
+        if (usbSession)
+            usbFailCount = 0;
 
-        // Learn USB serial <-> hello.id so Settings can merge Nearby without guessing.
+        // Re-learn USB serial <-> hello.id on every USB hello (the id changes
+        // when the iPad app is reinstalled), so matching and Settings stay right.
         if (usbSession && !usbDev.serial.empty() && !hello.id.empty()) {
             Config learned = Config::Load();
-            learned.RememberUsbSerialId(usbDev.serial, hello.id);
-            learned.Save();
-            Logf(ip, "USB serial %s bound to id %s\n", usbDev.serial.c_str(), hello.id.c_str());
+            if (learned.IdForUsbSerial(usbDev.serial) != hello.id) {
+                learned.RememberUsbSerialId(usbDev.serial, hello.id);
+                learned.Save();
+                Logf(ip, "USB serial %s bound to id %s\n", usbDev.serial.c_str(), hello.id.c_str());
+            }
         }
+        // The cable we dialed must be this entry's iPad.
+        if (usbSession && !knownId.empty() && !hello.id.empty() && hello.id != knownId) {
+            Logf(ip, "USB device %s is iPad id %s, not this entry's %s - closing it and using Wi-Fi\n",
+                 usbDev.serial.empty() ? "?" : usbDev.serial.c_str(), hello.id.c_str(), knownId.c_str());
+            conn->Close();
+            rejectedSerial = usbDev.serial;
+            rejectedSerialUntil = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+            forceWifiOnce = true;
+            continue;
+        }
+        if (entryId_.empty() && !hello.id.empty())
+            knownId = hello.id; // no TXT id configured: follow the iPad we actually reached
 
         // Version handshake (receiver protocol 3+): the iPad only sends
         // `pencil`/`proximity` to a peer that announced protocol >= 3 —
@@ -578,26 +726,37 @@ while (!stopRequested_) {
         uint32_t width = Align16Clamp(hello.pixelsWide, 1920);
         uint32_t height = Align16Clamp(hello.pixelsHigh, 1080);
         Logf(ip, "hello: %dx%d -> %ux%u\n", hello.pixelsWide, hello.pixelsHigh, width, height);
-        mttHelloW = hello.pixelsWide > 0 ? static_cast<uint32_t>(hello.pixelsWide) : 0;
-        mttHelloH = hello.pixelsHigh > 0 ? static_cast<uint32_t>(hello.pixelsHigh) : 0;
+        // Raw hello size (unaligned): MTT generates the per-iPad EDID from it.
+        backend->BeginConnection(hello.pixelsWide > 0 ? static_cast<uint32_t>(hello.pixelsWide) : 0,
+                                 hello.pixelsHigh > 0 ? static_cast<uint32_t>(hello.pixelsHigh) : 0);
 
         // Only iPads of the panel size that is already on the air may join (see
         // AcquirePanel). A different one hangs up and keeps checking back, so
         // it starts by itself once the other iPad disconnects.
         PanelHolder panel;
+        TimerResolution1ms timerResolution;
         uint32_t activeWidth = 0, activeHeight = 0;
-        panel.held = AcquirePanel(width, height, activeWidth, activeHeight);
+        const bool exclusiveHead = backend->Kind() == DisplayBackendKind::Mtt;
+        const void* holder = nullptr;
+        panel.held = AcquirePanel(width, height, exclusiveHead, this, activeWidth, activeHeight, holder);
         if (!panel.held) {
             blockedByWidth_ = activeWidth;
             blockedByHeight_ = activeHeight;
+            blockedByApp_ = holder;
+            blockedExclusive_ = exclusiveHead;
             state_ = State::Blocked;
             // Once per episode, not on every check: this comes back every few
             // seconds for as long as the other iPad streams.
             if (!blockedLogged) {
                 blockedLogged = true;
-                Logf(ip, "waiting: an iPad with a %ux%u panel is streaming and this one is %ux%u - only one "
-                         "panel size at a time (MTT keeps sizes serialized)\n",
-                     activeWidth, activeHeight, width, height);
+                if (exclusiveHead)
+                    Logf(ip, "waiting: another iPad (%ux%u) is on the MTT display - MTT drives one iPad at a "
+                             "time (Parsec supports several)\n",
+                         activeWidth, activeHeight);
+                else
+                    Logf(ip, "waiting: an iPad with a %ux%u panel is streaming and this one is %ux%u - %s only "
+                             "holds one panel size at a time\n",
+                         activeWidth, activeHeight, width, height, DisplayBackendName(backend->Kind()));
             }
             conn->Close();
             InterruptibleSleep(kBlockedRetryMs);
@@ -605,6 +764,8 @@ while (!stopRequested_) {
         }
         blockedByWidth_ = 0;
         blockedByHeight_ = 0;
+        blockedByApp_ = nullptr;
+        blockedExclusive_ = false;
         blockedLogged = false;
 
         {
@@ -637,12 +798,7 @@ while (!stopRequested_) {
             conn->Close();
             if (panel.held) {
                 panel.held = false;
-                if (ReleasePanel() && usingMttVdd) {
-                    // Pipeline failed but session may reconnect - keep VDD sticky.
-                    RequestMttVddTeardown(ip, MttTeardownReason::LinkLoss);
-                    mttModesEnsured = false;
-                    mttHelloModeForced = false;
-                }
+                backend->OnPipelineFailed(ReleasePanel());
             }
             InterruptibleSleep(kReconnectDelayMs);
             continue;
@@ -651,8 +807,7 @@ while (!stopRequested_) {
         width_ = width;
         height_ = height;
         state_ = State::Streaming;
-        if (usingMttVdd)
-            (void)SaveMttDisplayTopology(ip);
+        backend->OnStreaming();
 
         std::atomic<bool> running{true};
         bool loggedPencil = false; // reader-thread only; one line per connection
@@ -662,8 +817,15 @@ while (!stopRequested_) {
         // mirror on TCP until ack, then UDP-only. cursorImg stays TCP.
         CursorUdp cursorUdp;
         std::mutex cursorNetMutex;
+        // The receiver's rate envelope (displayMaxFrameRate + videoCaps) from
+        // the latest hello; the reader updates it on every re-hello and bumps
+        // rateHelloGen so the capture loop recomputes its frame-rate limit.
+        std::mutex rateHelloMutex;
+        HelloMsg rateHello = hello;
+        std::atomic<uint32_t> rateHelloGen{1};
         std::atomic<bool> cursorUdpConfirmed{false};
-        uint64_t cursorSeq = 0;
+        std::atomic<bool> cursorForce{false}; // shape changed: resend position now
+        uint64_t cursorSeq = 0;                // under cursorNetMutex
         std::chrono::steady_clock::time_point cursorUdpOpened{};
         bool cursorUdpGaveUp = false;
 
@@ -674,23 +836,17 @@ while (!stopRequested_) {
         auto lastSenderPing = std::chrono::steady_clock::now();
         constexpr int kSenderPingMs = 2000;
 
-        // Touch/pen/scroll must target the MTT capture head (mttMon).
-        RECT lastLoggedMttInputRect{};
-        bool loggedMttInputRect = false;
+        // Touch/pen/scroll target the capture head; follow live moves.
+        RECT lastLoggedInputRect{};
+        bool loggedInputRect = false;
         auto refreshInputRect = [&]() {
-            RECT r = mttMon.rect;
-            if (GetMonitorRectByDeviceName(mttMon.deviceName, r))
-                mttMon.rect = r;
-            else
-                r = mttMon.rect;
+            const RECT r = backend->CurrentRect();
             input.SetMonitorRect(r);
-            if (!loggedMttInputRect || r.left != lastLoggedMttInputRect.left ||
-                r.top != lastLoggedMttInputRect.top || r.right != lastLoggedMttInputRect.right ||
-                r.bottom != lastLoggedMttInputRect.bottom) {
-                Logf(ip, "mtt: input rect %ls L=%ld T=%ld R=%ld B=%ld\n", mttMon.deviceName.c_str(),
-                     r.left, r.top, r.right, r.bottom);
-                lastLoggedMttInputRect = r;
-                loggedMttInputRect = true;
+            if (!loggedInputRect || r.left != lastLoggedInputRect.left || r.top != lastLoggedInputRect.top ||
+                r.right != lastLoggedInputRect.right || r.bottom != lastLoggedInputRect.bottom) {
+                Logf(ip, "input rect L=%ld T=%ld R=%ld B=%ld\n", r.left, r.top, r.right, r.bottom);
+                lastLoggedInputRect = r;
+                loggedInputRect = true;
             }
         };
 
@@ -718,6 +874,11 @@ std::thread reader([&] {
                         break;
                     }
                     case ControlType::Hello: {
+                        {
+                            std::lock_guard<std::mutex> rlock(rateHelloMutex);
+                            rateHello = msg->hello;
+                        }
+                        ++rateHelloGen;
                         // Rotation / panel-size change: rebuild. Same-size hello
                         // again (common right after connect) must not tear down
                         // capture+encoder under live input - that flash+crash.
@@ -825,9 +986,7 @@ std::thread reader([&] {
 
         std::vector<uint8_t> nv12;
         std::string pendingCursorImg;
-        std::string pendingCursor;
         auto lastSend = std::chrono::steady_clock::now();
-        auto lastChange = std::chrono::steady_clock::now() - std::chrono::milliseconds(kActiveTailMs);
         // A drop is "pending" until something goes out again. Guards the replay
         // below against re-arming itself on every failed attempt.
         bool dropPending = false;
@@ -852,7 +1011,7 @@ std::thread reader([&] {
                      ip.c_str(), hello.cursorPort);
                 // Probe immediately so cursorAck does not need a mouse move
                 // (PROTOCOL 6.3; Mac sender probes on UDP .ready).
-                ++cursorSeq;
+                ++cursorSeq; // cursorNetMutex held
                 cursorProbe = MakeCursorMessage(false, 0.0, 0.0, cursorSeq);
                 cursorUdp.Send(reinterpret_cast<const uint8_t*>(cursorProbe.data()),
                                cursorProbe.size());
@@ -870,11 +1029,124 @@ std::thread reader([&] {
             }
         }
 
+        // Cursor thread: polls GetCursorInfo at the head's refresh rate and
+        // sends positions on its own, so the pointer is not tied to the
+        // encode loop (which runs at the capture/encode cadence, ~30 fps on a
+        // busy link). UDP when open; mirrored on TCP until cursorAck, or for
+        // good on USB / when UDP never confirms. SendFrame is thread-safe.
+        std::atomic<bool> cursorStop{false};
+        std::thread cursorThread([&] {
+            HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                                  TIMER_ALL_ACCESS);
+            uint32_t hz = backend->RefreshHz();
+            auto lastHzCheck = std::chrono::steady_clock::now();
+            bool haveLast = false;
+            bool lastVisible = false;
+            LONG lastX = 0, lastY = 0;
+            while (!cursorStop && running && !stopRequested_) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now - lastHzCheck > std::chrono::seconds(1)) {
+                    lastHzCheck = now;
+                    hz = backend->RefreshHz();
+                }
+                const uint32_t tickHz = (std::max)(30u, (std::min)(hz, 240u));
+                const RECT r = backend->CurrentRect();
+                CURSORINFO ci{};
+                ci.cbSize = sizeof(ci);
+                const bool gotInfo = GetCursorInfo(&ci) != FALSE;
+                const LONG rw = r.right - r.left, rh = r.bottom - r.top;
+                // ptScreenPos is already the hotspot, in desktop coordinates.
+                const bool inside = gotInfo && rw > 0 && rh > 0 && ci.ptScreenPos.x >= r.left &&
+                                    ci.ptScreenPos.x < r.right && ci.ptScreenPos.y >= r.top &&
+                                    ci.ptScreenPos.y < r.bottom;
+                const bool visible = inside && (ci.flags & CURSOR_SHOWING) != 0;
+                const LONG x = inside ? ci.ptScreenPos.x - r.left : lastX;
+                const LONG y = inside ? ci.ptScreenPos.y - r.top : lastY;
+                const bool force = cursorForce.exchange(false);
+                if (gotInfo && (force || !haveLast || visible != lastVisible || (visible && (x != lastX || y != lastY)))) {
+                    haveLast = true;
+                    lastVisible = visible;
+                    lastX = x;
+                    lastY = y;
+                    bool udpOpen = false;
+                    bool sendTcp = true;
+                    std::string msg;
+                    {
+                        std::lock_guard<std::mutex> lock(cursorNetMutex);
+                        ++cursorSeq;
+                        msg = MakeCursorMessage(visible, static_cast<double>(x) / rw, static_cast<double>(y) / rh,
+                                                cursorSeq);
+                        const bool confirmed = cursorUdpConfirmed.load(std::memory_order_relaxed);
+                        udpOpen = cursorUdp.Ready();
+                        if (udpOpen) {
+                            cursorUdp.Send(reinterpret_cast<const uint8_t*>(msg.data()), msg.size());
+                            if (!confirmed && !cursorUdpGaveUp &&
+                                cursorUdpOpened != std::chrono::steady_clock::time_point{} &&
+                                std::chrono::steady_clock::now() - cursorUdpOpened >
+                                    std::chrono::milliseconds(kCursorUdpAckMs)) {
+                                cursorUdp.Close();
+                                cursorUdpGaveUp = true;
+                                udpOpen = false;
+                                Logf(ip, "no cursorAck within %dms, falling back to TCP cursor\n", kCursorUdpAckMs);
+                            }
+                        }
+                        sendTcp = !udpOpen || !confirmed;
+                    }
+                    if (sendTcp &&
+                        !conn->SendFrame(reinterpret_cast<const uint8_t*>(msg.data()), static_cast<uint32_t>(msg.size())))
+                        running = false;
+                }
+                const LONGLONG periodNs100 = 10'000'000LL / tickHz;
+                if (timer) {
+                    LARGE_INTEGER due{};
+                    due.QuadPart = -periodNs100;
+                    if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE))
+                        WaitForSingleObject(timer, 100);
+                    else
+                        Sleep(1);
+                } else {
+                    Sleep(1);
+                }
+            }
+            if (timer)
+                CloseHandle(timer);
+        });
+
+        // Back to USB: on a Wi-Fi session, look for this iPad's cable every
+        // few seconds (strict match on the learned serial->id only). When it
+        // shows up, end this session; the reconnect prefers USB and MTT keeps
+        // its head through the link-loss grace, so the picture comes back on
+        // the same display.
+        std::atomic<bool> movedToUsb{false};
+        std::thread usbWatch;
+        if (!usbSession && !configuredLoopback && usbAllowed && !knownId.empty()) {
+            usbWatch = std::thread([&] {
+                int ticks = 0;
+                while (!cursorStop && running && !stopRequested_) {
+                    Sleep(100);
+                    if (++ticks % 30 != 0 || state_ != State::Streaming)
+                        continue;
+                    UsbMuxDevice d;
+                    bool verify = false;
+                    // Set before this session started; read-only while it runs.
+                    if (usbFailCount > 0 && std::chrono::steady_clock::now() < usbFailUntil)
+                        continue;
+                    if (PickUsbForEntry(knownId, {}, true, d, verify)) {
+                        Logf(ip, "USB cable for this iPad is back (%s) - moving the session from Wi-Fi to USB\n",
+                             d.serial.c_str());
+                        movedToUsb = true;
+                        running = false;
+                        conn->Close(); // unblock the reader
+                        break;
+                    }
+                }
+            });
+        }
+
         std::chrono::steady_clock::time_point wrongSizeSince{};
         bool sizeRebuildDone = false;
         bool sizeGiveUpLogged = false;
-        POINT mttLastPos{INT_MIN, INT_MIN};
-        std::chrono::steady_clock::time_point lastMttPosPoll{};
+        std::chrono::steady_clock::time_point lastBackendPoll{};
         std::chrono::steady_clock::time_point waitFirstFrameSince{};
         bool firstFrameNudged = false;
         bool firstFrameWaitLogged = false;
@@ -884,6 +1156,27 @@ std::thread reader([&] {
         std::chrono::steady_clock::time_point cadenceSince = std::chrono::steady_clock::now();
         uint32_t cadencePresents = 0;
         uint32_t cadenceEncCalls = 0;
+        // Frame-rate limiter (no sleeping): at most one encode per slot of
+        // 1/fpsLimit, on an anchored schedule. A frame that arrives early is
+        // held as "pending" (the capture's NV12 buffer/texture always holds
+        // the newest one) and AcquireNextFrame's timeout is shortened to the
+        // slot, so it goes out on time - the only wait is that existing call.
+        using Clock = std::chrono::steady_clock; // QPC on Windows
+        constexpr int kIdleCaptureTimeoutMs = 1000 / static_cast<int>(kFps);
+        uint32_t fpsLimit = 60;
+        uint32_t fpsLimitGen = 0;
+        uint32_t fpsLimitW = 0, fpsLimitH = 0;
+        uint32_t fpsLimitHz = backend->RefreshHz();
+        Clock::time_point fpsHzCheck = Clock::now();
+        Clock::duration slot = std::chrono::microseconds(1'000'000 / 60);
+        Clock::duration earlyWindow = slot / 4;
+        Clock::time_point nextSlot{};
+        bool framePending = false;
+        // Tail: the async MFT can hold the last image's AU until another input
+        // arrives. One re-encode a slot after the last new image pushes it out
+        // (otherwise it could sit until the 1 s keepalive). Scheduled, not slept.
+        bool tailPending = false;
+        Clock::time_point tailAt{};
         uint32_t cadenceAus = 0;
         uint32_t cadenceSends = 0;
         uint32_t cadenceTimeouts = 0;
@@ -891,6 +1184,56 @@ std::thread reader([&] {
         while (running && !stopRequested_) {
             std::vector<EncodedFrame> encoded;
             int64_t capMs = 0;
+            // Recompute the limit on a new hello, a new encoded raster or a
+            // new refresh rate on the head (polled once a second).
+            bool hzChanged = false;
+            if (Clock::now() - fpsHzCheck > std::chrono::seconds(1)) {
+                fpsHzCheck = Clock::now();
+                const uint32_t hzNow = backend->RefreshHz();
+                hzChanged = hzNow != fpsLimitHz;
+                fpsLimitHz = hzNow;
+            }
+            if (hzChanged || rateHelloGen.load() != fpsLimitGen || encoder.Width() != fpsLimitW ||
+                encoder.Height() != fpsLimitH) {
+                fpsLimitGen = rateHelloGen.load();
+                fpsLimitW = encoder.Width();
+                fpsLimitH = encoder.Height();
+                HelloMsg rh;
+                {
+                    std::lock_guard<std::mutex> rlock(rateHelloMutex);
+                    rh = rateHello;
+                }
+                // Never above the rate the encoder is configured for (kFps:
+                // timestamps, bitrate and GOP assume it) or the head's refresh.
+                const uint32_t receiverLimit = StreamFpsLimit(rh, "h264", fpsLimitW, fpsLimitH);
+                uint32_t limit = (std::min)(receiverLimit, kFps);
+                if (fpsLimitHz > 0)
+                    limit = (std::min)(limit, fpsLimitHz);
+                limit = (std::max)(limit, 1u);
+                if (limit != fpsLimit || fpsLimitGen == 1) {
+                    uint32_t capsRate = 0;
+                    for (const VideoCapEntry& e : rh.videoCaps)
+                        if (e.codec == "h264")
+                            capsRate = (std::max)(capsRate, e.maxFrameRate);
+                    Logf(ip, "fps limit %u (receiver %u: displayMaxFrameRate=%u, h264 videoCaps maxFrameRate=%u, %zu caps; "
+                             "encoder %u, head %u Hz, %ux%u)\n",
+                         limit, receiverLimit, rh.displayMaxFrameRate, capsRate, rh.videoCaps.size(), kFps, fpsLimitHz,
+                         fpsLimitW, fpsLimitH);
+                }
+                fpsLimit = limit;
+                slot = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(1.0 / fpsLimit));
+                earlyWindow = slot / 4;
+            }
+            // Capture timeout: up to the next slot while a frame waits,
+            // otherwise the normal idle cadence.
+            int captureTimeoutMs = kIdleCaptureTimeoutMs;
+            if (framePending || tailPending) {
+                const auto due = framePending ? nextSlot : tailAt;
+                const auto left = due - Clock::now();
+                const auto leftMs = std::chrono::ceil<std::chrono::milliseconds>(left).count();
+                captureTimeoutMs = static_cast<int>((std::max)(0LL, (std::min)(static_cast<long long>(leftMs),
+                                                                               static_cast<long long>(kIdleCaptureTimeoutMs))));
+            }
             {
                 // Only capture+encode need the pipeline lock (they touch dup
                 // and encoder, which the reader thread may rebuild on
@@ -906,15 +1249,14 @@ std::thread reader([&] {
                 Microsoft::WRL::ComPtr<ID3D11Texture2D> gpuNv12;
                 CaptureResult cap{};
                 if (gpuNv12Path) {
-                    cap = dup.CaptureFrameNv12Gpu(gpuNv12, encoder.Width(), encoder.Height(),
-                                                  1000 / static_cast<int>(kFps));
+                    cap = dup.CaptureFrameNv12Gpu(gpuNv12, encoder.Width(), encoder.Height(), captureTimeoutMs);
                     if (cap.desktopChanged && !gpuNv12) {
                         // VP convert failed mid-stream - drop to CPU for this process.
                         Logf(ip, "GPU NV12 capture failed - falling back to CPU BGRA->NV12\n");
                         gpuNv12Path = false;
                         haveGpuDesktopFrame = false;
                         nv12.resize(static_cast<size_t>(dup.Width()) * dup.Height() * 3 / 2);
-                        cap = dup.CaptureFrameNv12(nv12, 1000 / static_cast<int>(kFps));
+                        cap = dup.CaptureFrameNv12(nv12, captureTimeoutMs);
                     } else if (cap.desktopChanged && gpuNv12 && !haveGpuDesktopFrame) {
                         // First real present after connect/rebuild: IDR so the iPad
                         // leaves its black decoder state immediately.
@@ -927,11 +1269,13 @@ std::thread reader([&] {
                     }
                 } else {
                     nv12.resize(static_cast<size_t>(dup.Width()) * dup.Height() * 3 / 2);
-                    cap = dup.CaptureFrameNv12(nv12, 1000 / static_cast<int>(kFps));
+                    cap = dup.CaptureFrameNv12(nv12, captureTimeoutMs);
                 }
                 const bool changed = cap.desktopChanged;
-                if (changed)
+                if (changed) {
                     ++cadencePresents;
+                    framePending = true; // newest image is in nv12 / the GPU texture
+                }
                 else if (!cap.acquired)
                     ++cadenceTimeouts;
 
@@ -960,12 +1304,11 @@ std::thread reader([&] {
                     firstFrameWaitLogged = false;
                     Logf(ip, "capture ACCESS_LOST - rebuilding pipeline (new D3D device)\n");
                     gpuNv12Path = false;
-                    // ACCESS_LOST is usually a Display Settings Apply. Persist the
-                    // user's new layout first (only if MTT is attached+active and
-                    // this was not our own apply); the rebuild never re-applies x/y.
-                    if (usingMttVdd)
-                        (void)SaveMttDisplayTopologyIfUserChange(ip);
-                    if (!buildPipeline(width, height)) {
+                    // ACCESS_LOST is usually a Display Settings Apply: let the
+                    // backend persist the user's layout first; the rebuild never
+                    // re-applies x/y or reshapes the head.
+                    backend->OnLayoutMayHaveChanged();
+                    if (!buildPipeline(width, height, BuildReason::CaptureRebuild)) {
                         Logf(ip, "pipeline rebuild after ACCESS_LOST failed, dropping the connection\n");
                         running = false;
                     }
@@ -994,21 +1337,16 @@ std::thread reader([&] {
                 }
 
                 pendingCursorImg.clear();
-                pendingCursor.clear();
                 if (cap.pointerShapeChanged) {
                     PointerShapeBgra shape;
                     if (dup.GetPointerShapeBgra(shape)) {
                         pendingCursorImg = MakeCursorImgMessage(shape, dup.Width(), dup.Height());
                     }
                 }
-                if (cap.cursorChanged || !pendingCursorImg.empty()) {
-                    const double invW = dup.Width() ? 1.0 / dup.Width() : 0.0;
-                    const double invH = dup.Height() ? 1.0 / dup.Height() : 0.0;
-                    const double cx = (dup.PointerX() + dup.PointerHotX()) * invW;
-                    const double cy = (dup.PointerY() + dup.PointerHotY()) * invH;
-                    ++cursorSeq;
-                    pendingCursor = MakeCursorMessage(dup.PointerVisible(), cx, cy, cursorSeq);
-                }
+                // Positions come from the cursor thread (refresh rate, not
+                // encode rate); a new shape makes it resend the position.
+                if (!pendingCursorImg.empty())
+                    cursorForce = true;
 
                 // Rotation or a resolution change made on the Windows side
                 // never sends a `hello`, so nothing rebuilds the pipeline: the
@@ -1044,8 +1382,7 @@ std::thread reader([&] {
                     // encoding portrait "fixes" flash but the iPad stays sideways.
                     Logf(ip, "capture is now %ux%u (encoder had %ux%u), rebuilding pipeline\n", dup.Width(),
                          dup.Height(), encoder.Width(), encoder.Height());
-                    if (usingMttVdd)
-                        (void)SaveMttDisplayTopologyIfUserChange(ip);
+                    backend->OnLayoutMayHaveChanged();
                     haveGpuDesktopFrame = false;
                     gpuNv12Path = false;
                     waitFirstFrameSince = {};
@@ -1054,40 +1391,47 @@ std::thread reader([&] {
                     const bool swappedHello = (wantW == height && wantH == width);
                     uint32_t rebuildW = wantW;
                     uint32_t rebuildH = wantH;
-                    if (swappedHello) {
-                        rebuildW = width;
-                        rebuildH = height;
-                        if (usingMttVdd) {
-                            if (EnsureMonitorMode(mttMon.deviceName, rebuildW, rebuildH, kFps))
+                    if (backend->KeepsHelloLandscape()) {
+                        // MTT: a portrait capture of the landscape hello is
+                        // forced back to landscape; any other size is adopted.
+                        if (swappedHello) {
+                            rebuildW = width;
+                            rebuildH = height;
+                            if (backend->ForceMode(rebuildW, rebuildH, kFps))
                                 Logf(ip, "capture was portrait swap of hello - forced MTT %ux%u landscape\n",
                                      rebuildW, rebuildH);
                             else
                                 Logf(ip, "capture was portrait swap of hello - MTT mode force failed\n");
+                        } else {
+                            width = wantW;
+                            height = wantH;
                         }
-                    } else {
-                        width = wantW;
-                        height = wantH;
+                    } else if (swappedHello) {
+                        // Parsec (upstream): a rotation made in Windows is the
+                        // user's decision and is adopted, not undone.
+                        std::swap(width, height);
                     }
-                    if (!buildPipeline(rebuildW, rebuildH)) {
+                    // Parsec, foreign size: encode what is captured but keep the
+                    // panel size, so the watchdog below can put it back.
+                    if (!buildPipeline(rebuildW, rebuildH, BuildReason::CaptureRebuild)) {
                         Logf(ip, "pipeline rebuild after resize failed, dropping the connection\n");
                         running = false;
                     } else {
                         width_ = dup.Width();
                         height_ = dup.Height();
-                        if (GetMonitorRectByDeviceName(mttMon.deviceName, mttMon.rect))
-                            input.SetMonitorRect(mttMon.rect);
+                        input.SetMonitorRect(backend->CurrentRect());
                         continue; // capture a fresh frame on the new pipeline
                     }
                 }
 
                 auto now = std::chrono::steady_clock::now();
 
-                // Persist Mike's MTT arrangement while streaming (DISPLAY index may change later).
-                if (usingMttVdd &&
-                    (lastMttPosPoll == std::chrono::steady_clock::time_point{} ||
-                     now - lastMttPosPoll > std::chrono::seconds(2))) {
-                    lastMttPosPoll = now;
-                    PollMttDisplayTopology(ip, mttLastPos);
+                // Backend housekeeping while streaming (MTT: persist the user's
+                // arrangement; DISPLAY index may change later).
+                if (lastBackendPoll == std::chrono::steady_clock::time_point{} ||
+                    now - lastBackendPoll > std::chrono::seconds(2)) {
+                    lastBackendPoll = now;
+                    backend->Poll();
                 }
 
                 // Only adopt rotation into session size from a real frame - not
@@ -1105,10 +1449,32 @@ std::thread reader([&] {
                 } else if (wrongSizeSince == std::chrono::steady_clock::time_point{}) {
                     wrongSizeSince = now;
                 } else if (!sizeRebuildDone &&
+                           now - wrongSizeSince > std::chrono::milliseconds(kWrongSizeGraceMs) &&
+                           backend->RebuildsOnForeignSize()) {
+                    // Parsec (upstream): a remove + re-add is what gets the
+                    // panel size back; re-applying the mode on the live monitor
+                    // is refused (DISP_CHANGE_BADMODE) while the capture runs.
+                    // Exactly one attempt: a rebuild resets every parsec
+                    // monitor in turn, so retrying is how two senders end up
+                    // trading rebuilds forever.
+                    sizeRebuildDone = true;
+                    Logf(ip, "monitor sits at %ux%u instead of %ux%u, rebuilding once\n", dup.Width(), dup.Height(),
+                         width, height);
+                    if (!buildPipeline(width, height))
+                        Logf(ip, "rebuild for the panel size failed, keeping what we have\n");
+                    else
+                        continue; // nv12 still holds the pre-rebuild frame - capture a fresh one
+                } else if (sizeRebuildDone && !sizeGiveUpLogged && backend->RebuildsOnForeignSize()) {
+                    // parsec-vdd puts *one* custom resolution on all of its
+                    // virtual monitors: whichever sender sets its panel size
+                    // last drags every other monitor along. Said once per
+                    // connection, then we stop touching the monitor.
+                    sizeGiveUpLogged = true;
+                    Logf(ip, "monitor stays at %ux%u (this iPad is %ux%u): parsec-vdd shares one custom resolution "
+                             "across all its monitors, so the picture stays letterboxed here\n",
+                         dup.Width(), dup.Height(), width, height);
+                } else if (!sizeRebuildDone &&
                            now - wrongSizeSince > std::chrono::milliseconds(kWrongSizeGraceMs)) {
-                    // A remove + re-add is what gets the panel size back;
-                    // re-applying the mode on the live monitor is refused
-                    // (DISP_CHANGE_BADMODE) while the capture runs.
                     sizeRebuildDone = true;
                     // MTT: do not rebuild to ModeDesc - fights capture-driven encode WxH.
                     Logf(ip, "monitor sits at %ux%u (session %ux%u) - MTT: not forcing ModeDesc rebuild\n",
@@ -1122,27 +1488,35 @@ std::thread reader([&] {
                          dup.Width(), dup.Height(), width, height, width, height);
                 }
 
-                if (changed)
-                    lastChange = now;
-
-                // The async encoder holds one frame until the *next* frame is
-                // fed, so if we stopped feeding the instant the screen went
-                // idle, the last frame of an interaction (a tap, the end of a
-                // scroll) would sit in the encoder until the next change or
-                // keepalive — up to a second later, which feels sluggish. Keep
-                // feeding at capture rate for a short tail after the last
-                // change so the encoder stays drained and interaction stays
-                // low-latency.
-                bool active = now - lastChange < std::chrono::milliseconds(kActiveTailMs);
-
                 // Keepalive re-encodes the last image (a tiny P-frame) so the
                 // iPad's ~5s liveness watchdog (spec §5) never trips on an
                 // otherwise idle desktop. GPU path only encodes once we have a
                 // real present (CaptureFrameNv12Gpu returns null until then);
                 // do not fall through to an empty CPU buffer.
-                bool keepaliveDue = now - lastSend >= std::chrono::milliseconds(kKeepaliveMs);
+                const bool keepaliveDue = now - lastSend >= std::chrono::milliseconds(kKeepaliveMs);
 
-                if (running && (active || keepaliveDue)) {
+                // Encode only a new image (pending) or the keepalive, and only
+                // once its slot opens (a little early is fine). Nothing new
+                // means nothing encoded, apart from the single tail above. The
+                // async encoder's held AU is collected below in between.
+                const auto nowEnc = Clock::now();
+                const bool slotOpen = nowEnc >= nextSlot - earlyWindow;
+                const bool tailDue = tailPending && !framePending && nowEnc >= tailAt;
+                const bool doEncode = running && slotOpen && (framePending || keepaliveDue || tailDue);
+                if (doEncode) {
+                    // A new image schedules one tail; the tail or keepalive does not.
+                    tailPending = framePending;
+                    framePending = false;
+                    nextSlot += slot;
+                    if (nowEnc > nextSlot + slot) // idle or stalled: re-anchor
+                        nextSlot = nowEnc + slot;
+                    tailAt = nextSlot + slot / 2;
+                } else if (running) {
+                    encoded = encoder.CollectPending();
+                    cadenceAus += static_cast<uint32_t>(encoded.size());
+                }
+
+                if (doEncode) {
                     if (gpuNv12Path) {
                         // last-good texture from CaptureFrameNv12Gpu (or null
                         // before the first present / after Open reset).
@@ -1179,6 +1553,7 @@ std::thread reader([&] {
                                                sessionEncode.rcQuality)) {
                             Logf(ip, "software encoder fallback failed\n");
                         } else {
+                            encoder.RequestKeyFrame(); // new encoder: start on an IDR
                             const std::wstring mft = encoder.MftName();
                             std::string mftA;
                             for (wchar_t c : mft)
@@ -1198,37 +1573,6 @@ std::thread reader([&] {
                 }
                 pendingCursorImg.clear();
             }
-            if (running && !pendingCursor.empty()) {
-                bool udpOpen = false;
-                bool confirmed = cursorUdpConfirmed.load(std::memory_order_relaxed);
-                {
-                    std::lock_guard<std::mutex> lock(cursorNetMutex);
-                    udpOpen = cursorUdp.Ready();
-                    if (udpOpen) {
-                        cursorUdp.Send(reinterpret_cast<const uint8_t*>(pendingCursor.data()),
-                                       pendingCursor.size());
-                        if (!confirmed && !cursorUdpGaveUp &&
-                            cursorUdpOpened != std::chrono::steady_clock::time_point{} &&
-                            std::chrono::steady_clock::now() - cursorUdpOpened >
-                                std::chrono::milliseconds(kCursorUdpAckMs)) {
-                            cursorUdp.Close();
-                            cursorUdpGaveUp = true;
-                            udpOpen = false;
-                            Logf(ip, "no cursorAck within %dms, falling back to TCP cursor\n",
-                                 kCursorUdpAckMs);
-                        }
-                    }
-                }
-                const bool sendTcp = !udpOpen || !confirmed;
-                if (sendTcp) {
-                    if (!conn->SendFrame(reinterpret_cast<const uint8_t*>(pendingCursor.data()),
-                                         static_cast<uint32_t>(pendingCursor.size()))) {
-                        running = false;
-                    }
-                }
-                pendingCursor.clear();
-            }
-
             bool sentSomething = false;
             // Reply to receiver ping(s) before video so clock offset stays fresh.
             {
@@ -1291,18 +1635,18 @@ std::thread reader([&] {
                     // image, and Desktop Duplication delivers nothing new once
                     // the desktop goes static, so the correction would wait for
                     // the keepalive — up to a second. Count the drop as a
-                    // change: the active tail re-feeds the last captured buffer
-                    // right away, no second timer needed (upstream does the
-                    // same with a dedicated 30ms replay timer, see #207).
+                    // pending frame: the limiter re-feeds the last captured image
+                    // in the next slot, no second timer needed (upstream does
+                    // the same with a dedicated 30ms replay timer, see #207).
                     //
                     // Only for the *first* drop of an episode. Re-arming on
-                    // every failed attempt would keep `active` true for as long
+                    // every failed attempt would keep a frame pending for as long
                     // as the link stays congested, burning an encode per
                     // WaitWritable timeout on frames nobody can receive. One
                     // prompt replay, then fall back to the keepalive until the
                     // socket drains.
                     if (!dropPending) {
-                        lastChange = std::chrono::steady_clock::now();
+                        framePending = true; // re-send the current image in the next slot
                         dropPending = true;
                         // Once per episode, not per dropped frame: on a link
                         // that stays congested this would otherwise be the
@@ -1347,6 +1691,10 @@ std::thread reader([&] {
             }
         }
 
+        cursorStop = true;
+        cursorThread.join();
+        if (usbWatch.joinable())
+            usbWatch.join();
         conn->Close();
         reader.join();
         // After the reader is gone, so nothing else touches the injector.
@@ -1358,21 +1706,15 @@ std::thread reader([&] {
             panel.held = false;
             lastClient = ReleasePanel();
         }
-        if (lastClient && usingMttVdd) {
-            // stopRequested_ => tray Disconnect / Exit / Stop (user-initiated).
-            // Otherwise socket drop / transport flap: grace window, sticky VDD.
-            const MttTeardownReason reason =
-                stopRequested_ ? MttTeardownReason::UserInitiated : MttTeardownReason::LinkLoss;
-            RequestMttVddTeardown(ip, reason);
-            if (reason == MttTeardownReason::UserInitiated)
-                usingMttVdd = false;
-            mttModesEnsured = false;
-            mttHelloModeForced = false;
-        }
+        // stopRequested_ => tray Disconnect / Exit / Stop (user-initiated).
+        // Otherwise socket drop / transport flap: MTT keeps its head for a
+        // grace window; Parsec keeps its monitor for the sender's lifetime.
+        backend->OnSessionEnd(lastClient, stopRequested_.load());
         width_ = 0;
         height_ = 0;
         transport_ = Transport::None;
-        Logf(ip, "disconnected%s\n", stopRequested_ ? "" : ", reconnecting");
+        Logf(ip, "disconnected%s\n",
+             stopRequested_ ? "" : (movedToUsb ? ", reconnecting over USB" : ", reconnecting"));
     }
 
     if (ipLock != nullptr)

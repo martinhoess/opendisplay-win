@@ -14,8 +14,10 @@
 #include "app/SenderApp.h"
 #include "app/TrayApp.h"
 #include "display/MttVddSettings.h"
+#include "display/VirtualDisplay.h"
 #include "net/Mdns.h"
 
+#include "parsec-vdd.h" // VDD_MAX_DISPLAYS, to range-check --remove-display
 
 namespace {
 
@@ -147,7 +149,8 @@ int main(int argc, char** argv)
     MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
 
     std::string command = argc >= 2 ? argv[1] : "";
-    bool oneOff = command == "--browse-mdns" ||
+    bool oneOff = command == "--register-resolution" || command == "--cleanup-monitors" ||
+                  command == "--remove-display" || command == "--browse-mdns" ||
                   command == "--ensure-mtt-resolutions" || command == "--ensure-mtt-edid" ||
                   command == "--dump-mtt-edid" ||
                   command == "--set-mtt-monitor-count" ||
@@ -183,7 +186,7 @@ int main(int argc, char** argv)
     int rc = 0;
     if ((argc >= 2 && std::string(argv[1]) == "--ensure-mtt-edid") ||
                (argc >= 2 && std::string(argv[1]) == "--ensure-mtt-resolutions")) {
-        // Elevated one-off (SelfElevateEnsure): with a hello size WxH, generate
+        // Elevated one-off (RunElevatedSelf): with a hello size WxH, generate
         // that iPad's EDID + XML modes; without, install the shipped
         // user_edid.bin. Sets CustomEdid/PreventSpoof, reloads MttVDD only if
         // something changed.
@@ -192,9 +195,12 @@ int main(int argc, char** argv)
                                     ? od::EnsureCustomEdidForHello(helloW, helloH, /*dryRun=*/false)
                                     : od::EnsureCustomEdid();
         const bool ok = r.ok;
-        printf("ensure-mtt-edid: %s (added %d, changed=%d) path=%ls detail=%s\n",
-               ok ? "ok" : "failed", r.added, r.changed ? 1 : 0, r.path.c_str(), r.detail.c_str());
-        rc = ok ? 0 : 1;
+        printf("ensure-mtt-edid: %s (added %d, changed=%d, reload=%s) path=%ls detail=%s\n",
+               ok ? "ok" : "failed", r.added, r.changed ? 1 : 0,
+               !r.changed ? "not needed" : r.reloadFailed ? "FAILED" : "ok", r.path.c_str(), r.detail.c_str());
+        // 2 = files written but the MttVDD adapter did not restart (the
+        // parent logs that instead of claiming success).
+        rc = !ok ? 1 : (r.changed && r.reloadFailed) ? 2 : 0;
 
     } else if (argc >= 2 && std::string(argv[1]) == "--dump-mtt-edid") {
         // Diagnostics (no admin, touches nothing): --dump-mtt-edid WxH [out.bin]
@@ -230,12 +236,12 @@ int main(int argc, char** argv)
         }
     } else if (argc >= 3 && std::string(argv[1]) == "--set-mtt-monitor-count") {
         // Elevated one-shot: set <monitors><count> in live MTT settings and reload.
-        // Invoked by SelfElevateSetMonitorCount (ensure/teardown path).
+        // Elevated child of the MTT ensure/teardown path.
         auto n = static_cast<uint32_t>(strtoul(argv[2], nullptr, 10));
         od::MttEnsureResult r = od::SetMonitorCount(n);
         printf("set-mtt-monitor-count %u: %s changed=%d detail=%s\n", n, r.ok ? "ok" : "failed",
                r.changed ? 1 : 0, r.detail.c_str());
-        rc = r.ok ? 0 : 1;
+        rc = !r.ok ? 1 : (r.changed && r.reloadFailed) ? 2 : 0;
     } else if (argc >= 2 && std::string(argv[1]) == "--teardown-mtt-vdd") {
         // Verify last-client teardown path without an iPad session.
         bool ok = od::TearDownMttVdd("cli");
@@ -254,11 +260,34 @@ int main(int argc, char** argv)
             printf("%s  %s  host=%s port=%u id=%s\n", receiver.address.c_str(), receiver.instance.c_str(),
                    receiver.host.c_str(), receiver.port, receiver.id.c_str());
         rc = ok ? 0 : 1;
-    } else if (argc >= 2 && (std::string(argv[1]) == "--register-resolution" ||
-                              std::string(argv[1]) == "--remove-display" ||
-                              std::string(argv[1]) == "--cleanup-monitors")) {
-        printf("%s: removed (MTT-only fork; use --ensure-mtt-* / --teardown-mtt-vdd)\n", argv[1]);
-        rc = 1;
+    } else if (argc >= 4 && std::string(argv[1]) == "--register-resolution") {
+        // Elevated one-off: register a custom resolution (+ its rotation) so the
+        // virtual monitor can use it. Invoked by the self-elevate path or by hand.
+        auto w = static_cast<uint32_t>(strtoul(argv[2], nullptr, 10));
+        auto h = static_cast<uint32_t>(strtoul(argv[3], nullptr, 10));
+        bool ok = w > 0 && h > 0 && od::VirtualDisplay::RegisterResolutions(w, h);
+        printf("register %ux%u: %s\n", w, h, ok ? "ok" : "failed");
+        rc = ok ? 0 : 1;
+    } else if (argc >= 3 && std::string(argv[1]) == "--remove-display") {
+        // Explicit one-off: unplug the virtual display at this index. Cleans up
+        // after a sender that was killed rather than stopped — the driver keeps
+        // such a display attached to the desktop for as long as any client
+        // holds the adapter open.
+        // Range-checked before it reaches the driver: the index goes straight
+        // into an IOCTL, and parsec-vdd has VDD_MAX_DISPLAYS slots.
+        int index = atoi(argv[2]);
+        if (index < 0 || index >= parsec_vdd::VDD_MAX_DISPLAYS) {
+            printf("remove display %d: refused, index must be 0..%d\n", index, parsec_vdd::VDD_MAX_DISPLAYS - 1);
+            rc = 1;
+        } else {
+            bool ok = od::VirtualDisplay::RemoveDisplayIndex(index);
+            printf("remove display %d: %s\n", index, ok ? "sent" : "failed (driver handle?)");
+            rc = ok ? 0 : 1;
+        }
+    } else if (argc >= 2 && std::string(argv[1]) == "--cleanup-monitors") {
+        // Explicit one-off: drop phantom virtual monitors from earlier runs.
+        int n = od::VirtualDisplay::CleanupGhostMonitors();
+        printf("removed %d leftover virtual monitor(s)\n", n);
     } else if (argc >= 2) {
         // Headless CLI mode: stream to the given IP until killed (handy for
         // testing/scripting; logging goes to the inherited/redirected stdout).

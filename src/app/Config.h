@@ -28,6 +28,11 @@ struct Config {
     uint16_t port = 9000;         // the iPad receiver's fixed listen port
     bool autoReconnect = true;    // start streaming automatically on launch
 
+    // Virtual display driver: "auto" (MTT VDD if installed, else Parsec VDD),
+    // "mtt" or "parsec". An explicit choice is never silently swapped; if its
+    // driver is missing the tray says so.
+    std::string displayBackend = "auto";
+
     // When USB is in use and the cable drops (or USB dial fails), fall back to
     // the configured Wi-Fi address. Default ON matches today's behavior.
     bool usbWifiFailover = true;

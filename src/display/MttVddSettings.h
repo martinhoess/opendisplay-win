@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -32,6 +33,7 @@ struct MttEnsureResult {
     int added = 0;         // number of <resolution> entries in the rewritten set
     std::wstring path;     // live settings path used
     std::string detail;    // short status for logging
+    bool reloadFailed = false; // files written but the MttVDD adapter did not restart cleanly
 };
 
 // Prefer C:\VirtualDisplayDriver\vdd_settings.xml when present.
@@ -72,16 +74,28 @@ MttEnsureResult EnsureCustomEdidForHello(uint32_t helloW, uint32_t helloH, bool 
 // Needs admin to write the live path; returns ok=false with detail on denial.
 MttEnsureResult EnsureResolutions(const std::vector<MttMode>& wanted);
 
-// Elevated one-shot: runs `--ensure-mtt-edid WxH` (shipped file when 0x0).
-bool SelfElevateEnsure(uint32_t helloW, uint32_t helloH);
-
 // Sender entry, called before the MTT head attaches: generate the EDID for
 // this hello size; if bytes / flags / XML modes differ from what is installed,
 // show the one-time notice and self-elevate to write + reload MttVDD. No
 // change -> no UAC, no reload. UAC declined / failure -> log, keep the
 // installed EDID (shipped fallback if none), return false; never blocks the
 // connection.
-bool EnsureMttResolutionsForHello(uint32_t helloW, uint32_t helloH, const std::string& logTag);
+// cancel (optional, e.g. the sender's stop flag) abandons an open UAC prompt /
+// running helper so Disconnect / Quit never hang; the helper is bounded and
+// finishes on its own. The helper's own log lines are copied into this log.
+bool EnsureMttResolutionsForHello(uint32_t helloW, uint32_t helloH, const std::string& logTag,
+                                  const std::atomic<bool>* cancel = nullptr);
+
+// After the head attaches: wait up to timeoutMs for the MTT head to offer the
+// preferred mode from vdd_settings.xml (EnumDisplaySettings). Logs
+// "mtt: verified ..." or "mtt: VERIFY FAILED ..." with what the driver offers
+// instead. Layouts are only saved to mtt_display.json while this has passed.
+bool VerifyMttModesOffered(const std::string& logTag, int timeoutMs);
+bool MttModesVerified();
+
+// Root\MttVDD adapter instance id (display class, present). False if the MTT
+// driver is not installed.
+bool FindMttAdapterInstanceId(std::wstring& instanceId);
 
 // Optional UI hook (tray balloon) shown right before an EDID-change UAC prompt.
 // Called on a sender thread; the callee must marshal to its UI thread.
@@ -91,11 +105,8 @@ void SetMttUserNotifier(std::function<void(const std::wstring&)> fn);
 int ReadMonitorCount();
 
 // Write <monitors><count>N</count> and reload MttVDD. Idempotent when already N.
-// Needs admin to write the live path.
+// Needs admin to write the live path. The first rewrite keeps a .bak copy.
 MttEnsureResult SetMonitorCount(uint32_t count);
-
-// Elevated one-shot used by --set-mtt-monitor-count.
-bool SelfElevateSetMonitorCount(uint32_t count);
 
 // Ensure at least one MTT head is attached (set count>=1 + reload if needed).
 // Logs via Logf. Cancels any pending link-loss grace teardown.
@@ -104,10 +115,14 @@ bool SelfElevateSetMonitorCount(uint32_t count);
 // desktop (previous run / reboot). When the head is already attached and was
 // positioned, this is a no-op for layout (ACCESS_LOST / rotate / resize
 // rebuilds must never move the monitor back). Refuses after BeginMttShutdown.
-bool EnsureMttVddAttached(const std::string& logTag);
+// Only raises <count> 0 -> 1 (never lowers another tool's count). A head
+// attached here is marked as OpenDisplay's (mtt_head_owned.txt); only such a
+// head is ever detached by TearDown / Quit / the startup cleanup.
+bool EnsureMttVddAttached(const std::string& logTag, const std::atomic<bool>* cancel = nullptr);
 
-// Drop MTT heads via CDS detach. Prefer RequestMttVddTeardown so link-loss
-// flaps keep the head sticky across USB<->Wi-Fi.
+// Drop the MTT head via CDS detach - only if OpenDisplay attached it (a head
+// set up by another tool is left alone). Prefer RequestMttVddTeardown so
+// link-loss flaps keep the head sticky across USB<->Wi-Fi.
 bool TearDownMttVdd(const std::string& logTag);
 
 // How long after link loss (socket drop / transport flap) we keep the MTT head

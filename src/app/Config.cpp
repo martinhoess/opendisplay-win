@@ -208,6 +208,10 @@ Config Config::Load()
     ReadBool(json, "autoReconnect", cfg.autoReconnect);
     ReadBool(json, "usbWifiFailover", cfg.usbWifiFailover);
     ReadBool(json, "separateUsbWifiPicture", cfg.separateUsbWifiPicture);
+    {
+        const std::string v = ReadString(json, "displayBackend");
+        cfg.displayBackend = (v == "mtt" || v == "parsec") ? v : "auto";
+    }
 
     {
         std::string v = ReadString(json, "usbEncodeMode");
@@ -271,6 +275,9 @@ void Config::Save() const
          << "  \"port\": " << out.port << ",\n"
          << "  \"autoReconnect\": " << (out.autoReconnect ? "true" : "false") << ",\n"
          << "  \"usbWifiFailover\": " << (out.usbWifiFailover ? "true" : "false") << ",\n"
+         << "  \"displayBackend\": \""
+         << ((out.displayBackend == "mtt" || out.displayBackend == "parsec") ? out.displayBackend : "auto")
+         << "\",\n"
          << "  \"picturePreset\": \"" << NormalizePreset(out.picturePreset) << "\",\n"
          << "  \"separateUsbWifiPicture\": " << (out.separateUsbWifiPicture ? "true" : "false") << ",\n"
          << "  \"usbEncodeMode\": \"" << NormalizeMode(out.usbEncodeMode) << "\",\n"

@@ -1,5 +1,7 @@
 #include "net/UsbMux.h"
 
+#include <algorithm>
+
 #include "app/Log.h"
 
 #include <atomic>
@@ -246,6 +248,78 @@ void AcceptLoop()
 
 } // namespace
 
+// What usbmuxd last reported, logged only when it changes (-1 = not reachable).
+static std::atomic<int> g_lastUsbMuxCount{-2};
+
+static void NoteUsbMuxCount(int count)
+{
+    if (g_lastUsbMuxCount.exchange(count) == count)
+        return;
+    if (count < 0)
+        Logf("usb", "usbmux: not reachable (Apple Devices / iTunes not running?)\n");
+    else
+        Logf("usb", "usbmux: %d USB device%s\n", count, count == 1 ? "" : "s");
+}
+
+bool ListUsbMuxDevices(std::vector<UsbMuxDevice>& out)
+{
+    out.clear();
+    SOCKET s = ConnectLocal(kUsbmuxPort, 400);
+    if (s == INVALID_SOCKET) {
+        NoteUsbMuxCount(-1);
+        return false;
+    }
+    bool ok = SendPlist(s, 1, ListDevicesPlist());
+    std::string xml;
+    if (ok)
+        ok = RecvPlist(s, xml);
+    closesocket(s);
+    if (!ok) {
+        NoteUsbMuxCount(-1);
+        return false;
+    }
+
+    // Each DeviceList entry carries DeviceID twice (entry and its Properties
+    // dict); ConnectionType + SerialNumber sit next to the second. Split on
+    // every DeviceID and merge what each piece says about that id.
+    static const std::string kNeedle = "<key>DeviceID</key>";
+    struct Info {
+        bool usb = false;
+        std::string serial;
+    };
+    std::vector<std::pair<uint32_t, Info>> seen;
+    size_t pos = xml.find(kNeedle);
+    while (pos != std::string::npos) {
+        const size_t next = xml.find(kNeedle, pos + kNeedle.size());
+        const std::string piece = xml.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+        uint32_t id = 0;
+        if (ExtractKeyInteger(piece, "DeviceID", id)) {
+            auto it = std::find_if(seen.begin(), seen.end(), [id](const auto& p) { return p.first == id; });
+            if (it == seen.end()) {
+                seen.push_back({id, Info{}});
+                it = seen.end() - 1;
+            }
+            if (piece.find("<string>USB</string>") != std::string::npos)
+                it->second.usb = true;
+            std::string serial;
+            if (it->second.serial.empty() && ExtractKeyString(piece, "SerialNumber", serial))
+                it->second.serial = serial;
+        }
+        pos = next;
+    }
+    for (const auto& [id, info] : seen) {
+        if (!info.usb)
+            continue;
+        UsbMuxDevice d;
+        d.present = true;
+        d.deviceId = id;
+        d.serial = info.serial;
+        out.push_back(std::move(d));
+    }
+    NoteUsbMuxCount(static_cast<int>(out.size()));
+    return true;
+}
+
 bool ProbeUsbMux(UsbMuxDevice& out)
 {
     out = {};
@@ -289,7 +363,8 @@ std::optional<SOCKET> ConnectUsbMux(uint32_t deviceId, uint16_t devicePort)
     uint32_t number = 0xFFFFFFFFu;
     ExtractKeyInteger(xml, "Number", number);
     if (number != 0) {
-        Logf("usb", "usbmux Connect Result=%u (device %u port %u)\n", number, deviceId, devicePort);
+        Logf("usb", "usbmux Connect Result=%u (device %u port %u)%s\n", number, deviceId, devicePort,
+             number == 3 ? " (iPad app not listening yet)" : "");
         closesocket(s);
         return std::nullopt;
     }

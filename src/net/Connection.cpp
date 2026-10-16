@@ -45,7 +45,8 @@ Connection::~Connection()
     Close();
 }
 
-Connection::Connection(Connection&& other) noexcept : socket_(other.socket_)
+Connection::Connection(Connection&& other) noexcept
+    : socket_(other.socket_), sendMutex_(std::move(other.sendMutex_))
 {
     other.socket_ = INVALID_SOCKET;
 }
@@ -55,6 +56,7 @@ Connection& Connection::operator=(Connection&& other) noexcept
     if (this != &other) {
         Close();
         socket_ = other.socket_;
+        sendMutex_ = std::move(other.sendMutex_);
         other.socket_ = INVALID_SOCKET;
     }
     return *this;
@@ -170,8 +172,9 @@ std::optional<std::vector<uint8_t>> Connection::ReadFrame()
 
 bool Connection::SendFrame(const uint8_t* data, uint32_t size)
 {
-    if (!IsValid())
+    if (!IsValid() || !sendMutex_)
         return false;
+    std::lock_guard<std::mutex> lock(*sendMutex_);
 
     uint8_t lenBytes[4] = {
         static_cast<uint8_t>((size >> 24) & 0xFF),

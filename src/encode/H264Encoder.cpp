@@ -6,6 +6,8 @@
 #include <cstring>
 #include <cwctype>
 #include <atomic>
+#include <deque>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <codecapi.h>
@@ -57,12 +59,152 @@ void TrySetBool(ICodecAPI* api, const GUID& key, bool value)
     api->SetValue(&key, &v);
 }
 
+// Event-driven async MFT pump: keeps one IMFMediaEventGenerator::BeginGetEvent
+// outstanding and queues each event type, signalling a Win32 event. Callers
+// wait on that event, so they wake the moment the MFT asks for input or has
+// output - instead of polling GetEvent(NO_WAIT) with Sleep(1), which is a
+// 15.6 ms sleep at the default timer resolution (two waits per frame were
+// what capped encoding at ~31 fps). Invoke runs on an MF work-queue thread
+// and only queues; ProcessInput/ProcessOutput stay on the encode thread.
+class AsyncEventQueue final : public IMFAsyncCallback {
+public:
+    AsyncEventQueue() : signal_(CreateEventW(nullptr, FALSE, FALSE, nullptr)) {}
+
+    bool Start(IMFMediaEventGenerator* gen)
+    {
+        if (!gen || !signal_)
+            return false;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            gen_ = gen;
+            stopped_ = false;
+        }
+        return SUCCEEDED(gen->BeginGetEvent(this, nullptr));
+    }
+
+    // No more re-arming. The outstanding request completes (MF_E_SHUTDOWN)
+    // when the MFT is shut down, which drops the generator reference.
+    void Stop()
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        stopped_ = true;
+        events_.clear();
+    }
+
+    // Next event type, waiting up to timeoutMs (0 = just check).
+    bool Pop(MediaEventType& met, DWORD timeoutMs)
+    {
+        const ULONGLONG deadline = GetTickCount64() + timeoutMs;
+        for (;;) {
+            {
+                std::lock_guard<std::mutex> lock(mu_);
+                if (!events_.empty()) {
+                    met = events_.front();
+                    events_.pop_front();
+                    return true;
+                }
+                if (failed_)
+                    return false;
+            }
+            const ULONGLONG now = GetTickCount64();
+            if (now >= deadline)
+                return false;
+            WaitForSingleObject(signal_, static_cast<DWORD>(deadline - now));
+        }
+    }
+
+    // IUnknown
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override
+    {
+        if (!ppv)
+            return E_POINTER;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IMFAsyncCallback)) {
+            *ppv = static_cast<IMFAsyncCallback*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() override { return ++refs_; }
+    STDMETHODIMP_(ULONG) Release() override
+    {
+        const ULONG n = --refs_;
+        if (n == 0)
+            delete this;
+        return n;
+    }
+
+    // IMFAsyncCallback
+    STDMETHODIMP GetParameters(DWORD*, DWORD*) override { return E_NOTIMPL; }
+    STDMETHODIMP Invoke(IMFAsyncResult* result) override
+    {
+        ComPtr<IMFMediaEventGenerator> gen;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            gen = gen_;
+        }
+        if (!gen)
+            return S_OK;
+        ComPtr<IMFMediaEvent> event;
+        const HRESULT hr = gen->EndGetEvent(result, &event);
+        if (!Record(hr, event.Get()))
+            return S_OK;
+        // Re-arm outside the lock (MF may call back on this same thread).
+        if (FAILED(gen->BeginGetEvent(this, nullptr))) {
+            std::lock_guard<std::mutex> lock(mu_);
+            failed_ = true;
+            gen_.Reset();
+            SetEvent(signal_);
+        }
+        return S_OK;
+    }
+
+private:
+    // Queue one finished request. False: stop listening (failed or stopped).
+    bool Record(HRESULT hr, IMFMediaEvent* event)
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (FAILED(hr) || !event) {
+            failed_ = true; // shutdown, or the MFT broke: waiters stop waiting
+            gen_.Reset();
+            SetEvent(signal_);
+            return false;
+        }
+        MediaEventType met = MEUnknown;
+        event->GetType(&met);
+        if (stopped_) {
+            gen_.Reset();
+            return false;
+        }
+        events_.push_back(met);
+        SetEvent(signal_);
+        return true;
+    }
+
+    ~AsyncEventQueue()
+    {
+        if (signal_)
+            CloseHandle(signal_);
+    }
+
+    std::atomic<ULONG> refs_{1};
+    std::mutex mu_;
+    ComPtr<IMFMediaEventGenerator> gen_;
+    std::deque<MediaEventType> events_;
+    bool stopped_ = false;
+    bool failed_ = false;
+    HANDLE signal_ = nullptr;
+};
+
 } // namespace
 
 struct H264Encoder::Impl {
     ComPtr<IMFTransform> mft;
     std::wstring mftName;
     ComPtr<IMFMediaEventGenerator> eventGen;
+    ComPtr<AsyncEventQueue> events; // async MFTs only
+    int inFlight = 0;               // inputs submitted whose AU has not come out yet
     ComPtr<ICodecAPI> codecApi;
     bool isAsync = false;
     bool pendingNeedInput = false;
@@ -141,8 +283,10 @@ struct H264Encoder::Impl {
             mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
             mft->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
         }
+        StopEvents();
         mft.Reset();
         eventGen.Reset();
+        inFlight = 0;
         codecApi.Reset();
         isAsync = false;
         pendingNeedInput = false;
@@ -152,6 +296,19 @@ struct H264Encoder::Impl {
         mftName.clear();
     }
 
+
+    // Stop the event pump and shut the async MFT down, which completes the
+    // outstanding BeginGetEvent so nothing keeps the MFT alive.
+    void StopEvents()
+    {
+        if (!events)
+            return;
+        events->Stop();
+        ComPtr<IMFShutdown> shutdown;
+        if (mft && SUCCEEDED(mft.As(&shutdown)) && shutdown)
+            shutdown->Shutdown();
+        events.Reset();
+    }
 
     static bool IsIntelDevice(ID3D11Device* device)
     {
@@ -177,7 +334,11 @@ struct H264Encoder::Impl {
 
     bool AdoptD3DDevice(ID3D11Device* device, ID3D11DeviceContext* context)
     {
-        if (!device || !context || !IsIntelDevice(device))
+        // Any adapter: a D3D11-aware hardware MFT gets this device through
+        // MFT_MESSAGE_SET_D3D_MANAGER (ApplyD3DManager). If the MFT refuses it
+        // (e.g. it lives on another adapter) that path falls back to system-
+        // memory staging + CPU BGRA->NV12, as before.
+        if (!device || !context)
             return false;
 
         // Already adopted this exact device+context.
@@ -215,7 +376,7 @@ struct H264Encoder::Impl {
         }
 
         ComPtr<IDXGIDevice> dxgiDev;
-        std::string adapterName = "Intel";
+        std::string adapterName = "capture adapter";
         if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&dxgiDev))) && dxgiDev) {
             ComPtr<IDXGIAdapter> adapter;
             if (SUCCEEDED(dxgiDev->GetAdapter(&adapter)) && adapter) {
@@ -224,7 +385,7 @@ struct H264Encoder::Impl {
                     adapterName = NarrowAscii(desc.Description);
             }
         }
-        Logf("encoder", "adopted capture D3D device for QSV: %s\n", adapterName.c_str());
+        Logf("encoder", "adopted capture D3D device for HW encode: %s\n", adapterName.c_str());
         return true;
     }
 
@@ -389,6 +550,15 @@ struct H264Encoder::Impl {
             if (isAsync) {
                 attrs->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
                 mft.As(&eventGen);
+                // Must be listening before the MFT starts streaming.
+                events.Attach(new AsyncEventQueue());
+                if (!eventGen || !events->Start(eventGen.Get())) {
+                    Logf("encoder", "async MFT event pump failed to start: %s\n", NarrowAscii(name).c_str());
+                    StopEvents();
+                    ResetMft();
+                    act->ShutdownObject();
+                    return false;
+                }
             }
             // Belt-and-suspenders with CODECAPI_AVLowLatencyMode (same intent).
             attrs->SetUINT32(MF_LOW_LATENCY, TRUE);
@@ -592,6 +762,7 @@ struct H264Encoder::Impl {
     {
         asyncTimedOut = false;
         pendingNeedInput = false;
+        inFlight = 0;
 
         const DWORD expected = width * height * 3 / 2;
         auto make_sample = [&](LONGLONG pts) -> ComPtr<IMFSample> {
@@ -656,12 +827,7 @@ struct H264Encoder::Impl {
             feed(static_cast<LONGLONG>(i) * dur);
             if (!out.empty())
                 break;
-            const DWORD start = GetTickCount();
-            while (out.empty() && GetTickCount() - start < 300) {
-                DrainAvailableAsync(out);
-                if (out.empty())
-                    Sleep(1);
-            }
+            (void)WaitAsync(300, out, [&] { return !out.empty(); });
             if (asyncTimedOut && out.empty() && i >= 2)
                 break;
         }
@@ -821,59 +987,72 @@ struct H264Encoder::Impl {
         return true;
     }
 
-    void DrainAvailableAsync(std::vector<EncodedFrame>& out)
+    void HandleAsyncEvent(MediaEventType met, std::vector<EncodedFrame>& out)
     {
-        for (;;) {
-            ComPtr<IMFMediaEvent> event;
-            HRESULT hr = eventGen->GetEvent(MF_EVENT_FLAG_NO_WAIT, &event);
-            if (hr == MF_E_NO_EVENTS_AVAILABLE || FAILED(hr))
-                return;
-
-            MediaEventType met = MEUnknown;
-            event->GetType(&met);
-
-            if (met == METransformHaveOutput) {
-                ProcessOutputOnce(out);
-            } else if (met == METransformNeedInput) {
-                // Keep draining: HaveOutput may already be queued behind NeedInput.
-                pendingNeedInput = true;
-            }
+        if (met == METransformHaveOutput) {
+            if (ProcessOutputOnce(out) && inFlight > 0)
+                --inFlight;
+        } else if (met == METransformNeedInput) {
+            pendingNeedInput = true;
         }
     }
+
+    // Wait up to timeoutMs for events, handling each, until done() says stop.
+    template <typename Done>
+    bool WaitAsync(DWORD timeoutMs, std::vector<EncodedFrame>& out, Done done)
+    {
+        if (!events)
+            return false;
+        const ULONGLONG deadline = GetTickCount64() + timeoutMs;
+        while (!done()) {
+            const ULONGLONG now = GetTickCount64();
+            if (now >= deadline)
+                return false;
+            MediaEventType met = MEUnknown;
+            if (!events->Pop(met, static_cast<DWORD>(deadline - now)))
+                return done();
+            HandleAsyncEvent(met, out);
+        }
+        return true;
+    }
+
+    void DrainAvailableAsync(std::vector<EncodedFrame>& out)
+    {
+        MediaEventType met = MEUnknown;
+        while (events && events->Pop(met, 0))
+            HandleAsyncEvent(met, out);
+    }
+
+    // Up to two frames may be inside the MFT: submit does not block on this
+    // frame's AU beyond a short grace (so the common case still sends it right
+    // away); a late AU is collected by the next call or the active tail.
+    static constexpr int kMaxInFlight = 2;
 
     void PumpAsync(IMFSample* sample, std::vector<EncodedFrame>& out)
     {
         DrainAvailableAsync(out);
 
+        // Too many frames inside the MFT with no AU: QSV was observed to keep
+        // asking for input forever without producing any. Wait, then give up.
+        if (inFlight >= kMaxInFlight) {
+            const DWORD kOutputTimeoutMs = 800;
+            if (!WaitAsync(kOutputTimeoutMs, out, [&] { return inFlight < kMaxInFlight; })) {
+                asyncTimedOut = true;
+                Logf("encoder", "async MFT timed out waiting for HaveOutput (%lu ms, %d in flight)\n",
+                     static_cast<unsigned long>(kOutputTimeoutMs), inFlight);
+                return;
+            }
+        }
+
         if (!pendingNeedInput) {
-            // Never block forever on GetEvent(0): Intel QSV has been observed to
-            // never signal NeedInput when capture is on another adapter, which
-            // freezes the whole sender (tray UI included).
+            // Bounded: Intel QSV has been observed to never signal NeedInput
+            // when capture is on another adapter, which would freeze the sender.
             const DWORD kNeedInputTimeoutMs = 500;
-            const DWORD start = GetTickCount();
-            for (;;) {
-                ComPtr<IMFMediaEvent> event;
-                HRESULT hr = eventGen->GetEvent(MF_EVENT_FLAG_NO_WAIT, &event);
-                if (hr == MF_E_NO_EVENTS_AVAILABLE) {
-                    if (GetTickCount() - start >= kNeedInputTimeoutMs) {
-                        asyncTimedOut = true;
-                        Logf("encoder", "async MFT timed out waiting for NeedInput (%lu ms)\n",
-                             static_cast<unsigned long>(kNeedInputTimeoutMs));
-                        return;
-                    }
-                    Sleep(1);
-                    continue;
-                }
-                if (FAILED(hr))
-                    return;
-
-                MediaEventType met = MEUnknown;
-                event->GetType(&met);
-
-                if (met == METransformHaveOutput)
-                    ProcessOutputOnce(out);
-                else if (met == METransformNeedInput)
-                    break;
+            if (!WaitAsync(kNeedInputTimeoutMs, out, [&] { return pendingNeedInput; })) {
+                asyncTimedOut = true;
+                Logf("encoder", "async MFT timed out waiting for NeedInput (%lu ms)\n",
+                     static_cast<unsigned long>(kNeedInputTimeoutMs));
+                return;
             }
         }
         pendingNeedInput = false;
@@ -883,42 +1062,14 @@ struct H264Encoder::Impl {
             Logf("encoder", "async ProcessInput failed hr=0x%08lX\n", static_cast<unsigned long>(phr));
             return;
         }
+        ++inFlight;
 
-                // After ProcessInput, Require HaveOutput. Another NeedInput alone is
-        // not success — QSV was observed to re-ask for input forever with no AU.
-        {
-            const DWORD kOutputTimeoutMs = 800;
-            const DWORD start = GetTickCount();
-            bool gotOutput = false;
-            while (GetTickCount() - start < kOutputTimeoutMs) {
-                DrainAvailableAsync(out);
-                if (!out.empty()) {
-                    gotOutput = true;
-                    break;
-                }
-                ComPtr<IMFMediaEvent> event;
-                HRESULT hr = eventGen->GetEvent(MF_EVENT_FLAG_NO_WAIT, &event);
-                if (hr == MF_E_NO_EVENTS_AVAILABLE) {
-                    Sleep(1);
-                    continue;
-                }
-                if (FAILED(hr))
-                    break;
-                MediaEventType met = MEUnknown;
-                event->GetType(&met);
-                if (met == METransformHaveOutput) {
-                    if (ProcessOutputOnce(out))
-                        gotOutput = true;
-                } else if (met == METransformNeedInput) {
-                    pendingNeedInput = true;
-                }
-            }
-            if (!gotOutput) {
-                asyncTimedOut = true;
-                Logf("encoder", "async MFT timed out waiting for HaveOutput (%lu ms)\n",
-                     static_cast<unsigned long>(kOutputTimeoutMs));
-            }
-        }
+        // Short grace for this frame's AU (about half a frame), woken by the
+        // event the moment it is ready.
+        const LONGLONG frameMs = frameDuration100ns > 0 ? frameDuration100ns / 10000 : 16;
+        const DWORD graceMs = static_cast<DWORD>((std::max)(2LL, (std::min)(frameMs / 2, 12LL)));
+        const size_t before = out.size();
+        (void)WaitAsync(graceMs, out, [&] { return out.size() > before; });
     }
 
     void DrainSync(std::vector<EncodedFrame>& out)
@@ -940,6 +1091,7 @@ H264Encoder::~H264Encoder()
         impl_->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
         impl_->mft->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
     }
+    impl_->StopEvents();
     impl_->mft.Reset();
     impl_->eventGen.Reset();
 
@@ -1163,5 +1315,12 @@ std::vector<EncodedFrame> H264Encoder::EncodeDxgiNv12(ID3D11Texture2D* nv12)
     return outFrames;
 }
 
-} // namespace od
+std::vector<EncodedFrame> H264Encoder::CollectPending()
+{
+    std::vector<EncodedFrame> outFrames;
+    if (impl_->configured && impl_->isAsync)
+        impl_->DrainAvailableAsync(outFrames);
+    return outFrames;
+}
 
+} // namespace od

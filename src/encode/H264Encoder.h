@@ -67,14 +67,20 @@ public:
     // running count so the sender can fall back to software after N misses.
     bool TookAsyncTimeout() const;
     int ConsecutiveAsyncTimeouts() const;
+
+    // AUs an async MFT finished since the last call, without feeding input
+    // (never blocks). Lets the capture loop drain a held frame instead of
+    // re-encoding duplicates to push it out. Sync MFTs drain on input: empty.
+    std::vector<EncodedFrame> CollectPending();
     void SetAllowHardware(bool allow);
 
     // Create an Intel D3D11 device + DXGI manager for QSV (not the capture /
     // Parsec adapter). Call before Configure(). Returns false if no Intel GPU.
     bool EnsureIntelEncoderDevice();
 
-    // Prefer the capture D3D device when it is Intel (MTT path): one device for
-    // VideoProcessor convert + QSV DXGI input. Call before Configure().
+    // Share the capture D3D device (any vendor) with the encoder: one device
+    // for VideoProcessor convert + DXGI input to a D3D11-aware hardware MFT.
+    // An MFT that refuses it gets system-memory input. Call before Configure().
     bool AdoptD3DDevice(ID3D11Device* device, ID3D11DeviceContext* context);
 
     bool UsesDxgiInput() const;

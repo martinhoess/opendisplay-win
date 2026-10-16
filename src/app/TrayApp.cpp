@@ -66,6 +66,11 @@ struct TrayContext {
     HICON iconGreen = nullptr; // at least one iPad streaming
     HICON iconRed = nullptr;   // configured but nothing streaming
     HICON iconGrey = nullptr;  // no iPad configured
+    // Last display-driver problem shown as a balloon, so it is said once per
+    // distinct problem rather than on every status refresh.
+    std::string shownDriverProblem;
+    // Per sender: already told the user its MTT screen is in use (once per wait).
+    std::vector<bool> shownInUse;
 
     // Names/addresses the iPads advertise over Bonjour. Filled by a background
     // browse so the menu and Settings never wait on the network.
@@ -379,6 +384,12 @@ std::string ResolveDeviceAddress(const TrayContext* ctx, size_t index)
     return entry.address;
 }
 
+// The iPad's Bonjour TXT id saved with this entry (empty if none).
+std::string EntryId(const TrayContext* ctx, size_t index)
+{
+    return index < ctx->cfg.deviceIds.size() ? ctx->cfg.deviceIds[index] : std::string{};
+}
+
 std::wstring DeviceLabel(const TrayContext* ctx, size_t index)
 {
     DeviceEntry entry = SplitDevice(ctx->cfg.devices[index]);
@@ -395,6 +406,16 @@ std::wstring DeviceLabel(const TrayContext* ctx, size_t index)
     std::lock_guard<std::mutex> lock(ctx->discoveredMutex);
     auto discovered = ctx->discovered.find(entry.address);
     return Widen(discovered != ctx->discovered.end() ? discovered->second : entry.address);
+}
+
+// Label of the iPad whose sender holds the display this one waits for.
+std::wstring HolderLabel(const TrayContext* ctx, const SenderApp& app)
+{
+    const void* holder = app.BlockedByApp();
+    for (size_t i = 0; holder && i < ctx->apps.size() && i < ctx->cfg.devices.size(); ++i)
+        if (ctx->apps[i].get() == holder)
+            return DeviceLabel(ctx, i);
+    return {};
 }
 
 std::wstring DeviceStatusText(const TrayContext* ctx, size_t index)
@@ -418,8 +439,19 @@ std::wstring DeviceStatusText(const TrayContext* ctx, size_t index)
         }
         case SenderApp::State::Connecting:
             return text + L"  Connecting...";
-        case SenderApp::State::Blocked:
-            return text + L"  Not connected";
+        case SenderApp::State::Blocked: {
+            const std::wstring holder = HolderLabel(ctx, app);
+            if (app.BlockedExclusive() && !holder.empty())
+                return text + L"  Waiting - screen in use by " + holder;
+            const uint32_t bw = app.BlockedByWidth(), bh = app.BlockedByHeight();
+            if (bw && bh)
+                return text + L"  Waiting for " + std::to_wstring(bw) + L"x" + std::to_wstring(bh);
+            if (!holder.empty())
+                return text + L"  Waiting for " + holder;
+            return text + L"  Waiting for the display";
+        }
+        case SenderApp::State::DriverMissing:
+            return text + L"  Display driver missing";
         default:
             return text + L"  Not connected";
     }
@@ -439,13 +471,82 @@ void UpdateStatus(TrayContext* ctx)
     wcsncpy_s(ctx->nid.szTip, tip.c_str(), _TRUNCATE);
     ctx->nid.uFlags = NIF_ICON | NIF_TIP;
     Shell_NotifyIconW(NIM_MODIFY, &ctx->nid);
+
+    // The chosen display driver is missing: say so instead of silently using
+    // the other one (Settings > Advanced > Display driver).
+    std::string problem;
+    for (const auto& app : ctx->apps) {
+        if (app->GetState() == SenderApp::State::DriverMissing) {
+            problem = app->StatusDetail();
+            break;
+        }
+    }
+    if (!problem.empty() && problem != ctx->shownDriverProblem) {
+        NOTIFYICONDATAW info = ctx->nid;
+        info.uFlags = NIF_INFO;
+        info.dwInfoFlags = NIIF_WARNING;
+        wcsncpy_s(info.szInfoTitle, L"OpenDisplay", _TRUNCATE);
+        const std::wstring msg = Widen(problem) + L" Change it in Settings > Advanced > Display driver.";
+        wcsncpy_s(info.szInfo, msg.c_str(), _TRUNCATE);
+        Shell_NotifyIconW(NIM_MODIFY, &info);
+    }
+    ctx->shownDriverProblem = problem;
+
+    // MTT drives one iPad: a second one that connects waits, and says so once.
+    ctx->shownInUse.resize(ctx->apps.size(), false);
+    for (size_t i = 0; i < ctx->apps.size() && i < ctx->cfg.devices.size(); ++i) {
+        const SenderApp& app = *ctx->apps[i];
+        const bool waiting = app.GetState() == SenderApp::State::Blocked && app.BlockedExclusive();
+        if (!waiting) {
+            ctx->shownInUse[i] = false;
+            continue;
+        }
+        if (ctx->shownInUse[i])
+            continue;
+        const std::wstring holder = HolderLabel(ctx, app);
+        if (holder.empty())
+            continue;
+        ctx->shownInUse[i] = true;
+        NOTIFYICONDATAW info = ctx->nid;
+        info.uFlags = NIF_INFO;
+        info.dwInfoFlags = NIIF_INFO;
+        wcsncpy_s(info.szInfoTitle, L"OpenDisplay", _TRUNCATE);
+        const std::wstring msg = DeviceLabel(ctx, i) + L" is waiting: the screen is in use by " + holder +
+                                 L". It connects when that iPad disconnects. (Parsec in Settings > Advanced "
+                                 L"drives several iPads.)";
+        wcsncpy_s(info.szInfo, msg.c_str(), _TRUNCATE);
+        Shell_NotifyIconW(NIM_MODIFY, &info);
+    }
+}
+
+// Settings > Advanced "Display driver" combo; index order matches kBackendValues.
+const char* const kBackendValues[] = {"auto", "mtt", "parsec"};
+
+void FillBackendCombo(HWND dlg, const std::string& value)
+{
+    HWND cb = GetDlgItem(dlg, IDC_DISPLAY_BACKEND);
+    SendMessageW(cb, CB_RESETCONTENT, 0, 0);
+    SendMessageW(cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Auto"));
+    SendMessageW(cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"MTT (1 iPad)"));
+    SendMessageW(cb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Parsec (multiple iPads)"));
+    int sel = 0;
+    for (int i = 0; i < 3; ++i)
+        if (value == kBackendValues[i])
+            sel = i;
+    SendMessageW(cb, CB_SETCURSEL, sel, 0);
+}
+
+std::string ReadBackendCombo(HWND dlg)
+{
+    const LRESULT sel = SendDlgItemMessageW(dlg, IDC_DISPLAY_BACKEND, CB_GETCURSEL, 0, 0);
+    return (sel >= 0 && sel < 3) ? kBackendValues[sel] : "auto";
 }
 
 void ApplyAndRestart(TrayContext* ctx)
 {
     RebuildSenders(ctx);
     for (size_t i = 0; i < ctx->apps.size(); ++i)
-        ctx->apps[i]->Start(ResolveDeviceAddress(ctx, i), ctx->cfg.port);
+        ctx->apps[i]->Start(ResolveDeviceAddress(ctx, i), ctx->cfg.port, EntryId(ctx, i));
     UpdateStatus(ctx);
 }
 
@@ -549,7 +650,7 @@ const int kGeneralControlIds[] = {
 
 const int kAdvancedControlIds[] = {
     IDC_ADV_MANUAL_GROUP, IDC_ADV_MANUAL_HINT, IDC_DEVICES, IDC_ADV_MANUAL_EXAMPLE,
-    IDC_ADV_PORT_LABEL, IDC_PORT, IDC_SEPARATE_USB_WIFI,
+    IDC_ADV_PORT_LABEL, IDC_PORT, IDC_ADV_BACKEND_LABEL, IDC_DISPLAY_BACKEND, IDC_SEPARATE_USB_WIFI,
     IDC_ADV_USB_LABEL, IDC_ADV_USB_MODE_LABEL, IDC_USB_ENCODE_MODE,
     IDC_ADV_USB_PRESET_LABEL, IDC_USB_ENCODE_PRESET,
     IDC_ADV_WIFI_LABEL, IDC_ADV_WIFI_MODE_LABEL, IDC_WIFI_ENCODE_MODE,
@@ -881,6 +982,7 @@ INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lPara
             FillPictureCombo(dlg);
             SelectPictureCombo(dlg, cfg->picturePreset);
             FillEncodeCombos(dlg);
+            FillBackendCombo(dlg, cfg->displayBackend);
             SelectEncodeCombos(dlg, *cfg);
 
             InitSettingsTabs(dlg);
@@ -950,6 +1052,7 @@ INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lPara
                     cfg->port = static_cast<uint16_t>(port);
                 cfg->autoReconnect = IsDlgButtonChecked(dlg, IDC_AUTORECONNECT) == BST_CHECKED;
                 cfg->usbWifiFailover = IsDlgButtonChecked(dlg, IDC_USB_WIFI_FAILOVER) == BST_CHECKED;
+                cfg->displayBackend = ReadBackendCombo(dlg);
                 SetAutostart(IsDlgButtonChecked(dlg, IDC_AUTOSTART) == BST_CHECKED);
                 cfg->picturePreset = ReadPictureCombo(dlg);
                 cfg->separateUsbWifiPicture = IsDlgButtonChecked(dlg, IDC_SEPARATE_USB_WIFI) == BST_CHECKED;
@@ -975,7 +1078,9 @@ void ShowContextMenu(HWND hwnd, TrayContext* ctx)
 
     bool several = ctx->cfg.devices.size() > 1;
     for (size_t i = 0; i < ctx->cfg.devices.size(); ++i) {
-        UINT flags = MF_STRING | (ctx->apps[i]->GetState() != SenderApp::State::Idle ? MF_CHECKED : 0);
+        // One toggle per iPad (connect / disconnect just that one); the check
+        // mark means it is streaming right now.
+        UINT flags = MF_STRING | (ctx->apps[i]->GetState() == SenderApp::State::Streaming ? MF_CHECKED : 0);
         AppendMenuW(menu, flags, IDM_DEVICE_FIRST + static_cast<UINT>(i), DeviceStatusText(ctx, i).c_str());
     }
     if (!ctx->cfg.devices.empty())
@@ -1001,6 +1106,9 @@ void ShowContextMenu(HWND hwnd, TrayContext* ctx)
 
 void OpenSettingsAndApply(HWND hwnd, TrayContext* ctx)
 {
+    // Senders write to the config at runtime (USB serial->id bindings); start
+    // from the file, not the tray's copy from launch.
+    ctx->cfg = Config::Load();
     std::vector<std::string> oldDevices = ctx->cfg.devices;
     std::vector<std::string> oldIds = ctx->cfg.deviceIds;
     uint16_t oldPort = ctx->cfg.port;
@@ -1011,6 +1119,7 @@ void OpenSettingsAndApply(HWND hwnd, TrayContext* ctx)
     const std::string oldPicture = ctx->cfg.picturePreset;
     const bool oldSeparate = ctx->cfg.separateUsbWifiPicture;
     const bool oldFailover = ctx->cfg.usbWifiFailover;
+    const std::string oldBackend = ctx->cfg.displayBackend;
 
     SettingsDlgState state;
     state.tray = ctx;
@@ -1019,6 +1128,14 @@ void OpenSettingsAndApply(HWND hwnd, TrayContext* ctx)
     if (DialogBoxParamW(ctx->hInstance, MAKEINTRESOURCEW(IDD_SETTINGS), hwnd, SettingsDlgProc,
                         reinterpret_cast<LPARAM>(&state)) != IDOK)
         return;
+
+    // Bindings learned while the dialog was open: keep the file's, the dialog
+    // never edits them.
+    {
+        const Config onDisk = Config::Load();
+        ctx->cfg.usbLinkSerials = onDisk.usbLinkSerials;
+        ctx->cfg.usbLinkIds = onDisk.usbLinkIds;
+    }
 
     if (state.restartAdminRequested) {
         ctx->cfg.Save();
@@ -1035,7 +1152,9 @@ void OpenSettingsAndApply(HWND hwnd, TrayContext* ctx)
         ctx->cfg.picturePreset != oldPicture || ctx->cfg.separateUsbWifiPicture != oldSeparate;
     // Failover is read each connect; no restart required. Targets/encode still are.
     (void)oldFailover;
-    if (targetsChanged || encodeChanged)
+    // A different display driver means new heads: reconnect everything.
+    const bool backendChanged = ctx->cfg.displayBackend != oldBackend;
+    if (targetsChanged || encodeChanged || backendChanged)
         ApplyAndRestart(ctx);
 }
 
@@ -1071,7 +1190,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 if (app.IsRunning())
                     app.Stop();
                 else
-                    app.Start(ResolveDeviceAddress(ctx, index), ctx->cfg.port);
+                    app.Start(ResolveDeviceAddress(ctx, index), ctx->cfg.port, EntryId(ctx, index));
                 UpdateStatus(ctx);
                 return 0;
             }
@@ -1079,7 +1198,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             switch (LOWORD(wParam)) {
                 case IDM_CONNECT:
                     for (size_t i = 0; i < ctx->apps.size(); ++i)
-                        ctx->apps[i]->Start(ResolveDeviceAddress(ctx, i), ctx->cfg.port);
+                        ctx->apps[i]->Start(ResolveDeviceAddress(ctx, i), ctx->cfg.port, EntryId(ctx, i));
                     UpdateStatus(ctx);
                     return 0;
                 case IDM_DISCONNECT:
@@ -1221,7 +1340,7 @@ int RunTray(HINSTANCE hInstance)
 
     if (ctx.cfg.autoReconnect)
         for (size_t i = 0; i < ctx.apps.size(); ++i)
-            ctx.apps[i]->Start(ResolveDeviceAddress(&ctx, i), ctx.cfg.port);
+            ctx.apps[i]->Start(ResolveDeviceAddress(&ctx, i), ctx.cfg.port, EntryId(&ctx, i));
     UpdateStatus(&ctx);
 
     MSG msg;
