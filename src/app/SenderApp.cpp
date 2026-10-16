@@ -1172,6 +1172,11 @@ std::thread reader([&] {
         Clock::duration earlyWindow = slot / 4;
         Clock::time_point nextSlot{};
         bool framePending = false;
+        // Tail: the async MFT can hold the last image's AU until another input
+        // arrives. One re-encode a slot after the last new image pushes it out
+        // (otherwise it could sit until the 1 s keepalive). Scheduled, not slept.
+        bool tailPending = false;
+        Clock::time_point tailAt{};
         uint32_t cadenceAus = 0;
         uint32_t cadenceSends = 0;
         uint32_t cadenceTimeouts = 0;
@@ -1222,8 +1227,9 @@ std::thread reader([&] {
             // Capture timeout: up to the next slot while a frame waits,
             // otherwise the normal idle cadence.
             int captureTimeoutMs = kIdleCaptureTimeoutMs;
-            if (framePending) {
-                const auto left = nextSlot - Clock::now();
+            if (framePending || tailPending) {
+                const auto due = framePending ? nextSlot : tailAt;
+                const auto left = due - Clock::now();
                 const auto leftMs = std::chrono::ceil<std::chrono::milliseconds>(left).count();
                 captureTimeoutMs = static_cast<int>((std::max)(0LL, (std::min)(static_cast<long long>(leftMs),
                                                                                static_cast<long long>(kIdleCaptureTimeoutMs))));
@@ -1491,16 +1497,20 @@ std::thread reader([&] {
 
                 // Encode only a new image (pending) or the keepalive, and only
                 // once its slot opens (a little early is fine). Nothing new
-                // means nothing encoded: no duplicate tail. The async encoder's
-                // held AU is collected below instead.
+                // means nothing encoded, apart from the single tail above. The
+                // async encoder's held AU is collected below in between.
                 const auto nowEnc = Clock::now();
                 const bool slotOpen = nowEnc >= nextSlot - earlyWindow;
-                const bool doEncode = running && slotOpen && (framePending || keepaliveDue);
+                const bool tailDue = tailPending && !framePending && nowEnc >= tailAt;
+                const bool doEncode = running && slotOpen && (framePending || keepaliveDue || tailDue);
                 if (doEncode) {
+                    // A new image schedules one tail; the tail or keepalive does not.
+                    tailPending = framePending;
                     framePending = false;
                     nextSlot += slot;
                     if (nowEnc > nextSlot + slot) // idle or stalled: re-anchor
                         nextSlot = nowEnc + slot;
+                    tailAt = nextSlot + slot / 2;
                 } else if (running) {
                     encoded = encoder.CollectPending();
                     cadenceAus += static_cast<uint32_t>(encoded.size());
