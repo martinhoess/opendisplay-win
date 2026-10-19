@@ -25,13 +25,13 @@ const wchar_t* ReasonText(PauseReason reason)
 {
     switch (reason) {
         case PauseReason::Locked:
-            return L"\U0001F512  Locked";
+            return L"\U0001F512Locked";
         case PauseReason::Asleep:
-            return L"\U0001F319  Display asleep";
+            return L"\U0001F319Display asleep";
         case PauseReason::Admin:
-            return L"\U0001F6E1\uFE0F  Waiting for admin approval";
+            return L"\U0001F6E1\uFE0FWaiting for admin approval";
         default:
-            return L"\u23F8\uFE0F  Paused";
+            return L"\u23F8\uFE0FPaused";
     }
 }
 
