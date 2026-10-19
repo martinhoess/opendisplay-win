@@ -1209,7 +1209,7 @@ std::thread reader([&] {
                 return PauseReason::Asleep;
             if (desk == InputDesktop::Secure)
                 return PauseReason::Admin;
-            if (desk == InputDesktop::Other || pauseFromSecureDesktop)
+            if (desk == InputDesktop::Other)
                 return PauseReason::Paused;
             return PauseReason::None;
         };
