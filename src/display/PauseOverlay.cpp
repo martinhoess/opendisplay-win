@@ -86,9 +86,10 @@ bool DrawOverlay(IWICImagingFactory* wic, IWICBitmap* bitmap, uint32_t width, ui
     subFmt->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
 
     const wchar_t* title = ReasonText(reason);
-    const wchar_t* sub = (reason == PauseReason::Admin)
-                             ? L"Approve to continue"
-                             : L"Resumes automatically";
+    const wchar_t* sub = reason == PauseReason::Locked   ? L"Unlock to continue"
+                         : reason == PauseReason::Asleep ? L"Wake display to continue"
+                         : reason == PauseReason::Admin  ? L"Approve to continue"
+                                                         : L"Resumes automatically";
     ComPtr<IDWriteTextLayout> titleLayout, subLayout;
     if (FAILED(dwrite->CreateTextLayout(title, static_cast<UINT32>(wcslen(title)), titleFmt.Get(), w, h, &titleLayout)) ||
         FAILED(dwrite->CreateTextLayout(sub, static_cast<UINT32>(wcslen(sub)), subFmt.Get(), w, h, &subLayout)))
