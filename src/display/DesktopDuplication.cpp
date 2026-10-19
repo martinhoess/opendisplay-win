@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <thread>
 
 #pragma comment(lib, "d3d11.lib")
@@ -71,6 +72,59 @@ void ConvertBgraToNv12(const uint8_t* bgra, UINT rowPitch, uint32_t width, uint3
 }
 
 } // namespace
+
+void ConvertBgraToNv12Cpu(const uint8_t* bgra, UINT rowPitch, uint32_t width, uint32_t height,
+                          std::vector<uint8_t>& nv12)
+{
+    ConvertBgraToNv12(bgra, rowPitch, width, height, nv12);
+}
+
+bool DesktopDuplication::ReadBackLastFrame(std::vector<uint8_t>& bgra, uint32_t& width, uint32_t& height)
+{
+    if (!haveDesktopFrame_ || !device_ || !context_)
+        return false;
+    // GPU path keeps the last frame in bgraGpu_; the CPU path in staging_.
+    ComPtr<ID3D11Texture2D> source = bgraGpu_ ? bgraGpu_ : staging_;
+    if (!source)
+        return false;
+    D3D11_TEXTURE2D_DESC desc{};
+    source->GetDesc(&desc);
+    ComPtr<ID3D11Texture2D> readable = source;
+    if (desc.Usage != D3D11_USAGE_STAGING) {
+        D3D11_TEXTURE2D_DESC sd = desc;
+        sd.Usage = D3D11_USAGE_STAGING;
+        sd.BindFlags = 0;
+        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        sd.MiscFlags = 0;
+        readable.Reset();
+        if (FAILED(device_->CreateTexture2D(&sd, nullptr, &readable)))
+            return false;
+        context_->CopyResource(readable.Get(), source.Get());
+    }
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(context_->Map(readable.Get(), 0, D3D11_MAP_READ, 0, &mapped)))
+        return false;
+    width = desc.Width;
+    height = desc.Height;
+    bgra.resize(static_cast<size_t>(width) * height * 4);
+    for (uint32_t y = 0; y < height; ++y)
+        memcpy(bgra.data() + static_cast<size_t>(y) * width * 4,
+               static_cast<const uint8_t*>(mapped.pData) + static_cast<size_t>(y) * mapped.RowPitch,
+               static_cast<size_t>(width) * 4);
+    context_->Unmap(readable.Get(), 0);
+    return true;
+}
+
+bool DesktopDuplication::LastFrameBgra(std::vector<uint8_t>& bgra, uint32_t& width, uint32_t& height)
+{
+    if (!lostFrame_.empty()) {
+        bgra = lostFrame_;
+        width = lostFrameW_;
+        height = lostFrameH_;
+        return true;
+    }
+    return ReadBackLastFrame(bgra, width, height);
+}
 
 bool DesktopDuplication::Open(const std::wstring& deviceName)
 {
@@ -201,11 +255,14 @@ CaptureResult DesktopDuplication::CaptureFrameNv12(std::vector<uint8_t>& nv12, i
             reportedLoss_ = true;
         }
         result.accessLost = true;
+        if (!ReadBackLastFrame(lostFrame_, lostFrameW_, lostFrameH_))
+            lostFrame_.clear();
         Reopen();
         std::this_thread::sleep_for(std::chrono::milliseconds(kRecoveryBackoffMs));
         return result;
     }
     reportedLoss_ = false;
+    lostFrame_.clear();
     result.acquired = true;
 
     bool shapeChanged = false;
@@ -440,11 +497,14 @@ CaptureResult DesktopDuplication::CaptureFrameNv12Gpu(ComPtr<ID3D11Texture2D>& o
         }
         result.accessLost = true;
         outNv12 = nullptr; // drop stale GPU frame tied to the old device
+        if (!ReadBackLastFrame(lostFrame_, lostFrameW_, lostFrameH_))
+            lostFrame_.clear();
         Reopen();
         std::this_thread::sleep_for(std::chrono::milliseconds(kRecoveryBackoffMs));
         return result;
     }
     reportedLoss_ = false;
+    lostFrame_.clear();
     result.acquired = true;
 
     bool shapeChanged = false;

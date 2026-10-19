@@ -31,6 +31,10 @@ struct PointerShapeBgra {
     std::vector<uint8_t> bgra;
 };
 
+// BGRA (rowPitch bytes per row) -> tightly packed NV12, BT.601 limited, CPU.
+void ConvertBgraToNv12Cpu(const uint8_t* bgra, UINT rowPitch, uint32_t width, uint32_t height,
+                          std::vector<uint8_t>& nv12);
+
 class DesktopDuplication {
 public:
     DesktopDuplication() = default;
@@ -76,9 +80,15 @@ public:
 
     bool GetPointerShapeBgra(PointerShapeBgra& out) const;
 
+    // The last captured desktop image as tightly packed BGRA. After an
+    // ACCESS_LOST it is the copy taken just before the reopen (the old device's
+    // textures are gone by then). False when nothing was captured yet.
+    bool LastFrameBgra(std::vector<uint8_t>& bgra, uint32_t& width, uint32_t& height);
+
 private:
     bool UpdatePointer(const DXGI_OUTDUPL_FRAME_INFO& info, bool* shapeChanged = nullptr);
     bool Reopen();
+    bool ReadBackLastFrame(std::vector<uint8_t>& bgra, uint32_t& width, uint32_t& height);
     void ResetGpuConverter();
     bool ConvertDesktopToGpuNv12(ID3D11Texture2D* desktopBgra, uint32_t frameW, uint32_t frameH,
                                  uint32_t encW, uint32_t encH);
@@ -114,6 +124,10 @@ private:
     POINT pointerPosition_{};
     bool pointerVisible_ = false;
     bool pointerShapeValid_ = false;
+
+    std::vector<uint8_t> lostFrame_; // BGRA saved on ACCESS_LOST
+    uint32_t lostFrameW_ = 0;
+    uint32_t lostFrameH_ = 0;
 };
 
 } // namespace od

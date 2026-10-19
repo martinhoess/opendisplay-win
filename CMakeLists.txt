@@ -24,6 +24,7 @@ add_executable(opendisplay-win
   src/encode/AnnexB.cpp
   src/encode/H264Encoder.cpp
   src/display/DesktopDuplication.cpp
+  src/display/PauseOverlay.cpp
   src/display/DisplayBackend.cpp
   src/display/VirtualDisplay.cpp
   src/display/ExistingMonitor.cpp
@@ -58,6 +59,8 @@ target_link_libraries(opendisplay-win PRIVATE
   gdi32
   windowscodecs
   ole32
+  d2d1
+  dwrite
 )
 
 target_compile_definitions(opendisplay-win PRIVATE
