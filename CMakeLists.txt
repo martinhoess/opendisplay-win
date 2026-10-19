@@ -32,6 +32,7 @@ add_executable(opendisplay-win
   src/input/InputInjector.cpp
   src/app/Log.cpp
   src/app/SenderApp.cpp
+  src/app/PauseSignals.cpp
   src/app/Config.cpp
   src/app/TrayApp.cpp
   src/app/resources.rc
@@ -61,6 +62,7 @@ target_link_libraries(opendisplay-win PRIVATE
   ole32
   d2d1
   dwrite
+  wtsapi32
 )
 
 target_compile_definitions(opendisplay-win PRIVATE

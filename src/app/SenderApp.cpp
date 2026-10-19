@@ -3,6 +3,8 @@
 #include "app/Log.h"
 #include "app/Config.h"
 #include "app/EncodeProfile.h"
+#include "app/PauseSignals.h"
+#include "display/PauseOverlay.h"
 
 #include <atomic>
 #include <chrono>
@@ -1035,6 +1037,7 @@ std::thread reader([&] {
         // busy link). UDP when open; mirrored on TCP until cursorAck, or for
         // good on USB / when UDP never confirms. SendFrame is thread-safe.
         std::atomic<bool> cursorStop{false};
+        std::atomic<bool> cursorPaused{false}; // pause mode: no cursor updates
         std::thread cursorThread([&] {
             HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
                                                   TIMER_ALL_ACCESS);
@@ -1063,7 +1066,7 @@ std::thread reader([&] {
                 const LONG x = inside ? ci.ptScreenPos.x - r.left : lastX;
                 const LONG y = inside ? ci.ptScreenPos.y - r.top : lastY;
                 const bool force = cursorForce.exchange(false);
-                if (gotInfo && (force || !haveLast || visible != lastVisible || (visible && (x != lastX || y != lastY)))) {
+                if (!cursorPaused && gotInfo && (force || !haveLast || visible != lastVisible || (visible && (x != lastX || y != lastY)))) {
                     haveLast = true;
                     lastVisible = visible;
                     lastX = x;
@@ -1181,6 +1184,68 @@ std::thread reader([&] {
         uint32_t cadenceSends = 0;
         uint32_t cadenceTimeouts = 0;
 
+        // Pause mode: a locked PC, a dark console display or the secure desktop
+        // (UAC) stop capture, encode and cursor updates, but the connection,
+        // the MTT head and the session stay. The iPad gets one overlay frame
+        // (last picture dimmed + reason card), re-sent as the keepalive. Resume
+        // rebuilds duplication on the same output and starts on an IDR.
+        bool paused = false;
+        bool pauseFromSecureDesktop = false; // entered on ACCESS_LOST with the secure desktop up
+        PauseReason pauseReason = PauseReason::None;
+        std::vector<uint8_t> pauseBase;      // BGRA under the overlay
+        uint32_t pauseBaseW = 0, pauseBaseH = 0;
+        std::vector<uint8_t> pauseNv12;      // overlay at encoder size
+        int pauseEncodesDue = 0;             // overlay encodes owed right now
+        Clock::time_point lastResumeTry{};
+        bool resumeFailLogged = false;
+
+        auto pauseReasonNow = [&](InputDesktop desk) {
+            // The lock event starts it; WTS session state decides while it lasts
+            // (also catches a lock the tray never heard about, or a missed unlock).
+            const bool lockEvent = PauseSignals::locked.load();
+            if ((lockEvent || desk != InputDesktop::Default) && IsSessionLocked())
+                return PauseReason::Locked;
+            if (PauseSignals::displayOff.load())
+                return PauseReason::Asleep;
+            if (desk == InputDesktop::Secure)
+                return PauseReason::Admin;
+            if (desk == InputDesktop::Other || pauseFromSecureDesktop)
+                return PauseReason::Paused;
+            return PauseReason::None;
+        };
+        // Overlay frame for `reason` from pauseBase, padded to the encoder size.
+        auto renderPauseFrame = [&](PauseReason reason) {
+            std::vector<uint8_t> img = pauseBase;
+            uint32_t w = pauseBaseW, h = pauseBaseH;
+            if (img.empty() || w > encoder.Width() || h > encoder.Height()) {
+                w = encoder.Width();
+                h = encoder.Height();
+                img.assign(static_cast<size_t>(w) * h * 4, 0x30); // neutral dark gray
+            }
+            if (!RenderPauseOverlay(img.data(), w, h, reason))
+                Logf(ip, "pause overlay draw failed - sending the dimmed-less picture\n");
+            std::vector<uint8_t> nv12Small;
+            ConvertBgraToNv12Cpu(img.data(), w * 4, w, h, nv12Small);
+            if (!PadNv12TopLeft(nv12Small, w, h, encoder.Width(), encoder.Height(), pauseNv12))
+                pauseNv12.clear();
+            pauseReason = reason;
+            pauseEncodesDue = 2; // the async MFT hands out an AU on the next input
+            encoder.RequestKeyFrame();
+        };
+        auto enterPause = [&](PauseReason reason, bool fromSecure) {
+            paused = true;
+            pauseFromSecureDesktop = fromSecure;
+            cursorPaused = true;
+            framePending = false;
+            tailPending = false;
+            if (!dup.LastFrameBgra(pauseBase, pauseBaseW, pauseBaseH))
+                pauseBase.clear();
+            renderPauseFrame(reason);
+            resumeFailLogged = false;
+            Logf(ip, "paused (%s): capture/encode stopped, connection kept, overlay %s\n", PauseReasonName(reason),
+                 pauseNv12.empty() ? "unavailable" : "sent");
+        };
+
         while (running && !stopRequested_) {
             std::vector<EncodedFrame> encoded;
             int64_t capMs = 0;
@@ -1234,7 +1299,79 @@ std::thread reader([&] {
                 captureTimeoutMs = static_cast<int>((std::max)(0LL, (std::min)(static_cast<long long>(leftMs),
                                                                                static_cast<long long>(kIdleCaptureTimeoutMs))));
             }
-            {
+            if (!paused && (PauseSignals::locked.load() || PauseSignals::displayOff.load())) {
+                const PauseReason r = pauseReasonNow(CurrentInputDesktop());
+                if (r != PauseReason::None) {
+                    std::lock_guard<std::mutex> lock(pipelineMutex);
+                    enterPause(r, false);
+                } else {
+                    PauseSignals::locked = false; // stale: WTS says unlocked
+                }
+            }
+            if (paused) {
+                // No capture while paused: this replaces AcquireNextFrame's
+                // timeout as the loop's only wait, on the tray's wake event.
+                capMs = UnixEpochMs();
+                const InputDesktop desk = CurrentInputDesktop();
+                const PauseReason want = pauseReasonNow(desk);
+                const auto nowP = Clock::now();
+                if (want == PauseReason::None) {
+                    // One attempt per keepalive period, never a tight retry loop.
+                    if (lastResumeTry == Clock::time_point{} ||
+                        nowP - lastResumeTry >= std::chrono::milliseconds(kKeepaliveMs)) {
+                        lastResumeTry = nowP;
+                        std::lock_guard<std::mutex> lock(pipelineMutex);
+                        if (buildPipeline(width, height, BuildReason::CaptureRebuild)) {
+                            paused = false;
+                            pauseFromSecureDesktop = false;
+                            cursorPaused = false;
+                            cursorForce = true;
+                            haveGpuDesktopFrame = false;
+                            waitFirstFrameSince = {};
+                            firstFrameNudged = false;
+                            firstFrameWaitLogged = false;
+                            framePending = true; // encode the first capture at once
+                            nextSlot = Clock::now();
+                            encoder.RequestKeyFrame();
+                            Logf(ip, "resumed after %s: duplication rebuilt, keyframe requested\n",
+                                 PauseReasonName(pauseReason));
+                            lastResumeTry = {};
+                            continue;
+                        }
+                        if (!resumeFailLogged) {
+                            resumeFailLogged = true;
+                            Logf(ip, "resume: duplication rebuild failed, still paused - retrying each second\n");
+                        }
+                    }
+                } else if (want != pauseReason) {
+                    std::lock_guard<std::mutex> lock(pipelineMutex);
+                    renderPauseFrame(want);
+                    Logf(ip, "pause reason now %s\n", PauseReasonName(want));
+                }
+                if (nowP - lastSend >= std::chrono::milliseconds(kKeepaliveMs) && pauseEncodesDue == 0)
+                    pauseEncodesDue = 1; // keepalive: the overlay again
+                {
+                    std::lock_guard<std::mutex> lock(pipelineMutex);
+                    if (pauseEncodesDue > 0 && !pauseNv12.empty()) {
+                        --pauseEncodesDue;
+                        encoded = encoder.EncodeNv12(pauseNv12.data(), pauseNv12.size());
+                        ++cadenceEncCalls;
+                    } else {
+                        pauseEncodesDue = 0;
+                        encoded = encoder.CollectPending();
+                    }
+                    cadenceAus += static_cast<uint32_t>(encoded.size());
+                }
+                if (encoded.empty() && pauseEncodesDue == 0) {
+                    const auto untilKeepalive =
+                        std::chrono::ceil<std::chrono::milliseconds>(lastSend + std::chrono::milliseconds(kKeepaliveMs) -
+                                                                     Clock::now())
+                            .count();
+                    // Short cap: the input desktop has no change notification.
+                    const DWORD waitMs = static_cast<DWORD>((std::max)(1LL, (std::min)(250LL, static_cast<long long>(untilKeepalive))));
+                    WaitForSingleObject(PauseSignals::WakeEvent(), waitMs);
+                }
+            } else {
                 // Only capture+encode need the pipeline lock (they touch dup
                 // and encoder, which the reader thread may rebuild on
                 // rotation). The network send is deliberately outside the
@@ -1298,6 +1435,19 @@ std::thread reader([&] {
                 // QSV DXGI path shares the capture D3D device with the MFT, so a
                 // new capture device requires a full encoder rebuild.
                 if (cap.accessLost) {
+                    // Lock screen / UAC (secure desktop) or a dark display: pause
+                    // instead of rebuilding into a desktop we cannot capture.
+                    {
+                        const InputDesktop desk = CurrentInputDesktop();
+                        if (desk != InputDesktop::Default || PauseSignals::locked.load() ||
+                            PauseSignals::displayOff.load()) {
+                            enterPause(pauseReasonNow(desk) == PauseReason::None ? PauseReason::Paused
+                                                                                   : pauseReasonNow(desk),
+                                       desk != InputDesktop::Default);
+                            haveGpuDesktopFrame = false;
+                            continue;
+                        }
+                    }
                     haveGpuDesktopFrame = false;
                     waitFirstFrameSince = {};
                     firstFrameNudged = false;

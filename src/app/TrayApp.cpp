@@ -2,6 +2,7 @@
 
 #include "app/Config.h"
 #include "app/Log.h"
+#include "app/PauseSignals.h"
 #include "app/SenderApp.h"
 #include "app/resources.h"
 #include "display/MttVddSettings.h"
@@ -9,6 +10,7 @@
 
 #include <commctrl.h>
 #include <shellapi.h>
+#include <wtsapi32.h>
 
 #include <atomic>
 #include <chrono>
@@ -55,8 +57,12 @@ const wchar_t* const kWndClass = L"opendisplay-win-tray";
 constexpr int kSettingsWidth = 272;
 constexpr int kSettingsHeight = 294;
 
+// GUID_CONSOLE_DISPLAY_STATE, spelled out so no INITGUID / extra lib is needed.
+constexpr GUID kConsoleDisplayState = {0x6fe69556, 0x704a, 0x47a0, {0x8f, 0x24, 0xc2, 0x8d, 0x93, 0x6f, 0xda, 0x47}};
+
 struct TrayContext {
     HINSTANCE hInstance = nullptr;
+    HPOWERNOTIFY displayStateNotify = nullptr; // GUID_CONSOLE_DISPLAY_STATE
     // One sender per configured iPad, index-aligned with cfg.devices: each
     // drives its own virtual monitor, capture, encoder and input injection.
     // unique_ptr because SenderApp owns a thread and can't be moved.
@@ -1227,6 +1233,29 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             }
             return 0;
 
+        case WM_WTSSESSION_CHANGE:
+            if (wParam == WTS_SESSION_LOCK || wParam == WTS_SESSION_UNLOCK) {
+                PauseSignals::locked = wParam == WTS_SESSION_LOCK;
+                Logf("pause", "session %s\n", wParam == WTS_SESSION_LOCK ? "locked" : "unlocked");
+                PauseSignals::Notify();
+            }
+            return 0;
+
+        case WM_POWERBROADCAST:
+            if (wParam == PBT_POWERSETTINGCHANGE && lParam) {
+                const auto* ps = reinterpret_cast<const POWERBROADCAST_SETTING*>(lParam);
+                if (IsEqualGUID(ps->PowerSetting, kConsoleDisplayState) && ps->DataLength >= sizeof(DWORD)) {
+                    // 0 off, 1 on, 2 dimmed (still visible: not a pause).
+                    const DWORD state = *reinterpret_cast<const DWORD*>(ps->Data);
+                    const bool off = state == 0;
+                    if (PauseSignals::displayOff.exchange(off) != off) {
+                        Logf("pause", "console display %s\n", off ? "off" : "on");
+                        PauseSignals::Notify();
+                    }
+                }
+            }
+            return TRUE;
+
         case WM_DISPLAYCHANGE:
             SetTimer(hwnd, kDisplayChangeTimerId, kDisplayChangeDebounceMs, nullptr);
             return 0;
@@ -1249,6 +1278,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             return 0;
 
         case WM_DESTROY:
+            WTSUnRegisterSessionNotification(hwnd);
+            if (ctx->displayStateNotify) {
+                UnregisterPowerSettingNotification(ctx->displayStateNotify);
+                ctx->displayStateNotify = nullptr;
+            }
             SetMttUserNotifier(nullptr);
             KillTimer(hwnd, kStatusTimerId);
             KillTimer(hwnd, kDisplayChangeTimerId);
@@ -1309,6 +1343,13 @@ int RunTray(HINSTANCE hInstance)
     if (hwnd == nullptr)
         return 1;
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&ctx));
+    // Pause mode inputs: lock/unlock and console display on/off.
+    if (!WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION))
+        Logf("pause", "WTSRegisterSessionNotification failed (%lu)\n", GetLastError());
+    ctx.displayStateNotify =
+        RegisterPowerSettingNotification(hwnd, &kConsoleDisplayState, DEVICE_NOTIFY_WINDOW_HANDLE);
+    if (!ctx.displayStateNotify)
+        Logf("pause", "RegisterPowerSettingNotification failed (%lu)\n", GetLastError());
 
     ctx.iconGreen = MakeStatusIcon(RGB(40, 200, 80));
     ctx.iconRed = MakeStatusIcon(RGB(225, 65, 55));
