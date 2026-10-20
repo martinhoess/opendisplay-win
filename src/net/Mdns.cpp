@@ -361,6 +361,123 @@ bool SelfCheck()
     return true;
 }
 
+MdnsListener::MdnsListener()
+{
+    addrEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    ArmAddrChange();
+    Open();
+}
+
+MdnsListener::~MdnsListener()
+{
+    if (addrArmed_)
+        CancelIPChangeNotify(&addrOv_);
+    Close();
+    if (addrEvent_)
+        CloseHandle(addrEvent_);
+}
+
+void MdnsListener::ArmAddrChange()
+{
+    addrArmed_ = false;
+    if (!addrEvent_)
+        return;
+    addrOv_ = {};
+    addrOv_.hEvent = addrEvent_;
+    const DWORD r = NotifyAddrChange(&addrHandle_, &addrOv_);
+    addrArmed_ = r == ERROR_IO_PENDING;
+}
+
+void MdnsListener::Open()
+{
+    Close();
+    SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock == INVALID_SOCKET)
+        return;
+    // Windows' own mDNS responder holds 5353 too; share it.
+    BOOL reuse = TRUE;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
+    sockaddr_in any{};
+    any.sin_family = AF_INET;
+    any.sin_port = htons(kMulticastPort);
+    any.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(sock, reinterpret_cast<sockaddr*>(&any), sizeof(any)) != 0) {
+        closesocket(sock);
+        return;
+    }
+    int joined = 0;
+    for (const in_addr& local : LocalInterfaces()) {
+        ip_mreq mreq{};
+        inet_pton(AF_INET, kMulticastGroup, &mreq.imr_multiaddr);
+        mreq.imr_interface = local;
+        if (setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, reinterpret_cast<const char*>(&mreq), sizeof(mreq)) == 0)
+            ++joined;
+    }
+    WSAEVENT ev = WSACreateEvent();
+    if (joined == 0 || ev == WSA_INVALID_EVENT || WSAEventSelect(sock, ev, FD_READ) != 0) {
+        if (ev != WSA_INVALID_EVENT)
+            WSACloseEvent(ev);
+        closesocket(sock);
+        return;
+    }
+    sock_ = sock;
+    sockEvent_ = ev;
+}
+
+void MdnsListener::Close()
+{
+    if (sock_ != INVALID_SOCKET)
+        closesocket(sock_);
+    sock_ = INVALID_SOCKET;
+    if (sockEvent_ != WSA_INVALID_EVENT)
+        WSACloseEvent(sockEvent_);
+    sockEvent_ = WSA_INVALID_EVENT;
+}
+
+MdnsListener::Event MdnsListener::Wait(HANDLE stop, HANDLE wake, std::vector<MdnsReceiver>& out)
+{
+    out.clear();
+    for (;;) {
+        HANDLE handles[4];
+        DWORD count = 0;
+        handles[count++] = stop;
+        handles[count++] = wake;
+        const DWORD addrIndex = addrArmed_ ? count : MAXDWORD;
+        if (addrArmed_)
+            handles[count++] = addrEvent_;
+        const DWORD sockIndex = sock_ != INVALID_SOCKET ? count : MAXDWORD;
+        if (sock_ != INVALID_SOCKET)
+            handles[count++] = sockEvent_;
+
+        const DWORD r = WaitForMultipleObjects(count, handles, FALSE, INFINITE);
+        if (r == WAIT_OBJECT_0 || r == WAIT_FAILED)
+            return Event::Stop;
+        if (r == WAIT_OBJECT_0 + 1)
+            return Event::Wake;
+        if (r == WAIT_OBJECT_0 + addrIndex) {
+            ArmAddrChange();
+            Open(); // rejoin the group on whatever interfaces exist now
+            return Event::NetworkChanged;
+        }
+        if (r == WAIT_OBJECT_0 + sockIndex) {
+            WSAResetEvent(sockEvent_);
+            std::map<std::string, MdnsReceiver> found;
+            uint8_t packet[9000];
+            for (;;) {
+                const int length = recv(sock_, reinterpret_cast<char*>(packet), sizeof(packet), 0);
+                if (length <= 0)
+                    break; // WSAEWOULDBLOCK: drained
+                ParseResponse(packet, static_cast<size_t>(length), found);
+            }
+            for (auto& entry : found)
+                if (!entry.second.address.empty())
+                    out.push_back(entry.second);
+            if (!out.empty())
+                return Event::Heard;
+        }
+    }
+}
+
 std::vector<MdnsReceiver> BrowseReceivers(int timeoutMs)
 {
     std::vector<uint8_t> query = BuildQuery();

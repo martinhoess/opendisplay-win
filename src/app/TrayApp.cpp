@@ -88,6 +88,9 @@ struct TrayContext {
     std::map<std::string, std::string> discoveredIdLabel; // TXT id -> label
     std::thread discovery;
     std::atomic<bool> discoveryRunning{false};
+    HANDLE discoveryStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);  // manual: quit
+    HANDLE discoveryWake = CreateEventW(nullptr, FALSE, FALSE, nullptr); // browse now
+    HWND hwnd = nullptr;
 };
 
 // One Nearby row = one Wi-Fi (mDNS) iPad candidate.
@@ -137,38 +140,54 @@ std::string ReceiverLabel(const MdnsReceiver& receiver)
     return host.empty() ? receiver.instance : host;
 }
 
+void MergeDiscovered(TrayContext* ctx, const std::vector<MdnsReceiver>& receivers)
+{
+    if (receivers.empty())
+        return;
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(ctx->discoveredMutex);
+        // Merged, not replaced: an iPad that is asleep doesn't answer, and
+        // dropping its name would make the menu flip back to a raw address.
+        for (const MdnsReceiver& receiver : receivers) {
+            const std::string label = ReceiverLabel(receiver);
+            std::string& name = ctx->discovered[receiver.address];
+            changed |= name != label;
+            name = label;
+            if (!receiver.id.empty()) {
+                std::string& addr = ctx->discoveredById[receiver.id];
+                changed |= addr != receiver.address;
+                addr = receiver.address;
+                ctx->discoveredIdLabel[receiver.id] = label;
+            }
+        }
+    }
+    if (changed && ctx->hwnd)
+        PostMessageW(ctx->hwnd, WM_APP_STATUS, 0, 0); // names show in the tooltip
+}
+
+// No query timer: one browse at start, then whatever the receivers announce
+// (they do on launch and on joining a network), a fresh browse when the
+// network changes, and one when the user opens the menu or Settings.
 void RunDiscovery(TrayContext* ctx)
 {
     constexpr int kBrowseMs = 800;
-    constexpr int kPauseMs = 60'000;
+    MergeDiscovered(ctx, BrowseReceivers(kBrowseMs));
 
+    MdnsListener listener;
+    std::vector<MdnsReceiver> heard;
     while (ctx->discoveryRunning) {
-        std::map<std::string, std::string> names;
-        std::map<std::string, std::string> byId;
-        std::map<std::string, std::string> idLabel;
-        for (const MdnsReceiver& receiver : BrowseReceivers(kBrowseMs)) {
-            const std::string label = ReceiverLabel(receiver);
-            names[receiver.address] = label;
-            if (!receiver.id.empty()) {
-                byId[receiver.id] = receiver.address;
-                idLabel[receiver.id] = label;
-            }
+        switch (listener.Wait(ctx->discoveryStop, ctx->discoveryWake, heard)) {
+            case MdnsListener::Event::Stop:
+                return;
+            case MdnsListener::Event::Heard:
+                MergeDiscovered(ctx, heard);
+                break;
+            case MdnsListener::Event::Wake:
+            case MdnsListener::Event::NetworkChanged:
+                MergeDiscovered(ctx, BrowseReceivers(kBrowseMs));
+                break;
         }
-
-        if (!names.empty() || !byId.empty()) {
-            std::lock_guard<std::mutex> lock(ctx->discoveredMutex);
-            // Merged, not replaced: an iPad that is asleep doesn't answer, and
-            // dropping its name would make the menu flip back to a raw address.
-            for (auto& name : names)
-                ctx->discovered[name.first] = name.second;
-            for (auto& entry : byId)
-                ctx->discoveredById[entry.first] = entry.second;
-            for (auto& entry : idLabel)
-                ctx->discoveredIdLabel[entry.first] = entry.second;
-        }
-
-        for (int waited = 0; waited < kPauseMs && ctx->discoveryRunning; waited += 250)
-            std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
 }
 
@@ -1082,6 +1101,7 @@ INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lPara
 
 void ShowContextMenu(HWND hwnd, TrayContext* ctx)
 {
+    SetEvent(ctx->discoveryWake); // refresh names in the background for next time
     HMENU menu = CreatePopupMenu();
 
     bool several = ctx->cfg.devices.size() > 1;
@@ -1117,6 +1137,7 @@ void OpenSettingsAndApply(HWND hwnd, TrayContext* ctx)
     // Senders write to the config at runtime (USB serial->id bindings); start
     // from the file, not the tray's copy from launch.
     ctx->cfg = Config::Load();
+    SetEvent(ctx->discoveryWake);
     std::vector<std::string> oldDevices = ctx->cfg.devices;
     std::vector<std::string> oldIds = ctx->cfg.deviceIds;
     uint16_t oldPort = ctx->cfg.port;
@@ -1393,6 +1414,7 @@ int RunTray(HINSTANCE hInstance)
     SenderApp::SetStatusWindow(hwnd, WM_APP_STATUS);
     PostMessageW(hwnd, WM_APP_STATUS, 0, 0); // first paint
 
+    ctx.hwnd = hwnd;
     ctx.discoveryRunning = true;
     ctx.discovery = std::thread([&ctx] { RunDiscovery(&ctx); });
 
@@ -1418,6 +1440,7 @@ int RunTray(HINSTANCE hInstance)
     }
 
     ctx.discoveryRunning = false;
+    SetEvent(ctx.discoveryStop);
     if (ctx.discovery.joinable())
         ctx.discovery.join();
 
