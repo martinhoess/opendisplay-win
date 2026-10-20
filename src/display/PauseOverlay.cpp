@@ -128,8 +128,8 @@ bool DrawOverlay(IWICImagingFactory* wic, IWICBitmap* bitmap, uint32_t width, ui
     // Toast layout: emoji on the left, title over subtitle beside it, both
     // left-aligned. The emoji's ink is ~85% of the two-line block's height
     // and centered on it; the whole group is centered with equal padding.
-    const float padX = titleSize * 1.5f;
-    const float padY = titleSize * 0.95f;
+    const float padX = titleSize * 0.75f;
+    const float padY = titleSize * 0.475f;
     const float gap = titleSize * 0.35f;      // title -> subtitle
     const float emojiGap = titleSize * 0.6f;  // emoji -> text
     const float textW = (std::max)(tm.width, sm.width);
@@ -161,7 +161,7 @@ bool DrawOverlay(IWICImagingFactory* wic, IWICBitmap* bitmap, uint32_t width, ui
     const float cardH = blockH + 2 * padY;
     const float left = std::round((w - cardW) / 2);
     const float top = std::round((h - cardH) / 2);
-    const float radius = titleSize * 0.8f;
+    const float radius = titleSize * 0.4f;
     const D2D1_ROUNDED_RECT card = D2D1::RoundedRect(D2D1::RectF(left, top, left + cardW, top + cardH), radius, radius);
 
     ComPtr<ID2D1SolidColorBrush> dim, shadow, fill, border, titleBrush, subBrush;
