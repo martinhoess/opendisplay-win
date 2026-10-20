@@ -1,5 +1,6 @@
 #include "app/PauseSignals.h"
 
+#include <tlhelp32.h>
 #include <wtsapi32.h>
 
 #include <algorithm>
@@ -71,6 +72,50 @@ InputDesktop CurrentInputDesktop()
     if (_wcsicmp(name, L"Winlogon") == 0)
         return InputDesktop::Secure;
     return InputDesktop::Other;
+}
+
+SessionLock QuerySessionLock()
+{
+    LPWSTR buffer = nullptr;
+    DWORD bytes = 0;
+    if (!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTSSessionInfoEx, &buffer,
+                                     &bytes) ||
+        !buffer)
+        return SessionLock::Unknown;
+    SessionLock state = SessionLock::Unknown;
+    if (bytes >= sizeof(WTSINFOEXW)) {
+        const auto* info = reinterpret_cast<const WTSINFOEXW*>(buffer);
+        if (info->Level == 1) {
+            const LONG flags = info->Data.WTSInfoExLevel1.SessionFlags;
+            if (flags == WTS_SESSIONSTATE_LOCK)
+                state = SessionLock::Locked;
+            else if (flags == WTS_SESSIONSTATE_UNLOCK)
+                state = SessionLock::Unlocked;
+        }
+    }
+    WTSFreeMemory(buffer);
+    return state;
+}
+
+bool IsConsentRunning()
+{
+    DWORD mySession = 0;
+    if (!ProcessIdToSessionId(GetCurrentProcessId(), &mySession))
+        return false;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+        return false;
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    bool found = false;
+    for (BOOL ok = Process32FirstW(snap, &pe); ok && !found; ok = Process32NextW(snap, &pe)) {
+        if (_wcsicmp(pe.szExeFile, L"consent.exe") != 0)
+            continue;
+        DWORD session = 0;
+        found = ProcessIdToSessionId(pe.th32ProcessID, &session) && session == mySession;
+    }
+    CloseHandle(snap);
+    return found;
 }
 
 bool IsSessionLocked()

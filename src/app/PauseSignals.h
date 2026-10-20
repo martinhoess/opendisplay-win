@@ -31,4 +31,11 @@ InputDesktop CurrentInputDesktop();
 // lock that happened before the tray started listening).
 bool IsSessionLocked();
 
+// WTSSessionInfoEx SessionFlags only: Locked, Unlocked, or Unknown (query failed).
+enum class SessionLock { Locked, Unlocked, Unknown };
+SessionLock QuerySessionLock();
+
+// consent.exe (the UAC prompt) is running in this session.
+bool IsConsentRunning();
+
 } // namespace od

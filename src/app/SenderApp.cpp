@@ -1264,18 +1264,25 @@ std::thread reader([&] {
         Clock::time_point lastResumeTry{};
         bool resumeFailLogged = false;
 
+        // Priority Locked > Admin > Asleep > Paused. Locked if ANY of: a WTS
+        // lock event with no unlock since, the session flags say locked, or
+        // the input desktop is not Default (Winlogon / not openable) with no
+        // UAC prompt running. Admin: not Default, consent.exe up, not locked.
         auto pauseReasonNow = [&](InputDesktop desk) {
-            // The lock event starts it; WTS session state decides while it lasts
-            // (also catches a lock the tray never heard about, or a missed unlock).
-            const bool lockEvent = PauseSignals::locked.load();
-            if ((lockEvent || desk != InputDesktop::Default) && IsSessionLocked())
+            const SessionLock wts = QuerySessionLock();
+            const bool onDefault = desk == InputDesktop::Default;
+            // An unlock we never heard about: WTS says unlocked and the normal
+            // desktop is back, so the lock event is stale.
+            if (PauseSignals::locked.load() && wts == SessionLock::Unlocked && onDefault)
+                PauseSignals::locked = false;
+            const bool consent = !onDefault && IsConsentRunning();
+            const bool locked = PauseSignals::locked.load() || wts == SessionLock::Locked || (!onDefault && !consent);
+            if (locked)
                 return PauseReason::Locked;
+            if (consent)
+                return PauseReason::Admin;
             if (PauseSignals::displayOff.load())
                 return PauseReason::Asleep;
-            if (desk == InputDesktop::Secure)
-                return PauseReason::Admin;
-            if (desk == InputDesktop::Other)
-                return PauseReason::Paused;
             return PauseReason::None;
         };
         // Overlay frame for `reason` from pauseBase, padded to the encoder size.
@@ -1320,7 +1327,8 @@ std::thread reader([&] {
             // desktop or a locked session hides the picture whatever `reason`
             // says, from the very first overlay frame.
             pauseHideDesktop = PauseHidesDesktop(reason) || fromSecure || PauseSignals::locked.load() ||
-                               CurrentInputDesktop() != InputDesktop::Default || IsSessionLocked();
+                               CurrentInputDesktop() != InputDesktop::Default ||
+                               QuerySessionLock() == SessionLock::Locked;
             pauseDropUntilKey = pauseHideDesktop;
             if (pauseHideDesktop) {
                 wipe(pauseBase);
@@ -1399,8 +1407,6 @@ std::thread reader([&] {
                 if (r != PauseReason::None) {
                     std::lock_guard<std::mutex> lock(pipelineMutex);
                     enterPause(r, false);
-                } else {
-                    PauseSignals::locked = false; // stale: WTS says unlocked
                 }
             }
             if (paused) {
