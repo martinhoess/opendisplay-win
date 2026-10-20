@@ -62,6 +62,8 @@ bool DetachMonitorFromDesktop(const std::wstring& deviceName);
 // in Display Settings. Generation increments on every stamp.
 void NoteSelfDisplayChange();
 bool RecentSelfDisplayChange(uint32_t withinMs);
+// Milliseconds since the last NoteSelfDisplayChange (UINT64_MAX if never).
+uint64_t MsSinceSelfDisplayChange();
 uint64_t SelfDisplayChangeGeneration();
 
 } // namespace od

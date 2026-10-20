@@ -1228,8 +1228,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 KillTimer(hwnd, kDisplayChangeTimerId);
                 // User layout change while the MTT head is attached: persist it
                 // instead of reverting. No-op if MTT is inactive/absent or the
-                // change was one of our own applies.
-                (void)SaveMttDisplayTopologyIfUserChange("display");
+                // change was one of our own applies. Inside the settle window
+                // after one of our applies, try once more when it has passed.
+                if (const uint32_t deferMs = MttTopologySaveDeferMs())
+                    SetTimer(hwnd, kDisplayChangeTimerId, deferMs, nullptr);
+                else
+                    (void)SaveMttDisplayTopologyIfUserChange("display");
             }
             return 0;
 

@@ -74,7 +74,6 @@ public:
 
     virtual void OnStreaming() {}              // pipeline up, session streaming
     virtual void OnLayoutMayHaveChanged() {}   // before a capture-driven rebuild
-    virtual void Poll() {}                     // capture loop, every ~2 s
     // lastClient: this was the last iPad on the head. userInitiated: tray
     // Disconnect / Quit (vs. link loss -> grace).
     virtual void OnSessionEnd(bool lastClient, bool userInitiated) { (void)lastClient; (void)userInitiated; }

@@ -1156,7 +1156,6 @@ std::thread reader([&] {
         std::chrono::steady_clock::time_point wrongSizeSince{};
         bool sizeRebuildDone = false;
         bool sizeGiveUpLogged = false;
-        std::chrono::steady_clock::time_point lastBackendPoll{};
         std::chrono::steady_clock::time_point waitFirstFrameSince{};
         bool firstFrameNudged = false;
         bool firstFrameWaitLogged = false;
@@ -1588,14 +1587,6 @@ std::thread reader([&] {
                 }
 
                 auto now = std::chrono::steady_clock::now();
-
-                // Backend housekeeping while streaming (MTT: persist the user's
-                // arrangement; DISPLAY index may change later).
-                if (lastBackendPoll == std::chrono::steady_clock::time_point{} ||
-                    now - lastBackendPoll > std::chrono::seconds(2)) {
-                    lastBackendPoll = now;
-                    backend->Poll();
-                }
 
                 // Only adopt rotation into session size from a real frame - not
                 // Open() ModeDesc, which can disagree with DXGI buffer orientation.
