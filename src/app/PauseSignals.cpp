@@ -10,6 +10,7 @@ namespace od {
 
 std::atomic<bool> PauseSignals::locked{false};
 std::atomic<bool> PauseSignals::displayOff{false};
+std::atomic<uint32_t> PauseSignals::displayChangeGen{0};
 
 HANDLE PauseSignals::WakeEvent()
 {

@@ -1257,6 +1257,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             return TRUE;
 
         case WM_DISPLAYCHANGE:
+            ++PauseSignals::displayChangeGen; // senders re-read the refresh rate
             SetTimer(hwnd, kDisplayChangeTimerId, kDisplayChangeDebounceMs, nullptr);
             return 0;
 

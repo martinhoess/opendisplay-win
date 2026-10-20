@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <atomic>
+#include <cstdint>
 
 namespace od {
 
@@ -12,6 +13,9 @@ namespace od {
 struct PauseSignals {
     static std::atomic<bool> locked;     // WTS_SESSION_LOCK seen, no unlock yet
     static std::atomic<bool> displayOff; // GUID_CONSOLE_DISPLAY_STATE == off
+    // Bumped on every WM_DISPLAYCHANGE (mode / refresh / topology): senders
+    // re-read what they derive from the display mode when it moves.
+    static std::atomic<uint32_t> displayChangeGen;
     // Auto-reset event, signalled on every change above, so a paused sender
     // wakes up at once instead of at its next check.
     static HANDLE WakeEvent();

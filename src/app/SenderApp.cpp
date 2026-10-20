@@ -424,8 +424,11 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
     EncodeMode sessionEncodeMode = EncodeMode::Dynamic;
     EncodePreset sessionEncodePreset = EncodePreset::Speed;
 
+    // Bumped on every (re)build - duplication rebuilt, mode may have changed.
+    std::atomic<uint32_t> pipelineGen{0};
     auto buildPipeline = [&](uint32_t width, uint32_t height, BuildReason reason = BuildReason::Hello) {
         // Caller holds pipelineMutex.
+        ++pipelineGen;
         dup.Close();
         if (!backend || !backend->Prepare(width, height, reason))
             return false;
@@ -1169,8 +1172,12 @@ std::thread reader([&] {
         uint32_t fpsLimit = 60;
         uint32_t fpsLimitGen = 0;
         uint32_t fpsLimitW = 0, fpsLimitH = 0;
+        // Head refresh, read at stream start and again only when something says
+        // it may have changed: a pipeline rebuild (ACCESS_LOST, mode change,
+        // pause resume, rotation) or a WM_DISPLAYCHANGE from the tray.
         uint32_t fpsLimitHz = backend->RefreshHz();
-        Clock::time_point fpsHzCheck = Clock::now();
+        uint32_t hzSeenPipelineGen = pipelineGen.load();
+        uint32_t hzSeenDisplayGen = PauseSignals::displayChangeGen.load();
         Clock::duration slot = std::chrono::microseconds(1'000'000 / 60);
         Clock::duration earlyWindow = slot / 4;
         Clock::time_point nextSlot{};
@@ -1250,10 +1257,12 @@ std::thread reader([&] {
             std::vector<EncodedFrame> encoded;
             int64_t capMs = 0;
             // Recompute the limit on a new hello, a new encoded raster or a
-            // new refresh rate on the head (polled once a second).
+            // new refresh rate on the head (re-read on rebuild / display change).
             bool hzChanged = false;
-            if (Clock::now() - fpsHzCheck > std::chrono::seconds(1)) {
-                fpsHzCheck = Clock::now();
+            if (pipelineGen.load() != hzSeenPipelineGen ||
+                PauseSignals::displayChangeGen.load() != hzSeenDisplayGen) {
+                hzSeenPipelineGen = pipelineGen.load();
+                hzSeenDisplayGen = PauseSignals::displayChangeGen.load();
                 const uint32_t hzNow = backend->RefreshHz();
                 hzChanged = hzNow != fpsLimitHz;
                 fpsLimitHz = hzNow;
