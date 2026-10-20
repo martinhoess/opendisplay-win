@@ -91,6 +91,13 @@ public:
         events_.clear();
     }
 
+    // Forget queued events (after a flush they refer to work that is gone).
+    void ClearPending()
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        events_.clear();
+    }
+
     // Next event type, waiting up to timeoutMs (0 = just check).
     bool Pop(MediaEventType& met, DWORD timeoutMs)
     {
@@ -1313,6 +1320,39 @@ std::vector<EncodedFrame> H264Encoder::EncodeDxgiNv12(ID3D11Texture2D* nv12)
     }
 
     return outFrames;
+}
+
+bool H264Encoder::FlushDiscard(int& readyDiscarded, int& keysDiscarded, int& inMftDiscarded)
+{
+    readyDiscarded = keysDiscarded = inMftDiscarded = 0;
+    if (!impl_->configured || !impl_->mft)
+        return true;
+    std::vector<EncodedFrame> gone;
+    if (impl_->isAsync)
+        impl_->DrainAvailableAsync(gone);
+    else
+        impl_->DrainSync(gone);
+    inMftDiscarded = impl_->isAsync ? impl_->inFlight : 0;
+    const HRESULT hr = impl_->mft->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+    if (impl_->isAsync && impl_->events)
+        impl_->events->ClearPending();
+    impl_->inFlight = 0;
+    impl_->pendingNeedInput = false;
+    // An async MFT asks for input again only after START_OF_STREAM.
+    impl_->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+    if (impl_->isAsync) {
+        // Anything that still comes out now predates the flush: discard too.
+        (void)impl_->WaitAsync(100, gone, [&] { return impl_->pendingNeedInput; });
+        if (!impl_->pendingNeedInput)
+            Logf("encoder", "flush: no NeedInput within 100 ms after restart\n");
+    }
+    readyDiscarded = static_cast<int>(gone.size());
+    for (const EncodedFrame& f : gone)
+        keysDiscarded += f.isKeyFrame ? 1 : 0;
+    RequestKeyFrame();
+    if (FAILED(hr))
+        Logf("encoder", "MFT_MESSAGE_COMMAND_FLUSH failed hr=0x%08lX\n", static_cast<unsigned long>(hr));
+    return SUCCEEDED(hr);
 }
 
 std::vector<EncodedFrame> H264Encoder::CollectPending()

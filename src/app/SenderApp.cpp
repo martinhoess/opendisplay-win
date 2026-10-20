@@ -1244,6 +1244,18 @@ std::thread reader([&] {
         // until resume, so Locked -> Paused never brings the picture back.
         bool pauseHideDesktop = false;
         bool pauseDropUntilKey = false;
+        int pauseDroppedAus = 0; // dropped in the pause loop before the blank IDR
+        // Encoder holds pre-lock frames: discard all of them (and nothing is
+        // queued on our side of the socket: SendFrame is synchronous).
+        auto flushForBlank = [&]() {
+            int ready = 0, keys = 0, inMft = 0;
+            const bool ok = encoder.FlushDiscard(ready, keys, inMft);
+            pauseDroppedAus = 0;
+            Logf(ip,
+                 "pause: encoder flushed%s - discarded %d finished AU(s) (%d keyframe) + %d in the MFT; send queue "
+                 "empty (synchronous sends)\n",
+                 ok ? "" : " (FLUSH refused, dropping until the blank IDR)", ready, keys, inMft);
+        };
         auto wipe = [](std::vector<uint8_t>& v) {
             std::fill(v.begin(), v.end(), uint8_t{0});
             std::vector<uint8_t>().swap(v);
@@ -1271,6 +1283,7 @@ std::thread reader([&] {
             if (PauseHidesDesktop(reason) && !pauseHideDesktop) {
                 pauseHideDesktop = true;
                 pauseDropUntilKey = true;
+                flushForBlank();
             }
             if (pauseHideDesktop) {
                 wipe(pauseBase);
@@ -1314,6 +1327,7 @@ std::thread reader([&] {
                 pauseBaseW = pauseBaseH = 0;
                 dup.DropLastFrame();
                 wipe(nv12); // last captured desktop (CPU path)
+                flushForBlank();
             } else if (!dup.LastFrameBgra(pauseBase, pauseBaseW, pauseBaseH)) {
                 pauseBase.clear();
             }
@@ -1455,8 +1469,12 @@ std::thread reader([&] {
                     // first: drop all up to the overlay's IDR.
                     auto key = std::find_if(encoded.begin(), encoded.end(),
                                             [](const EncodedFrame& f) { return f.isKeyFrame; });
-                    if (key != encoded.end())
+                    pauseDroppedAus += static_cast<int>(key - encoded.begin());
+                    if (key != encoded.end()) {
                         pauseDropUntilKey = false;
+                        Logf(ip, "pause: first frame out is the blank keyframe (%d earlier AU(s) dropped)\n",
+                             pauseDroppedAus);
+                    }
                     encoded.erase(encoded.begin(), key);
                 }
                 if (encoded.empty() && pauseEncodesDue == 0) {
