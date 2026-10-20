@@ -16,8 +16,8 @@ struct PauseSignals {
     // Bumped on every WM_DISPLAYCHANGE (mode / refresh / topology): senders
     // re-read what they derive from the display mode when it moves.
     static std::atomic<uint32_t> displayChangeGen;
-    // Auto-reset event, signalled on every change above, so a paused sender
-    // wakes up at once instead of at its next check.
+    // The calling thread's auto-reset wake event (created on first use);
+    // Notify() sets every thread's, so each paused sender wakes at once.
     static HANDLE WakeEvent();
     static void Notify();
 };

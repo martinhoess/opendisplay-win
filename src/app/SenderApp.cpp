@@ -1408,8 +1408,10 @@ std::thread reader([&] {
                         std::chrono::ceil<std::chrono::milliseconds>(lastSend + std::chrono::milliseconds(kKeepaliveMs) -
                                                                      Clock::now())
                             .count();
-                    // Short cap: the input desktop has no change notification.
-                    const DWORD waitMs = static_cast<DWORD>((std::max)(1LL, (std::min)(250LL, static_cast<long long>(untilKeepalive))));
+                    // Lock/unlock, display on/off and desktop switches (UAC
+                    // secure desktop) all set the wake event; otherwise only
+                    // the keepalive is due.
+                    const DWORD waitMs = static_cast<DWORD>((std::max)(1LL, static_cast<long long>(untilKeepalive)));
                     WaitForSingleObject(PauseSignals::WakeEvent(), waitMs);
                 }
             } else {

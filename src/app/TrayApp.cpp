@@ -64,6 +64,7 @@ constexpr GUID kConsoleDisplayState = {0x6fe69556, 0x704a, 0x47a0, {0x8f, 0x24, 
 struct TrayContext {
     HINSTANCE hInstance = nullptr;
     HPOWERNOTIFY displayStateNotify = nullptr; // GUID_CONSOLE_DISPLAY_STATE
+    HWINEVENTHOOK desktopSwitchHook = nullptr; // EVENT_SYSTEM_DESKTOPSWITCH
     // One sender per configured iPad, index-aligned with cfg.devices: each
     // drives its own virtual monitor, capture, encoder and input injection.
     // unique_ptr because SenderApp owns a thread and can't be moved.
@@ -1165,6 +1166,13 @@ void OpenSettingsAndApply(HWND hwnd, TrayContext* ctx)
         ApplyAndRestart(ctx);
 }
 
+// Input desktop switched (lock screen, UAC secure desktop, back to Default):
+// wake paused senders so they re-check at once.
+void CALLBACK OnDesktopSwitch(HWINEVENTHOOK, DWORD, HWND, LONG, LONG, DWORD, DWORD)
+{
+    PauseSignals::Notify();
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     auto* ctx = reinterpret_cast<TrayContext*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -1289,6 +1297,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case WM_DESTROY:
             SenderApp::SetStatusWindow(nullptr, 0);
             WTSUnRegisterSessionNotification(hwnd);
+            if (ctx->desktopSwitchHook) {
+                UnhookWinEvent(ctx->desktopSwitchHook);
+                ctx->desktopSwitchHook = nullptr;
+            }
             if (ctx->displayStateNotify) {
                 UnregisterPowerSettingNotification(ctx->displayStateNotify);
                 ctx->displayStateNotify = nullptr;
@@ -1359,6 +1371,11 @@ int RunTray(HINSTANCE hInstance)
         RegisterPowerSettingNotification(hwnd, &kConsoleDisplayState, DEVICE_NOTIFY_WINDOW_HANDLE);
     if (!ctx.displayStateNotify)
         Logf("pause", "RegisterPowerSettingNotification failed (%lu)\n", GetLastError());
+    // Out-of-context: delivered through this thread's message loop.
+    ctx.desktopSwitchHook = SetWinEventHook(EVENT_SYSTEM_DESKTOPSWITCH, EVENT_SYSTEM_DESKTOPSWITCH, nullptr,
+                                            OnDesktopSwitch, 0, 0, WINEVENT_OUTOFCONTEXT);
+    if (!ctx.desktopSwitchHook)
+        Logf("pause", "SetWinEventHook(DESKTOPSWITCH) failed (%lu)\n", GetLastError());
 
     ctx.iconGreen = MakeStatusIcon(RGB(40, 200, 80));
     ctx.iconRed = MakeStatusIcon(RGB(225, 65, 55));

@@ -2,7 +2,10 @@
 
 #include <wtsapi32.h>
 
+#include <algorithm>
 #include <cwchar>
+#include <mutex>
+#include <vector>
 
 #pragma comment(lib, "wtsapi32.lib")
 
@@ -12,15 +15,43 @@ std::atomic<bool> PauseSignals::locked{false};
 std::atomic<bool> PauseSignals::displayOff{false};
 std::atomic<uint32_t> PauseSignals::displayChangeGen{0};
 
+namespace {
+
+// One auto-reset event per waiting thread (one per sender), all set by
+// Notify(): a single shared auto-reset event would wake only one of several
+// paused senders.
+std::mutex g_wakeMutex;
+std::vector<HANDLE> g_wakeEvents;
+
+struct ThreadWake {
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    ThreadWake()
+    {
+        std::lock_guard<std::mutex> lock(g_wakeMutex);
+        if (event)
+            g_wakeEvents.push_back(event);
+    }
+    ~ThreadWake()
+    {
+        std::lock_guard<std::mutex> lock(g_wakeMutex);
+        g_wakeEvents.erase(std::remove(g_wakeEvents.begin(), g_wakeEvents.end(), event), g_wakeEvents.end());
+        if (event)
+            CloseHandle(event);
+    }
+};
+
+} // namespace
+
 HANDLE PauseSignals::WakeEvent()
 {
-    static HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    return event;
+    thread_local ThreadWake wake;
+    return wake.event;
 }
 
 void PauseSignals::Notify()
 {
-    if (HANDLE e = WakeEvent())
+    std::lock_guard<std::mutex> lock(g_wakeMutex);
+    for (HANDLE e : g_wakeEvents)
         SetEvent(e);
 }
 
