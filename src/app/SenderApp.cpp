@@ -1149,33 +1149,40 @@ std::thread reader([&] {
                 CloseHandle(timer);
         });
 
-        // Back to USB: on a Wi-Fi session, look for this iPad's cable every
-        // few seconds (strict match on the learned serial->id only). When it
-        // shows up, end this session; the reconnect prefers USB and MTT keeps
-        // its head through the link-loss grace, so the picture comes back on
-        // the same display.
+        // Back to USB: on a Wi-Fi session, re-check for this iPad's cable when
+        // usbmuxd reports an attach/detach (strict match on the learned
+        // serial->id only), once at start, and when a USB dial backoff ends.
+        // When it shows up, end this session; the reconnect prefers USB and
+        // MTT keeps its head through the link-loss grace, so the picture comes
+        // back on the same display.
         std::atomic<bool> movedToUsb{false};
         std::thread usbWatch;
         if (!usbSession && !configuredLoopback && usbAllowed && !knownId.empty()) {
             usbWatch = std::thread([&] {
-                int ticks = 0;
+                uint64_t seen = UsbMuxEventGeneration();
+                // Set before this session started; read-only while it runs.
+                const bool backoff = usbFailCount > 0 && std::chrono::steady_clock::now() < usbFailUntil;
+                bool check = !backoff;
                 while (!cursorStop && running && !stopRequested_) {
-                    Sleep(100);
-                    if (++ticks % 30 != 0 || state_ != State::Streaming)
-                        continue;
-                    UsbMuxDevice d;
-                    bool verify = false;
-                    // Set before this session started; read-only while it runs.
-                    if (usbFailCount > 0 && std::chrono::steady_clock::now() < usbFailUntil)
-                        continue;
-                    if (PickUsbForEntry(knownId, {}, true, d, verify)) {
-                        Logf(ip, "USB cable for this iPad is back (%s) - moving the session from Wi-Fi to USB\n",
-                             d.serial.c_str());
-                        movedToUsb = true;
-                        running = false;
-                        conn->Close(); // unblock the reader
-                        break;
+                    if (check && state_ == State::Streaming &&
+                        !(usbFailCount > 0 && std::chrono::steady_clock::now() < usbFailUntil)) {
+                        UsbMuxDevice d;
+                        bool verify = false;
+                        if (PickUsbForEntry(knownId, {}, true, d, verify)) {
+                            Logf(ip, "USB cable for this iPad is back (%s) - moving the session from Wi-Fi to USB\n",
+                                 d.serial.c_str());
+                            movedToUsb = true;
+                            running = false;
+                            conn->Close(); // unblock the reader
+                            break;
+                        }
                     }
+                    const auto deadline = (usbFailCount > 0 && std::chrono::steady_clock::now() < usbFailUntil)
+                                              ? usbFailUntil
+                                              : std::chrono::steady_clock::time_point::max();
+                    const uint64_t now = WaitUsbMuxEvent(seen, deadline);
+                    check = now != seen || std::chrono::steady_clock::now() >= deadline;
+                    seen = now;
                 }
             });
         }
@@ -1878,8 +1885,10 @@ std::thread reader([&] {
 
         cursorStop = true;
         cursorThread.join();
-        if (usbWatch.joinable())
+        if (usbWatch.joinable()) {
+            WakeUsbMuxWaiters(); // it blocks on attach/detach events
             usbWatch.join();
+        }
         conn->Close();
         reader.join();
         // After the reader is gone, so nothing else touches the injector.
