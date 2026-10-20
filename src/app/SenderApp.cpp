@@ -333,6 +333,32 @@ bool PickUsbForEntry(const std::string& expectedId, const std::string& skipSeria
 
 } // namespace
 
+namespace {
+std::atomic<HWND> g_statusHwnd{nullptr};
+std::atomic<UINT> g_statusMsg{0};
+std::atomic<bool> g_statusPosted{false};
+} // namespace
+
+void SenderApp::SetStatusWindow(void* hwnd, unsigned msg)
+{
+    g_statusMsg = msg;
+    g_statusHwnd = static_cast<HWND>(hwnd);
+}
+
+void SenderApp::StatusMessageHandled()
+{
+    g_statusPosted = false;
+}
+
+void SenderApp::NotifyStatus()
+{
+    const HWND hwnd = g_statusHwnd.load();
+    if (!hwnd || g_statusPosted.exchange(true))
+        return;
+    if (!PostMessageW(hwnd, g_statusMsg.load(), 0, 0))
+        g_statusPosted = false;
+}
+
 SenderApp::~SenderApp()
 {
     Stop();
@@ -365,8 +391,8 @@ void SenderApp::Stop()
 
     running_ = false;
     stopRequested_ = false;
-    state_ = State::Idle;
-    transport_ = Transport::None;
+    SetState(State::Idle);
+    SetTransport(Transport::None);
 }
 
 void SenderApp::RunBlocking(std::string ip, uint16_t port)
@@ -397,7 +423,7 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
     if (ipLock != nullptr && GetLastError() == ERROR_ALREADY_EXISTS) {
         Logf(ip, "another opendisplay-win is already connected to this iPad\n");
         CloseHandle(ipLock);
-        state_ = State::Idle;
+        SetState(State::Idle);
         return;
     }
 
@@ -566,7 +592,7 @@ while (!stopRequested_) {
         // alternate between "waiting for 2732x2048" and "connecting..." while
         // nothing about its situation changed.
         if (state_ != State::Blocked)
-            state_ = State::Connecting;
+            SetState(State::Connecting);
 
         // USB preferred while usbmux + a USB device are available.
         // usbWifiFailover (default ON) keeps today's behavior: if USB dial
@@ -585,12 +611,12 @@ while (!stopRequested_) {
                 if (state_ != State::DriverMissing)
                     Logf(ip, "display: %s - not connecting until it is installed or Settings change\n",
                          sel.problem.c_str());
-                state_ = State::DriverMissing;
+                SetState(State::DriverMissing);
                 InterruptibleSleep(kBlockedRetryMs);
                 continue;
             }
             if (state_ == State::DriverMissing)
-                state_ = State::Connecting;
+                SetState(State::Connecting);
             SetStatusDetail({});
             if (!backend || backend->Kind() != sel.kind) {
                 std::lock_guard<std::mutex> lock(pipelineMutex);
@@ -653,7 +679,7 @@ while (!stopRequested_) {
             continue;
         }
         ActiveConn activeConn(this, &*conn);
-        transport_ = usbSession ? Transport::Usb : Transport::Wifi;
+        SetTransport(usbSession ? Transport::Usb : Transport::Wifi);
         if (usbSession) {
             // Remember a successful USB session so a later cable-drop does not
             // silently move to Wi-Fi when the user turned failover off.
@@ -749,7 +775,8 @@ while (!stopRequested_) {
             blockedByHeight_ = activeHeight;
             blockedByApp_ = holder;
             blockedExclusive_ = exclusiveHead;
-            state_ = State::Blocked;
+            NotifyStatus(); // the holder may change while we stay Blocked
+            SetState(State::Blocked);
             // Once per episode, not on every check: this comes back every few
             // seconds for as long as the other iPad streams.
             if (!blockedLogged) {
@@ -811,7 +838,7 @@ while (!stopRequested_) {
 
         width_ = width;
         height_ = height;
-        state_ = State::Streaming;
+        SetState(State::Streaming);
         backend->OnStreaming();
 
         std::atomic<bool> running{true};
@@ -1252,6 +1279,7 @@ std::thread reader([&] {
                 pauseBase.clear();
             renderPauseFrame(reason);
             resumeFailLogged = false;
+            NotifyStatus();
             Logf(ip, "paused (%s): capture/encode stopped, connection kept, overlay %s\n", PauseReasonName(reason),
                  pauseNv12.empty() ? "unavailable" : "sent");
         };
@@ -1345,6 +1373,7 @@ std::thread reader([&] {
                             framePending = true; // encode the first capture at once
                             nextSlot = Clock::now();
                             encoder.RequestKeyFrame();
+                            NotifyStatus();
                             Logf(ip, "resumed after %s: duplication rebuilt, keyframe requested\n",
                                  PauseReasonName(pauseReason));
                             lastResumeTry = {};
@@ -1866,14 +1895,14 @@ std::thread reader([&] {
         backend->OnSessionEnd(lastClient, stopRequested_.load());
         width_ = 0;
         height_ = 0;
-        transport_ = Transport::None;
+        SetTransport(Transport::None);
         Logf(ip, "disconnected%s\n",
              stopRequested_ ? "" : (movedToUsb ? ", reconnecting over USB" : ", reconnecting"));
     }
 
     if (ipLock != nullptr)
         CloseHandle(ipLock);
-    state_ = State::Idle;
+    SetState(State::Idle);
 }
 
 } // namespace od

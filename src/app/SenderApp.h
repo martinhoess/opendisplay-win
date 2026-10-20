@@ -47,6 +47,12 @@ public:
     // (headless CLI). Does not return under normal operation.
     void RunBlocking(std::string ip, uint16_t port);
 
+    // Every sender posts `msg` (wParam/lParam 0) to `hwnd` whenever anything
+    // the tray shows changes: state, transport, wait reason, pause. Coalesced:
+    // at most one is in flight until the tray calls StatusMessageHandled().
+    static void SetStatusWindow(void* hwnd, unsigned msg); // HWND, UINT
+    static void StatusMessageHandled();
+
     bool IsRunning() const { return running_.load(); }
     State GetState() const { return state_.load(); }
     Transport GetTransport() const { return transport_.load(); }
@@ -74,9 +80,25 @@ private:
     void InterruptibleSleep(int ms);
     void SetStatusDetail(std::string detail)
     {
-        std::lock_guard<std::mutex> lock(detailMutex_);
-        statusDetail_ = std::move(detail);
+        {
+            std::lock_guard<std::mutex> lock(detailMutex_);
+            if (statusDetail_ == detail)
+                return;
+            statusDetail_ = std::move(detail);
+        }
+        NotifyStatus();
     }
+    void SetState(State s)
+    {
+        if (state_.exchange(s) != s)
+            NotifyStatus();
+    }
+    void SetTransport(Transport t)
+    {
+        if (transport_.exchange(t) != t)
+            NotifyStatus();
+    }
+    static void NotifyStatus();
 
     std::thread worker_;
     std::atomic<bool> running_{false};

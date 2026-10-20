@@ -31,8 +31,9 @@ namespace {
 constexpr UINT WM_APP_TRAY = WM_APP + 1;
 // Sender thread -> tray: show a balloon. lParam = heap std::wstring (deleted here).
 constexpr UINT WM_APP_NOTIFY = WM_APP + 2;
-constexpr UINT kStatusTimerId = 1;
-constexpr UINT kStatusTimerMs = 1000;
+// A sender's state / transport / wait reason / pause changed (or discovery
+// renamed an iPad): refresh icon, tooltip and balloons. No periodic timer.
+constexpr UINT WM_APP_STATUS = WM_APP + 3;
 // WM_DISPLAYCHANGE debounce: a Display Settings Apply fires several changes.
 constexpr UINT kDisplayChangeTimerId = 2;
 constexpr UINT kDisplayChangeDebounceMs = 1500;
@@ -1221,10 +1222,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             }
             return 0;
 
-        case WM_TIMER:
-            if (wParam == kStatusTimerId)
+        case WM_APP_STATUS:
+            SenderApp::StatusMessageHandled(); // before reading: a change during UpdateStatus posts again
+            if (ctx)
                 UpdateStatus(ctx);
-            else if (wParam == kDisplayChangeTimerId) {
+            return 0;
+
+        case WM_TIMER:
+            if (wParam == kDisplayChangeTimerId) {
                 KillTimer(hwnd, kDisplayChangeTimerId);
                 // User layout change while the MTT head is attached: persist it
                 // instead of reverting. No-op if MTT is inactive/absent or the
@@ -1274,7 +1279,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 // MTT head does not survive into the next session.
                 Logf("mtt", "session ending - tearing down\n");
                 BeginMttShutdown();
-                KillTimer(hwnd, kStatusTimerId);
                 KillTimer(hwnd, kDisplayChangeTimerId);
                 for (auto& app : ctx->apps)
                     app->Stop();
@@ -1283,13 +1287,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             return 0;
 
         case WM_DESTROY:
+            SenderApp::SetStatusWindow(nullptr, 0);
             WTSUnRegisterSessionNotification(hwnd);
             if (ctx->displayStateNotify) {
                 UnregisterPowerSettingNotification(ctx->displayStateNotify);
                 ctx->displayStateNotify = nullptr;
             }
             SetMttUserNotifier(nullptr);
-            KillTimer(hwnd, kStatusTimerId);
             KillTimer(hwnd, kDisplayChangeTimerId);
             Shell_NotifyIconW(NIM_DELETE, &ctx->nid);
             // Quit: block re-attach from any racing pipeline rebuild, stop the
@@ -1369,7 +1373,8 @@ int RunTray(HINSTANCE hInstance)
     wcsncpy_s(ctx.nid.szTip, L"OpenDisplay", _TRUNCATE);
     Shell_NotifyIconW(NIM_ADD, &ctx.nid);
 
-    SetTimer(hwnd, kStatusTimerId, kStatusTimerMs, nullptr);
+    SenderApp::SetStatusWindow(hwnd, WM_APP_STATUS);
+    PostMessageW(hwnd, WM_APP_STATUS, 0, 0); // first paint
 
     ctx.discoveryRunning = true;
     ctx.discovery = std::thread([&ctx] { RunDiscovery(&ctx); });
