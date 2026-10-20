@@ -1044,15 +1044,19 @@ std::thread reader([&] {
         std::thread cursorThread([&] {
             HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
                                                   TIMER_ALL_ACCESS);
+            // Refresh re-read only when the pipeline is rebuilt or the tray saw
+            // WM_DISPLAYCHANGE (same counters as the frame limiter).
             uint32_t hz = backend->RefreshHz();
-            auto lastHzCheck = std::chrono::steady_clock::now();
+            uint32_t seenPipelineGen = pipelineGen.load();
+            uint32_t seenDisplayGen = PauseSignals::displayChangeGen.load();
             bool haveLast = false;
             bool lastVisible = false;
             LONG lastX = 0, lastY = 0;
             while (!cursorStop && running && !stopRequested_) {
-                const auto now = std::chrono::steady_clock::now();
-                if (now - lastHzCheck > std::chrono::seconds(1)) {
-                    lastHzCheck = now;
+                if (pipelineGen.load() != seenPipelineGen ||
+                    PauseSignals::displayChangeGen.load() != seenDisplayGen) {
+                    seenPipelineGen = pipelineGen.load();
+                    seenDisplayGen = PauseSignals::displayChangeGen.load();
                     hz = backend->RefreshHz();
                 }
                 const uint32_t tickHz = (std::max)(30u, (std::min)(hz, 240u));
