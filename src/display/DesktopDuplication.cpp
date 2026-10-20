@@ -126,6 +126,13 @@ bool DesktopDuplication::LastFrameBgra(std::vector<uint8_t>& bgra, uint32_t& wid
     return ReadBackLastFrame(bgra, width, height);
 }
 
+void DesktopDuplication::DropLastFrame()
+{
+    std::fill(lostFrame_.begin(), lostFrame_.end(), uint8_t{0});
+    std::vector<uint8_t>().swap(lostFrame_);
+    lostFrameW_ = lostFrameH_ = 0;
+}
+
 bool DesktopDuplication::Open(const std::wstring& deviceName)
 {
     ComPtr<IDXGIFactory1> factory;

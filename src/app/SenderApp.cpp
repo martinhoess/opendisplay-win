@@ -1239,6 +1239,15 @@ std::thread reader([&] {
         std::vector<uint8_t> pauseBase;      // BGRA under the overlay
         uint32_t pauseBaseW = 0, pauseBaseH = 0;
         std::vector<uint8_t> pauseNv12;      // overlay at encoder size
+        // Locked / secure desktop: no desktop pixels in the overlay, no copy
+        // kept, and nothing encoded before the overlay IDR goes out. Sticky
+        // until resume, so Locked -> Paused never brings the picture back.
+        bool pauseHideDesktop = false;
+        bool pauseDropUntilKey = false;
+        auto wipe = [](std::vector<uint8_t>& v) {
+            std::fill(v.begin(), v.end(), uint8_t{0});
+            std::vector<uint8_t>().swap(v);
+        };
         int pauseEncodesDue = 0;             // overlay encodes owed right now
         Clock::time_point lastResumeTry{};
         bool resumeFailLogged = false;
@@ -1259,12 +1268,24 @@ std::thread reader([&] {
         };
         // Overlay frame for `reason` from pauseBase, padded to the encoder size.
         auto renderPauseFrame = [&](PauseReason reason) {
-            std::vector<uint8_t> img = pauseBase;
+            if (PauseHidesDesktop(reason) && !pauseHideDesktop) {
+                pauseHideDesktop = true;
+                pauseDropUntilKey = true;
+            }
+            if (pauseHideDesktop) {
+                wipe(pauseBase);
+                pauseBaseW = pauseBaseH = 0;
+                dup.DropLastFrame();
+            }
+            std::vector<uint8_t> img;
             uint32_t w = pauseBaseW, h = pauseBaseH;
-            if (img.empty() || w > encoder.Width() || h > encoder.Height()) {
+            if (pauseHideDesktop || pauseBase.empty() || w > encoder.Width() || h > encoder.Height()) {
                 w = encoder.Width();
                 h = encoder.Height();
-                img.assign(static_cast<size_t>(w) * h * 4, 0x30); // neutral dark gray
+                img.assign(static_cast<size_t>(w) * h * 4, 0);
+                FillPauseBackground(img.data(), w, h); // never the desktop
+            } else {
+                img = pauseBase;
             }
             if (!RenderPauseOverlay(img.data(), w, h, reason))
                 Logf(ip, "pause overlay draw failed - sending the dimmed-less picture\n");
@@ -1282,13 +1303,26 @@ std::thread reader([&] {
             cursorPaused = true;
             framePending = false;
             tailPending = false;
-            if (!dup.LastFrameBgra(pauseBase, pauseBaseW, pauseBaseH))
+            // Lock detection can trail the lock: a lock event, the secure
+            // desktop or a locked session hides the picture whatever `reason`
+            // says, from the very first overlay frame.
+            pauseHideDesktop = PauseHidesDesktop(reason) || fromSecure || PauseSignals::locked.load() ||
+                               CurrentInputDesktop() != InputDesktop::Default || IsSessionLocked();
+            pauseDropUntilKey = pauseHideDesktop;
+            if (pauseHideDesktop) {
+                wipe(pauseBase);
+                pauseBaseW = pauseBaseH = 0;
+                dup.DropLastFrame();
+                wipe(nv12); // last captured desktop (CPU path)
+            } else if (!dup.LastFrameBgra(pauseBase, pauseBaseW, pauseBaseH)) {
                 pauseBase.clear();
+            }
             renderPauseFrame(reason);
             resumeFailLogged = false;
             NotifyStatus();
-            Logf(ip, "paused (%s): capture/encode stopped, connection kept, overlay %s\n", PauseReasonName(reason),
-                 pauseNv12.empty() ? "unavailable" : "sent");
+            Logf(ip, "paused (%s): capture/encode stopped, connection kept, overlay %s%s\n", PauseReasonName(reason),
+                 pauseNv12.empty() ? "unavailable" : "sent",
+                 pauseHideDesktop ? " on blank background (desktop hidden, snapshot dropped)" : "");
         };
 
         while (running && !stopRequested_) {
@@ -1370,6 +1404,8 @@ std::thread reader([&] {
                         std::lock_guard<std::mutex> lock(pipelineMutex);
                         if (buildPipeline(width, height, BuildReason::CaptureRebuild)) {
                             paused = false;
+                            pauseHideDesktop = false;
+                            pauseDropUntilKey = false;
                             pauseFromSecureDesktop = false;
                             cursorPaused = false;
                             cursorForce = true;
@@ -1397,7 +1433,11 @@ std::thread reader([&] {
                     Logf(ip, "pause reason now %s\n", PauseReasonName(want));
                 }
                 if (nowP - lastSend >= std::chrono::milliseconds(kKeepaliveMs) && pauseEncodesDue == 0)
+                {
                     pauseEncodesDue = 1; // keepalive: the overlay again
+                    if (pauseDropUntilKey)
+                        encoder.RequestKeyFrame(); // the blank IDR has not made it out yet
+                }
                 {
                     std::lock_guard<std::mutex> lock(pipelineMutex);
                     if (pauseEncodesDue > 0 && !pauseNv12.empty()) {
@@ -1409,6 +1449,15 @@ std::thread reader([&] {
                         encoded = encoder.CollectPending();
                     }
                     cadenceAus += static_cast<uint32_t>(encoded.size());
+                }
+                if (pauseDropUntilKey) {
+                    // AUs still in the async MFT from desktop input come out
+                    // first: drop all up to the overlay's IDR.
+                    auto key = std::find_if(encoded.begin(), encoded.end(),
+                                            [](const EncodedFrame& f) { return f.isKeyFrame; });
+                    if (key != encoded.end())
+                        pauseDropUntilKey = false;
+                    encoded.erase(encoded.begin(), key);
                 }
                 if (encoded.empty() && pauseEncodesDue == 0) {
                     const auto untilKeepalive =

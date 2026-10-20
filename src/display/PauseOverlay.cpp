@@ -249,10 +249,37 @@ const char* PauseReasonName(PauseReason reason)
     }
 }
 
+bool PauseHidesDesktop(PauseReason reason)
+{
+    return reason == PauseReason::Locked || reason == PauseReason::Admin;
+}
+
+void FillPauseBackground(uint8_t* bgra, uint32_t width, uint32_t height)
+{
+    if (!bgra || width == 0 || height == 0)
+        return;
+    // #141416 at the top to #0c0c0e at the bottom: dark, matches the card.
+    for (uint32_t y = 0; y < height; ++y) {
+        const float t = height > 1 ? static_cast<float>(y) / (height - 1) : 0.0f;
+        const uint8_t g = static_cast<uint8_t>(std::lround(0x14 + (0x0c - 0x14) * t));
+        const uint8_t b = static_cast<uint8_t>(std::lround(0x16 + (0x0e - 0x16) * t));
+        uint8_t* row = bgra + static_cast<size_t>(y) * width * 4;
+        for (uint32_t x = 0; x < width; ++x) {
+            row[x * 4 + 0] = b;
+            row[x * 4 + 1] = g;
+            row[x * 4 + 2] = g;
+            row[x * 4 + 3] = 0xFF;
+        }
+    }
+}
+
 bool RenderPauseOverlay(uint8_t* bgra, uint32_t width, uint32_t height, PauseReason reason)
 {
     if (!bgra || width == 0 || height == 0)
         return false;
+    // Before anything that can fail: a failed draw must not leave the desktop.
+    if (PauseHidesDesktop(reason))
+        FillPauseBackground(bgra, width, height);
     ComScope com;
     ComPtr<IWICImagingFactory> wic;
     if (!CreateWicFactory(wic))

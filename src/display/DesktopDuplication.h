@@ -84,6 +84,8 @@ public:
     // ACCESS_LOST it is the copy taken just before the reopen (the old device's
     // textures are gone by then). False when nothing was captured yet.
     bool LastFrameBgra(std::vector<uint8_t>& bgra, uint32_t& width, uint32_t& height);
+    // Frees the ACCESS_LOST snapshot (locked / secure desktop: keep no copy).
+    void DropLastFrame();
 
 private:
     bool UpdatePointer(const DXGI_OUTDUPL_FRAME_INFO& info, bool* shapeChanged = nullptr);
