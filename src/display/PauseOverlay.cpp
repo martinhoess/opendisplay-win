@@ -21,18 +21,44 @@ namespace od {
 
 namespace {
 
-const wchar_t* ReasonText(PauseReason reason)
+const wchar_t* ReasonEmoji(PauseReason reason)
 {
     switch (reason) {
         case PauseReason::Locked:
-            return L"\U0001F512Locked";
+            return L"\U0001F512";
         case PauseReason::Asleep:
-            return L"\U0001F319Display asleep";
+            return L"\U0001F319";
         case PauseReason::Admin:
-            return L"\U0001F6E1\uFE0FWaiting for admin approval";
+            return L"\U0001F6E1\uFE0F";
         default:
-            return L"\u23F8\uFE0FPaused";
+            return L"\u23F8\uFE0F";
     }
+}
+
+const wchar_t* ReasonTitle(PauseReason reason)
+{
+    switch (reason) {
+        case PauseReason::Locked:
+            return L"Locked";
+        case PauseReason::Asleep:
+            return L"Display asleep";
+        case PauseReason::Admin:
+            return L"Waiting for admin approval";
+        default:
+            return L"Paused";
+    }
+}
+
+// Ink box of a single-line layout, relative to its origin.
+D2D1_RECT_F InkBox(IDWriteTextLayout* layout)
+{
+    DWRITE_TEXT_METRICS m{};
+    layout->GetMetrics(&m);
+    layout->SetMaxWidth(m.width);
+    layout->SetMaxHeight(m.height);
+    DWRITE_OVERHANG_METRICS o{};
+    layout->GetOverhangMetrics(&o);
+    return D2D1::RectF(m.left - o.left, m.top - o.top, m.left + m.width + o.right, m.top + m.height + o.bottom);
 }
 
 // COM for WIC on whatever thread calls in; balanced only when we initialised it.
@@ -85,7 +111,8 @@ bool DrawOverlay(IWICImagingFactory* wic, IWICBitmap* bitmap, uint32_t width, ui
     titleFmt->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
     subFmt->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
 
-    const wchar_t* title = ReasonText(reason);
+    const wchar_t* title = ReasonTitle(reason);
+    const wchar_t* emoji = ReasonEmoji(reason);
     const wchar_t* sub = reason == PauseReason::Locked   ? L"Unlock to continue"
                          : reason == PauseReason::Asleep ? L"Wake display to continue"
                          : reason == PauseReason::Admin  ? L"Approve to continue"
@@ -98,12 +125,40 @@ bool DrawOverlay(IWICImagingFactory* wic, IWICBitmap* bitmap, uint32_t width, ui
     titleLayout->GetMetrics(&tm);
     subLayout->GetMetrics(&sm);
 
+    // Toast layout: emoji on the left, title over subtitle beside it, both
+    // left-aligned. The emoji's ink is ~85% of the two-line block's height
+    // and centered on it; the whole group is centered with equal padding.
     const float padX = titleSize * 1.5f;
     const float padY = titleSize * 0.95f;
-    const float gap = titleSize * 0.35f;
-    const float contentW = (std::max)(tm.width, sm.width);
-    const float cardW = (std::min)(w * 0.9f, contentW + 2 * padX);
-    const float cardH = tm.height + gap + sm.height + 2 * padY;
+    const float gap = titleSize * 0.35f;      // title -> subtitle
+    const float emojiGap = titleSize * 0.6f;  // emoji -> text
+    const float textW = (std::max)(tm.width, sm.width);
+    const float blockH = tm.height + gap + sm.height;
+
+    // Size the emoji font from its ink at a reference size.
+    constexpr float kRefSize = 100.0f;
+    ComPtr<IDWriteTextFormat> emojiRefFmt;
+    ComPtr<IDWriteTextLayout> emojiLayout;
+    if (FAILED(dwrite->CreateTextFormat(L"Segoe UI Emoji", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                                        DWRITE_FONT_STRETCH_NORMAL, kRefSize, L"en-us", &emojiRefFmt)) ||
+        FAILED(dwrite->CreateTextLayout(emoji, static_cast<UINT32>(wcslen(emoji)), emojiRefFmt.Get(), w, h,
+                                        &emojiLayout)))
+        return false;
+    const D2D1_RECT_F refInk = InkBox(emojiLayout.Get());
+    const float refInkH = (std::max)(1.0f, refInk.bottom - refInk.top);
+    const float emojiSize = kRefSize * (blockH * 0.85f) / refInkH;
+    ComPtr<IDWriteTextFormat> emojiFmt;
+    emojiLayout.Reset();
+    if (FAILED(dwrite->CreateTextFormat(L"Segoe UI Emoji", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                                        DWRITE_FONT_STRETCH_NORMAL, emojiSize, L"en-us", &emojiFmt)) ||
+        FAILED(dwrite->CreateTextLayout(emoji, static_cast<UINT32>(wcslen(emoji)), emojiFmt.Get(), w, h, &emojiLayout)))
+        return false;
+    const D2D1_RECT_F ink = InkBox(emojiLayout.Get());
+    const float emojiW = ink.right - ink.left;
+    const float emojiH = ink.bottom - ink.top;
+
+    const float cardW = (std::min)(w * 0.9f, padX + emojiW + emojiGap + textW + padX);
+    const float cardH = blockH + 2 * padY;
     const float left = std::round((w - cardW) / 2);
     const float top = std::round((h - cardH) / 2);
     const float radius = titleSize * 0.8f;
@@ -136,12 +191,18 @@ bool DrawOverlay(IWICImagingFactory* wic, IWICBitmap* bitmap, uint32_t width, ui
     rt->FillRoundedRectangle(card, fill.Get());
     rt->DrawRoundedRectangle(card, border.Get(), (std::max)(1.0f, titleSize * 0.05f));
 
-    const float titleX = left + (cardW - tm.width) / 2 - tm.left;
-    const float titleY = top + padY - tm.top;
+    const float blockTop = top + padY;
+    const float emojiX = left + padX - ink.left;
+    const float emojiY = blockTop + (blockH - emojiH) / 2 - ink.top;
+    rt->DrawTextLayout(D2D1::Point2F(emojiX, emojiY), emojiLayout.Get(), titleBrush.Get(),
+                       D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+    const float textX = left + padX + emojiW + emojiGap;
+    const float titleX = textX - tm.left;
+    const float titleY = blockTop - tm.top;
     rt->DrawTextLayout(D2D1::Point2F(titleX, titleY), titleLayout.Get(), titleBrush.Get(),
                        D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
-    const float subX = left + (cardW - sm.width) / 2 - sm.left;
-    const float subY = top + padY + tm.height + gap - sm.top;
+    const float subX = textX - sm.left;
+    const float subY = blockTop + tm.height + gap - sm.top;
     rt->DrawTextLayout(D2D1::Point2F(subX, subY), subLayout.Get(), subBrush.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
     return SUCCEEDED(rt->EndDraw());
 }
