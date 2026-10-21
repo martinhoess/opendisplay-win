@@ -38,7 +38,16 @@ public:
     // running (Stop first to retarget).
     // entryId: the iPad's Bonjour TXT id from Settings (may be empty). Used to
     // pick this iPad's USB cable when several are plugged in.
-    void Start(std::string ip, uint16_t port, std::string entryId = {});
+    // idFollowsHello: a typed-in address; the id of the iPad whose Wi-Fi hello
+    // answers there becomes the entry's id (EntryId(), status is notified).
+    void Start(std::string ip, uint16_t port, std::string entryId = {}, bool idFollowsHello = false);
+
+    // The entry's id: as started, or as learned from a Wi-Fi hello.
+    std::string EntryId() const
+    {
+        std::lock_guard<std::mutex> lock(idMutex_);
+        return entryId_;
+    }
 
     // Signal stop and join the worker. Safe to call when not running.
     void Stop();
@@ -111,7 +120,9 @@ private:
     std::atomic<const void*> blockedByApp_{nullptr};
     std::atomic<bool> blockedExclusive_{false};
     std::atomic<uint32_t> blockedByHeight_{0};
-    std::string entryId_; // set in Start before the worker runs
+    mutable std::mutex idMutex_;
+    std::string entryId_; // set in Start; the worker may learn it from a hello
+    bool idFollowsHello_ = false; // set in Start before the worker runs
     mutable std::mutex detailMutex_;
     std::string statusDetail_;
 

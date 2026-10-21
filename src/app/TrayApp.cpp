@@ -417,6 +417,33 @@ std::string EntryId(const TrayContext* ctx, size_t index)
     return index < ctx->cfg.deviceIds.size() ? ctx->cfg.deviceIds[index] : std::string{};
 }
 
+// Ids the senders learned from a Wi-Fi hello at a typed-in address: saved
+// once per change, so USB and the next start match on them.
+void SaveLearnedIds(TrayContext* ctx)
+{
+    Config& cfg = ctx->cfg;
+    cfg.deviceIds.resize(cfg.devices.size());
+    cfg.deviceIdFromHello.resize(cfg.devices.size());
+    bool changed = false;
+    for (size_t i = 0; i < ctx->apps.size() && i < cfg.devices.size(); ++i) {
+        if (!cfg.IdFollowsHello(i))
+            continue;
+        const std::string id = ctx->apps[i]->EntryId();
+        if (id.empty() || id == cfg.deviceIds[i])
+            continue;
+        cfg.deviceIds[i] = id;
+        cfg.deviceIdFromHello[i] = "1";
+        changed = true;
+    }
+    if (!changed)
+        return;
+    // Senders write USB bindings to the file: keep those, not the tray's copy.
+    const Config onDisk = Config::Load();
+    cfg.usbLinkSerials = onDisk.usbLinkSerials;
+    cfg.usbLinkIds = onDisk.usbLinkIds;
+    cfg.Save();
+}
+
 std::wstring DeviceLabel(const TrayContext* ctx, size_t index)
 {
     DeviceEntry entry = SplitDevice(ctx->cfg.devices[index]);
@@ -573,7 +600,7 @@ void ApplyAndRestart(TrayContext* ctx)
 {
     RebuildSenders(ctx);
     for (size_t i = 0; i < ctx->apps.size(); ++i)
-        ctx->apps[i]->Start(ResolveDeviceAddress(ctx, i), ctx->cfg.port, EntryId(ctx, i));
+        ctx->apps[i]->Start(ResolveDeviceAddress(ctx, i), ctx->cfg.port, EntryId(ctx, i), ctx->cfg.IdFollowsHello(i));
     UpdateStatus(ctx);
 }
 
@@ -1064,14 +1091,32 @@ INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lPara
                 ReadDevicesEdit(dlg, state);
                 PruneUsbOnlyPlaceholders(state->devices, &state->pendingIds);
 
+                // Hello-learned ids stay hello-learned while the address and
+                // id are unchanged (also ones learned while this was open).
+                std::map<std::string, std::string> learned; // address -> id
+                cfg->deviceIds.resize(cfg->devices.size());
+                cfg->deviceIdFromHello.resize(cfg->devices.size());
+                for (size_t i = 0; i < cfg->devices.size(); ++i)
+                    if (cfg->deviceIdFromHello[i] == "1" && !cfg->deviceIds[i].empty())
+                        learned[SplitDevice(cfg->devices[i]).address] = cfg->deviceIds[i];
+
                 cfg->devices = state->devices;
                 std::vector<std::string> ids;
+                std::vector<std::string> fromHello;
                 ids.reserve(cfg->devices.size());
+                fromHello.reserve(cfg->devices.size());
                 for (const std::string& device : cfg->devices) {
-                    auto it = state->pendingIds.find(SplitDevice(device).address);
-                    ids.push_back(it != state->pendingIds.end() ? it->second : std::string{});
+                    const std::string address = SplitDevice(device).address;
+                    auto it = state->pendingIds.find(address);
+                    std::string id = it != state->pendingIds.end() ? it->second : std::string{};
+                    auto was = learned.find(address);
+                    if (id.empty() && was != learned.end())
+                        id = was->second;
+                    fromHello.push_back(was != learned.end() && was->second == id ? "1" : "");
+                    ids.push_back(std::move(id));
                 }
                 cfg->deviceIds = std::move(ids);
+                cfg->deviceIdFromHello = std::move(fromHello);
 
                 BOOL ok = FALSE;
                 UINT port = GetDlgItemInt(dlg, IDC_PORT, &ok, FALSE);
@@ -1226,7 +1271,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 if (app.IsRunning())
                     app.Stop();
                 else
-                    app.Start(ResolveDeviceAddress(ctx, index), ctx->cfg.port, EntryId(ctx, index));
+                    app.Start(ResolveDeviceAddress(ctx, index), ctx->cfg.port, EntryId(ctx, index), ctx->cfg.IdFollowsHello(index));
                 UpdateStatus(ctx);
                 return 0;
             }
@@ -1234,7 +1279,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             switch (LOWORD(wParam)) {
                 case IDM_CONNECT:
                     for (size_t i = 0; i < ctx->apps.size(); ++i)
-                        ctx->apps[i]->Start(ResolveDeviceAddress(ctx, i), ctx->cfg.port, EntryId(ctx, i));
+                        ctx->apps[i]->Start(ResolveDeviceAddress(ctx, i), ctx->cfg.port, EntryId(ctx, i), ctx->cfg.IdFollowsHello(i));
                     UpdateStatus(ctx);
                     return 0;
                 case IDM_DISCONNECT:
@@ -1253,8 +1298,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
         case WM_APP_STATUS:
             SenderApp::StatusMessageHandled(); // before reading: a change during UpdateStatus posts again
-            if (ctx)
+            if (ctx) {
+                SaveLearnedIds(ctx);
                 UpdateStatus(ctx);
+            }
             return 0;
 
         case WM_TIMER:
@@ -1430,7 +1477,7 @@ int RunTray(HINSTANCE hInstance)
 
     if (ctx.cfg.autoReconnect)
         for (size_t i = 0; i < ctx.apps.size(); ++i)
-            ctx.apps[i]->Start(ResolveDeviceAddress(&ctx, i), ctx.cfg.port, EntryId(&ctx, i));
+            ctx.apps[i]->Start(ResolveDeviceAddress(&ctx, i), ctx.cfg.port, EntryId(&ctx, i), ctx.cfg.IdFollowsHello(i));
     UpdateStatus(&ctx);
 
     MSG msg;

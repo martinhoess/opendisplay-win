@@ -364,11 +364,15 @@ SenderApp::~SenderApp()
     Stop();
 }
 
-void SenderApp::Start(std::string ip, uint16_t port, std::string entryId)
+void SenderApp::Start(std::string ip, uint16_t port, std::string entryId, bool idFollowsHello)
 {
     if (running_.exchange(true))
         return; // already running
-    entryId_ = std::move(entryId);
+    {
+        std::lock_guard<std::mutex> lock(idMutex_);
+        entryId_ = std::move(entryId);
+    }
+    idFollowsHello_ = idFollowsHello;
 
     stopRequested_ = false;
     worker_ = std::thread([this, ip = std::move(ip), port] { RunLoop(ip, port); });
@@ -564,15 +568,16 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
     bool blockedLogged = false; // the wait message belongs in the log once, not every retry
     int noHelloFailures = 0;    // consecutive links that closed before a hello (backoff)
     // USB matching (see PickUsbForEntry): the id this entry's iPad presents.
-    std::string knownId = entryId_;
+    std::string knownId = EntryId();
     bool forceWifiOnce = false;           // last USB pick was the wrong iPad
     std::string rejectedSerial;           // ... and is skipped for a minute
     std::chrono::steady_clock::time_point rejectedSerialUntil{};
 
     bool stickToUsbAfterSession = false;
     // An entry without an id (typed-in IP) is Wi-Fi only: whatever iPad is on
-    // the cable is not necessarily the one at that address.
-    const bool usbAllowed = !entryId_.empty();
+    // the cable is not necessarily the one at that address. Its first Wi-Fi
+    // hello gives it one (below), and USB matches on that id from then on.
+    bool usbAllowed = !knownId.empty();
     // USB dial/hello failures on this iPad's cable: the connect path and
     // Back-to-USB skip USB until the backoff runs out, so a cable whose app is
     // not listening does not bounce the Wi-Fi session every few seconds.
@@ -741,8 +746,24 @@ while (!stopRequested_) {
             forceWifiOnce = true;
             continue;
         }
-        if (entryId_.empty() && !hello.id.empty())
+        if (idFollowsHello_ && !usbSession && !hello.id.empty() && hello.id != knownId) {
+            // Typed-in address: the iPad answering there over Wi-Fi is this
+            // entry's iPad. The tray saves the id on the status message.
+            if (knownId.empty())
+                Logf(ip, "learned id %s for this entry from its Wi-Fi hello\n", hello.id.c_str());
+            else
+                Logf(ip, "id changed for this entry: %s (was %s) - another iPad has this address\n",
+                     hello.id.c_str(), knownId.c_str());
+            knownId = hello.id;
+            usbAllowed = true;
+            {
+                std::lock_guard<std::mutex> lock(idMutex_);
+                entryId_ = hello.id;
+            }
+            NotifyStatus();
+        } else if (EntryId().empty() && !hello.id.empty()) {
             knownId = hello.id; // no TXT id configured: follow the iPad we actually reached
+        }
 
         // Version handshake (receiver protocol 3+): the iPad only sends
         // `pencil`/`proximity` to a peer that announced protocol >= 3 —

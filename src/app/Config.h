@@ -19,6 +19,11 @@ struct Config {
     // Parallel to devices: mDNS TXT id= when known (empty if added by hand).
     // Lets us re-find an iPad after its Wi-Fi address changes.
     std::vector<std::string> deviceIds;
+    // Parallel to devices: "1" when the id was learned from the Wi-Fi hello at
+    // a typed-in address. Such an entry stays keyed by its address: a hello
+    // there with another id replaces it (the router gave the IP to another
+    // iPad). Ids from Nearby (mDNS) are never replaced this way.
+    std::vector<std::string> deviceIdFromHello;
 
     // Learned USB serial <-> hello.id bindings (parallel arrays). USB serial is
     // known at plug; TXT id arrives in hello. Used to merge Nearby rows when
@@ -51,6 +56,14 @@ struct Config {
     std::string usbEncodePreset = "speed";     // "speed" | "balanced" | "quality"
     std::string wifiEncodeMode = "dynamic";
     std::string wifiEncodePreset = "speed";
+
+    // Entry `index` takes its id from the Wi-Fi hello: no id yet (typed-in
+    // address) or one learned that way.
+    bool IdFollowsHello(size_t index) const
+    {
+        return index >= deviceIds.size() || deviceIds[index].empty() ||
+               (index < deviceIdFromHello.size() && deviceIdFromHello[index] == "1");
+    }
 
     // Loads the saved config; returns defaults if the file is missing/invalid.
     static Config Load();
