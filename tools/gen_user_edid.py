@@ -11,7 +11,7 @@ across reconnects and iPads. CustomEdid=true loads the file from
 C:\\VirtualDisplayDriver\\.
 
 Usage:
-  python tools/gen_user_edid.py                    # 2360x1640 -> assets/mtt/user_edid.bin (shipped fallback)
+  python tools/gen_user_edid.py                    # 2360x1640 (11" default) -> user_edid.bin
   python tools/gen_user_edid.py --size 2752x2064   # modes for that hello size
   python tools/gen_user_edid.py --size WxH -o x.bin
   python tools/gen_user_edid.py --size WxH --modes # print the mode list only
@@ -28,7 +28,7 @@ Mode rule (landscape, 16-px floor aligned, all @ 60 Hz, max 4 DTDs):
   3. 3/4 of native
   4. 1/2 of native
   Unused DTD slots carry a monitor-name ("OpenDisplay") / dummy descriptor.
-  2360x1640 -> 2352x1632, 2384x1664, 1760x1216, 1168x816 (the shipped file).
+  2360x1640 -> 2352x1632, 2384x1664, 1760x1216, 1168x816 (the 11" default).
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ SERIAL = 0x4F445731  # "ODW1" as ASCII in LE serial field
 WEEK = 1
 YEAR = 2026  # stored as year - 1990
 
-DEFAULT_SIZE = (2360, 1640)  # shipped fallback: 11" class
+DEFAULT_SIZE = (2360, 1640)  # fallback when no hello size is known: 11" class
 REFRESH = 60
 MAX_DIM = 4095  # EDID DTD 12-bit active fields
 
@@ -63,7 +63,7 @@ IPAD_PANELS = [
 ]
 
 # Physical size scale: 2352 px -> 225 mm (~265 ppi, iPad-class). Keeps the
-# shipped 11" file's 225x156 mm.
+# 11" default at 225x156 mm.
 MM_NUM = 225
 MM_DEN = 2352
 
@@ -306,8 +306,7 @@ def main() -> int:
         return 0
     out = args.output
     if out is None:
-        root = Path(__file__).resolve().parents[1]
-        out = root / "assets" / "mtt" / "user_edid.bin"
+        out = Path("user_edid.bin")
     out.parent.mkdir(parents=True, exist_ok=True)
     data = build_edid(modes)
     out.write_bytes(data)

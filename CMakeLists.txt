@@ -112,13 +112,5 @@ target_link_libraries(mft_encoder_probe PRIVATE
 # Console subsystem so printf is visible when run from a terminal.
 set_target_properties(mft_encoder_probe PROPERTIES WIN32_EXECUTABLE FALSE)
 
-# Ship MTT CustomEdid binary next to the exe (EnsureCustomEdid looks here first).
-add_custom_command(TARGET opendisplay-win POST_BUILD
-  COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:opendisplay-win>/assets/mtt"
-  COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-          "${CMAKE_SOURCE_DIR}/assets/mtt/user_edid.bin"
-          "$<TARGET_FILE_DIR:opendisplay-win>/assets/mtt/user_edid.bin"
-  COMMENT "Copy MTT user_edid.bin next to opendisplay-win"
-)
 
 

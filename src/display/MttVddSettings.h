@@ -18,8 +18,8 @@ namespace od {
 // <resolutions> (stock MTT still feeds IddCx QueryTargetModes from XML).
 // Writing the live path + reloading MttVDD needs admin; the self-elevating
 // --ensure-mtt-edid WxH one-shot covers that, and only runs when the bytes
-// actually change. The shipped assets/mtt/user_edid.bin (11" default) is the
-// fallback when no hello size is known.
+// actually change. When no hello size is known, the EDID for the 11" default
+// size (2360x1640) is the fallback.
 
 struct MttMode {
     uint32_t width = 0;
@@ -52,15 +52,14 @@ std::vector<MttMode> MttModesForHello(uint32_t helloW, uint32_t helloH);
 // invalid input.
 std::vector<uint8_t> BuildMttEdid(const std::vector<MttMode>& modes);
 
-// Shipped fallback list (= MttModesForHello(2360, 1640), the modes baked into
-// assets/mtt/user_edid.bin).
+// Fallback list when no hello size is known (= MttModesForHello(2360, 1640)).
 std::vector<MttMode> BakedMttModes();
 
 // Modes the driver currently offers (live XML <resolutions>, preferred first);
 // BakedMttModes when unreadable. Used to validate a saved mode.
 std::vector<MttMode> CurrentMttModes();
 
-// Install/refresh C:\VirtualDisplayDriver\user_edid.bin from the shipped asset,
+// Install/refresh C:\VirtualDisplayDriver\user_edid.bin with the 11" default EDID,
 // set CustomEdid=true + PreventSpoof=true, mirror BakedMttModes into XML
 // <resolutions>, reload MttVDD. Idempotent when already current.
 MttEnsureResult EnsureCustomEdid();
@@ -78,7 +77,7 @@ MttEnsureResult EnsureResolutions(const std::vector<MttMode>& wanted);
 // this hello size; if bytes / flags / XML modes differ from what is installed,
 // show the one-time notice and self-elevate to write + reload MttVDD. No
 // change -> no UAC, no reload. UAC declined / failure -> log, keep the
-// installed EDID (shipped fallback if none), return false; never blocks the
+// installed EDID (11" default if none), return false; never blocks the
 // connection.
 // cancel (optional, e.g. the sender's stop flag) abandons an open UAC prompt /
 // running helper so Disconnect / Quit never hang; the helper is bounded and

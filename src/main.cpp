@@ -190,8 +190,7 @@ int main(int argc, char** argv)
     if ((argc >= 2 && std::string(argv[1]) == "--ensure-mtt-edid") ||
                (argc >= 2 && std::string(argv[1]) == "--ensure-mtt-resolutions")) {
         // Elevated one-off (RunElevatedSelf): with a hello size WxH, generate
-        // that iPad's EDID + XML modes; without, install the shipped
-        // user_edid.bin. Sets CustomEdid/PreventSpoof, reloads MttVDD only if
+        // that iPad's EDID + XML modes; without, the 11" default EDID. Sets CustomEdid/PreventSpoof, reloads MttVDD only if
         // something changed.
         uint32_t helloW = 0, helloH = 0;
         od::MttEnsureResult r = ParseHelloSizeArgs(argc, argv, 2, helloW, helloH)

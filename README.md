@@ -271,10 +271,7 @@ cmake --build build --config Release
 ```
 
 The result is `build\Release\opendisplay-win.exe`, statically linked against
-the CRT, the same single-file binary the releases ship. The build also copies
-`assets\mtt\user_edid.bin` next to it: a fallback EDID for MTT, used only when
-nothing is installed under `C:\VirtualDisplayDriver` yet and the admin prompt
-was declined.
+the CRT, the same single-file binary the releases ship.
 
 ## Run
 
@@ -366,7 +363,7 @@ sender against each. Both senders must end up on **different** `\\.\DISPLAYn`
 monitors; the `claimed virtual monitor` line in the log says which.
 
 `tools/gen_user_edid.py` is the reference generator for the MTT EDID; see
-[assets/mtt/README.md](assets/mtt/README.md).
+[tools/gen_user_edid.md](tools/gen_user_edid.md).
 
 ## License
 

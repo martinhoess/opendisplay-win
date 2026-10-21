@@ -11,9 +11,9 @@ admin once (`--ensure-mtt-edid WxH`) to write them and reload MttVDD. The same
 iPad reconnecting is a no-op (no prompt, no reload). If the prompt is declined
 the session still connects with whatever EDID is installed.
 
-This file is the **shipped fallback** (11" default, hello 2360x1640), copied
-next to the exe by the post-build step and used when no hello size is known or
-nothing is installed yet.
+When no hello size is known and nothing is installed yet, the app generates
+the EDID for the 11" default (hello 2360x1640) the same way. No EDID file
+ships with the app.
 
 ## Identity (stable - do not randomize)
 - Manufacturer: MTT
@@ -30,14 +30,14 @@ saved arrangement still applies.
 4. 1/2 of native
 
 Unused DTD slots carry a monitor-name ("OpenDisplay") / dummy descriptor.
-For 2360x1640 this gives the shipped file: 2352x1632, 2384x1664, 1760x1216, 1168x816.
+For the 11" default 2360x1640 this gives 2352x1632, 2384x1664, 1760x1216, 1168x816.
 
 ## Generate / check
 ```
-python tools/gen_user_edid.py                      # shipped fallback -> assets/mtt/user_edid.bin
+python tools/gen_user_edid.py                      # 11" default -> user_edid.bin
 python tools/gen_user_edid.py --size 2752x2064 -o x.bin
 python tools/gen_user_edid.py --size 2752x2064 --modes
-python tools/gen_user_edid.py --decode assets/mtt/user_edid.bin
+python tools/gen_user_edid.py --decode user_edid.bin
 ```
 The Python generator is the reference implementation; the app's bytes must
 match it. To compare: `opendisplay-win --dump-mtt-edid WxH out.bin`.

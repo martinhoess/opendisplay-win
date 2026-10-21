@@ -777,33 +777,6 @@ bool FilesEqual(const std::wstring& a, const std::wstring& b)
     return ba == bb;
 }
 
-std::wstring ExeDirW()
-{
-    wchar_t exe[MAX_PATH];
-    if (GetModuleFileNameW(nullptr, exe, MAX_PATH) == 0)
-        return {};
-    std::wstring p(exe);
-    const size_t slash = p.find_last_of(L"\\/");
-    if (slash == std::wstring::npos)
-        return {};
-    return p.substr(0, slash);
-}
-
-std::wstring FindShippedUserEdid()
-{
-    const std::wstring exeDir = ExeDirW();
-    const std::wstring candidates[] = {
-        exeDir + L"\\assets\\mtt\\user_edid.bin",
-        exeDir + L"\\user_edid.bin",
-        kLiveEdidPath,
-    };
-    for (const std::wstring& c : candidates) {
-        if (!c.empty() && FileExists(c.c_str()))
-            return c;
-    }
-    return {};
-}
-
 
 bool ParseOptionBool(const std::string& xml, const char* tag, bool& out)
 {
@@ -847,7 +820,6 @@ std::string SetOptionBoolXml(const std::string& xml, const char* tag, bool value
     out.replace(start, b - start, value ? "true" : "false");
     return out;
 }
-
 
 
 // ---- MTT topology policy state ------------------------------------------
@@ -1084,12 +1056,12 @@ bool PersistActiveTopologyToDatabase(std::string& detail)
 
 // ---- Runtime EDID: single source of MTT modes ----------------------------
 // MttModesForHello is the ONE place the MTT mode list comes from: EDID DTDs,
-// XML <resolutions>, attach defaults and BakedMttModes (shipped fallback) all
+// XML <resolutions>, attach defaults and BakedMttModes (11" fallback) all
 // derive from it. tools/gen_user_edid.py (modes_for_size / build_edid) is the
 // byte-identical reference implementation - keep them in lockstep.
 namespace {
 
-constexpr uint32_t kDefaultHelloW = 2360; // shipped fallback (11" class)
+constexpr uint32_t kDefaultHelloW = 2360; // fallback when no hello size is known (11" class)
 constexpr uint32_t kDefaultHelloH = 1640;
 constexpr uint32_t kMttRefresh = 60;
 constexpr uint32_t kEdidMaxDim = 4095; // DTD 12-bit active fields
@@ -1110,7 +1082,7 @@ constexpr IpadPanel kIpadPanels[] = {
     {2048, 1536}, // 9.7" / older
 };
 
-// Physical size: 2352 px -> 225 mm (~265 ppi). Keeps the shipped 225x156 mm.
+// Physical size: 2352 px -> 225 mm (~265 ppi). Keeps the 11" fallback at 225x156 mm.
 constexpr uint32_t kMmNum = 225;
 constexpr uint32_t kMmDen = 2352;
 
@@ -1378,7 +1350,7 @@ std::vector<uint8_t> BuildMttEdid(const std::vector<MttMode>& modes)
 
 std::vector<MttMode> BakedMttModes()
 {
-    // Shipped fallback (assets/mtt/user_edid.bin) = the 11" default hello size.
+    // Fallback when no hello size is known: the 11" default.
     return MttModesForHello(kDefaultHelloW, kDefaultHelloH);
 }
 
@@ -1541,16 +1513,9 @@ MttEnsureResult EnsureCustomEdidBytes(const std::vector<uint8_t>& edid, const st
 
 MttEnsureResult EnsureCustomEdid()
 {
-    // Shipped fallback: assets/mtt/user_edid.bin next to the exe (11" default).
-    const std::wstring shipped = FindShippedUserEdid();
-    std::vector<uint8_t> bytes;
-    if (shipped.empty() || !ReadFileBytes(shipped, bytes)) {
-        MttEnsureResult r;
-        r.path = FindLiveSettingsPath();
-        r.detail = "shipped user_edid.bin not found (assets/mtt/user_edid.bin)";
-        return r;
-    }
-    return EnsureCustomEdidBytes(bytes, BakedMttModes(), /*dryRun=*/false);
+    // Generated like any iPad's EDID, for the 11" default size. Same bytes as
+    // the file that used to ship next to the exe, so the release stays one exe.
+    return EnsureCustomEdidForHello(kDefaultHelloW, kDefaultHelloH, /*dryRun=*/false);
 }
 
 MttEnsureResult EnsureCustomEdidForHello(uint32_t helloW, uint32_t helloH, bool dryRun)
@@ -1783,7 +1748,7 @@ ElevatedOutcome RunElevatedSelf(const std::wstring& args, const std::string& log
 std::wstring EnsureEdidArgs(uint32_t helloW, uint32_t helloH)
 {
     // The elevated child regenerates the same bytes from the hello size
-    // (deterministic), writes them and restarts MttVDD. No size -> shipped file.
+    // (deterministic), writes them and restarts MttVDD. No size -> the 11" default.
     std::wstring args = L"--ensure-mtt-edid";
     if (helloW && helloH)
         args += L" " + std::to_wstring(helloW) + L"x" + std::to_wstring(helloH);
@@ -1918,15 +1883,14 @@ bool EnsureMttResolutionsForHello(uint32_t helloW, uint32_t helloH, const std::s
     }
     g_mttEdidDeclinedKey.store(key);
     if (!FileExists(kLiveEdidPath)) {
-        // Nothing installed at all: best effort with the shipped 11" file
+        // Nothing installed at all: best effort with the 11" default EDID
         // (may still need admin to reload; never blocks the connection).
         const MttEnsureResult fb = EnsureCustomEdid();
-        Logf(logTag, "mtt: shipped fallback EDID %s (%s)\n", fb.ok ? "installed" : "not installed",
+        Logf(logTag, "mtt: fallback EDID (11\" default) %s (%s)\n", fb.ok ? "installed" : "not installed",
              fb.detail.c_str());
     }
     return false;
 }
-
 
 
 int ReadMonitorCount()
