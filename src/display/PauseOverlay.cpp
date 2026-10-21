@@ -251,7 +251,7 @@ const char* PauseReasonName(PauseReason reason)
 
 bool PauseHidesDesktop(PauseReason reason)
 {
-    return reason == PauseReason::Locked || reason == PauseReason::Admin;
+    return reason == PauseReason::Locked || reason == PauseReason::Admin || reason == PauseReason::Asleep;
 }
 
 void FillPauseBackground(uint8_t* bgra, uint32_t width, uint32_t height)

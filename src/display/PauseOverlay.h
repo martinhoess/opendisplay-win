@@ -9,7 +9,7 @@ enum class PauseReason { None, Locked, Asleep, Admin, Paused };
 
 const char* PauseReasonName(PauseReason reason);
 
-// Locked and Admin (secure desktop) never show the desktop: the card goes on a
+// Locked, Admin (secure desktop) and Asleep never show the desktop: the card goes on a
 // plain dark background instead of the dimmed last picture.
 bool PauseHidesDesktop(PauseReason reason);
 
