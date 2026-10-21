@@ -1,6 +1,5 @@
 #include "app/PauseSignals.h"
 
-#include <tlhelp32.h>
 #include <wtsapi32.h>
 
 #include <algorithm>
@@ -99,22 +98,21 @@ SessionLock QuerySessionLock()
 
 bool IsConsentRunning()
 {
+    // WTS enumeration reports each process's session itself; asking for the
+    // session of SYSTEM's consent.exe (ProcessIdToSessionId) is access denied
+    // for a non-elevated tray, so the UAC prompt would never be seen.
     DWORD mySession = 0;
     if (!ProcessIdToSessionId(GetCurrentProcessId(), &mySession))
         return false;
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE)
+    PWTS_PROCESS_INFOW procs = nullptr;
+    DWORD count = 0;
+    if (!WTSEnumerateProcessesW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &procs, &count) || !procs)
         return false;
-    PROCESSENTRY32W pe{};
-    pe.dwSize = sizeof(pe);
     bool found = false;
-    for (BOOL ok = Process32FirstW(snap, &pe); ok && !found; ok = Process32NextW(snap, &pe)) {
-        if (_wcsicmp(pe.szExeFile, L"consent.exe") != 0)
-            continue;
-        DWORD session = 0;
-        found = ProcessIdToSessionId(pe.th32ProcessID, &session) && session == mySession;
-    }
-    CloseHandle(snap);
+    for (DWORD i = 0; i < count && !found; ++i)
+        found = procs[i].SessionId == mySession && procs[i].pProcessName &&
+                _wcsicmp(procs[i].pProcessName, L"consent.exe") == 0;
+    WTSFreeMemory(procs);
     return found;
 }
 
