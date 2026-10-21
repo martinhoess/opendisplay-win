@@ -207,6 +207,9 @@ POINT InputInjector::ScreenPoint(double nx, double ny) const
     // coordinates: MonitorRect() is GetMonitorInfo's rcMonitor, so a monitor
     // left of or above the primary is negative there, and Windows drops such
     // frames without an error (InjectSyntheticPointerInput still returns TRUE).
+    // A touch on the padding strip still lands on the desktop's edge.
+    nx = (std::min)(nx / contentFx_.load(), 1.0);
+    ny = (std::min)(ny / contentFy_.load(), 1.0);
     POINT pt;
     pt.x = monitorRect_.left + std::lround(nx * (monitorRect_.right - monitorRect_.left)) -
            GetSystemMetrics(SM_XVIRTUALSCREEN);

@@ -1245,6 +1245,11 @@ uint32_t H264Encoder::Height() const
 }
 
 
+bool H264Encoder::IsIntelQsv() const
+{
+    return impl_ && !impl_->mftName.empty() && Impl::HwPreference(impl_->mftName) == 0;
+}
+
 std::wstring H264Encoder::MftName() const
 {
     return impl_ ? impl_->mftName : std::wstring{};

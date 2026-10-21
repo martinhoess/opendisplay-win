@@ -549,10 +549,11 @@ CaptureResult DesktopDuplication::CaptureFrameNv12Gpu(ComPtr<ID3D11Texture2D>& o
 
     // Encoder still on the other orientation (common after Display Settings
     // rotate): do not Blt into the wrong NV12 - keep desktopChanged so the
-    // capture loop rebuilds encode to exact capture WxH.
+    // capture loop rebuilds encode to exact capture WxH. The encoder runs at
+    // the frame size or padded up to whole macroblocks (QSV), never beyond.
     const uint32_t frameEncW = (frameW + 15u) & ~15u;
     const uint32_t frameEncH = (frameH + 15u) & ~15u;
-    if (frameEncW != encW || frameEncH != encH) {
+    if (encW < frameW || encH < frameH || encW > frameEncW || encH > frameEncH) {
         duplication_->ReleaseFrame();
         result.desktopChanged = true;
         result.acquired = true;

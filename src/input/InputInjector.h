@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <atomic>
 #include <cstdint>
 #include <unordered_map>
 
@@ -32,6 +33,15 @@ public:
     // update again on rotation (new hello -> new rect).
     void SetMonitorRect(const RECT& rect) { monitorRect_ = rect; }
 
+    // Share of the encoded frame the desktop fills (capture / encode size, 1 =
+    // whole frame). Below 1 when the encoder pads to whole macroblocks: the
+    // iPad's normalized touch covers the padded frame, not just the desktop.
+    void SetContentFraction(double fx, double fy)
+    {
+        contentFx_ = fx;
+        contentFy_ = fy;
+    }
+
     void HandleTouch(const TouchMsg& touch);
     void HandleScroll(const ScrollMsg& scroll);
     void HandlePencil(const PencilMsg& pencil);
@@ -58,6 +68,8 @@ private:
     void ReleaseAllTouches();
 
     RECT monitorRect_{};
+    std::atomic<double> contentFx_{1.0};
+    std::atomic<double> contentFy_{1.0};
 
     HSYNTHETICPOINTERDEVICE touchDevice_ = nullptr;
     bool touchDeviceFailed_ = false;

@@ -63,6 +63,10 @@ public:
     // Friendly name of the activated H.264 MFT (empty if unknown).
     std::wstring MftName() const;
 
+    // The activated MFT is Intel Quick Sync, which wants frame sizes in whole
+    // 16-pixel macroblocks.
+    bool IsIntelQsv() const;
+
     // Async MFTs that stall on NeedInput: last EncodeNv12 timed out, and a
     // running count so the sender can fall back to software after N misses.
     bool TookAsyncTimeout() const;

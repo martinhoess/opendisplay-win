@@ -192,6 +192,26 @@ uint32_t Align16Ceil(uint32_t v)
     return (v + 15u) & ~15u;
 }
 
+uint32_t EvenClamp(int32_t v, uint32_t fallback)
+{
+    uint32_t u = v > 0 ? static_cast<uint32_t>(v) : fallback;
+    return u & ~1u; // NV12 4:2:0 needs even dimensions
+}
+
+// Display size for a hello dimension. Parsec gets the iPad's native (even)
+// size, the resolution existing installs already registered, so an update
+// needs no new UAC prompt. MTT keeps whole macroblocks: its modes come from
+// the EDID generated for that size.
+uint32_t HelloDim(DisplayBackendKind kind, int32_t v, uint32_t fallback)
+{
+    return kind == DisplayBackendKind::Mtt ? Align16Clamp(v, fallback) : EvenClamp(v, fallback);
+}
+
+uint32_t EvenCeil(uint32_t v)
+{
+    return (v + 1u) & ~1u;
+}
+
 int64_t UnixEpochMs()
 {
     using namespace std::chrono;
@@ -456,6 +476,13 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
 
     // Bumped on every (re)build - duplication rebuilt, mode may have changed.
     std::atomic<uint32_t> pipelineGen{0};
+    // Capture / encode size: the share of the encoded frame the desktop fills
+    // (1 unless QSV pads). Cursor positions are sent relative to the frame.
+    std::atomic<double> contentFx{1.0}, contentFy{1.0};
+    // The encoder runs at whole macroblocks above the capture size (QSV).
+    // Fixed per build: the capture loop compares against it, so a fallback to
+    // another MFT at the same padded size does not look like a resize.
+    std::atomic<bool> encodePadded{false};
     auto buildPipeline = [&](uint32_t width, uint32_t height, BuildReason reason = BuildReason::Hello) {
         // Caller holds pipelineMutex.
         ++pipelineGen;
@@ -480,13 +507,13 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
         // Encode to the size the caller requested (capture WxH that triggered
         // rebuild). Open() ModeDesc often stays hello landscape while DXGI
         // frames are portrait after rotate - trusting ModeDesc flash-loops.
-        uint32_t encW = Align16Ceil(width);
-        uint32_t encH = Align16Ceil(height);
+        uint32_t encW = EvenCeil(width);
+        uint32_t encH = EvenCeil(height);
         if (!encW || !encH) {
-            encW = Align16Ceil(dup.Width() ? dup.Width() : 1920);
-            encH = Align16Ceil(dup.Height() ? dup.Height() : 1080);
+            encW = EvenCeil(dup.Width() ? dup.Width() : 1920);
+            encH = EvenCeil(dup.Height() ? dup.Height() : 1080);
         } else if (dup.Width() && dup.Height() &&
-                   (Align16Ceil(dup.Width()) != encW || Align16Ceil(dup.Height()) != encH)) {
+                   (EvenCeil(dup.Width()) != encW || EvenCeil(dup.Height()) != encH)) {
             Logf(ip, "Open ModeDesc %ux%u != requested encode %ux%u - using requested\n",
                  dup.Width(), dup.Height(), encW, encH);
         }
@@ -503,12 +530,41 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
             if (!haveEncoderD3d)
                 Logf(ip, "no D3D device for the encoder - HW encode may use system memory or fall back\n");
         }
-        if (!encoder.Configure(encW, encH, kFps, sessionEncode.peakBitrateBps,
-                               sessionEncode.qualityVsSpeed, sessionEncode.gopSeconds,
-                               sessionEncode.useQualityRc, sessionEncode.rcQuality)) {
+        // Whole macroblocks first: QSV is tried first and wants them. Any
+        // other encoder is moved to the even capture size, so the iPad gets
+        // the desktop pixel for pixel instead of a padding strip - unless that
+        // binds a different MFT (QSV taking it, or hardware refusing it).
+        const uint32_t capW = encW, capH = encH; // what the desktop fills
+        auto configure = [&](uint32_t w, uint32_t h) {
+            return encoder.Configure(w, h, kFps, sessionEncode.peakBitrateBps, sessionEncode.qualityVsSpeed,
+                                     sessionEncode.gopSeconds, sessionEncode.useQualityRc,
+                                     sessionEncode.rcQuality);
+        };
+        encW = Align16Ceil(capW);
+        encH = Align16Ceil(capH);
+        if (!configure(encW, encH)) {
             Logf(ip, "encoder Configure failed (%ux%u)\n", encW, encH);
             return false;
         }
+        if (!encoder.IsIntelQsv() && (encW != capW || encH != capH)) {
+            const std::wstring paddedMft = encoder.MftName();
+            if (configure(capW, capH) && encoder.MftName() == paddedMft) {
+                encW = capW;
+                encH = capH;
+            } else {
+                encoder.SetAllowHardware(true); // a miss above may have pinned software
+                if (!configure(encW, encH)) {
+                    Logf(ip, "encoder Configure failed (%ux%u)\n", encW, encH);
+                    return false;
+                }
+            }
+        }
+        encodePadded = encW != capW || encH != capH;
+        if (encodePadded)
+            Logf(ip, "encoding %ux%u padded to %ux%u (whole macroblocks)\n", capW, capH, encW, encH);
+        contentFx = static_cast<double>(capW) / encW;
+        contentFy = static_cast<double>(capH) / encH;
+        input.SetContentFraction(contentFx, contentFy);
         // VBR only: Configure seeds mean ~60%; push preset mean (Speed/Balanced).
         if (!sessionEncode.useQualityRc)
             encoder.UpdateBitrate(sessionEncode.peakBitrateBps, sessionEncode.meanBitrateBps);
@@ -775,8 +831,8 @@ while (!stopRequested_) {
         bool welcomeSent = conn->SendFrame(reinterpret_cast<const uint8_t*>(kWelcome), sizeof(kWelcome) - 1);
         Logf(ip, "welcome sent: %s\n", welcomeSent ? "yes" : "FAILED");
 
-        uint32_t width = Align16Clamp(hello.pixelsWide, 1920);
-        uint32_t height = Align16Clamp(hello.pixelsHigh, 1080);
+        uint32_t width = HelloDim(backend->Kind(), hello.pixelsWide, 1920);
+        uint32_t height = HelloDim(backend->Kind(), hello.pixelsHigh, 1080);
         Logf(ip, "hello: %dx%d -> %ux%u\n", hello.pixelsWide, hello.pixelsHigh, width, height);
         // Raw hello size (unaligned): MTT generates the per-iPad EDID from it.
         backend->BeginConnection(hello.pixelsWide > 0 ? static_cast<uint32_t>(hello.pixelsWide) : 0,
@@ -936,8 +992,8 @@ std::thread reader([&] {
                         // again (common right after connect) must not tear down
                         // capture+encoder under live input - that flash+crash.
                         std::lock_guard<std::mutex> lock(pipelineMutex);
-                        uint32_t w = Align16Clamp(msg->hello.pixelsWide, width);
-                        uint32_t h = Align16Clamp(msg->hello.pixelsHigh, height);
+                        uint32_t w = HelloDim(backend->Kind(), msg->hello.pixelsWide, width);
+                        uint32_t h = HelloDim(backend->Kind(), msg->hello.pixelsHigh, height);
                         const int port = msg->hello.cursorPort;
                         auto retuneCursor = [&]() {
                             std::lock_guard<std::mutex> clock(cursorNetMutex);
@@ -1132,8 +1188,8 @@ std::thread reader([&] {
                     {
                         std::lock_guard<std::mutex> lock(cursorNetMutex);
                         ++cursorSeq;
-                        msg = MakeCursorMessage(visible, static_cast<double>(x) / rw, static_cast<double>(y) / rh,
-                                                cursorSeq);
+                        msg = MakeCursorMessage(visible, static_cast<double>(x) / rw * contentFx,
+                                                static_cast<double>(y) / rh * contentFy, cursorSeq);
                         const bool confirmed = cursorUdpConfirmed.load(std::memory_order_relaxed);
                         udpOpen = cursorUdp.Ready();
                         if (udpOpen) {
@@ -1634,7 +1690,7 @@ std::thread reader([&] {
                 if (cap.pointerShapeChanged) {
                     PointerShapeBgra shape;
                     if (dup.GetPointerShapeBgra(shape)) {
-                        pendingCursorImg = MakeCursorImgMessage(shape, dup.Width(), dup.Height());
+                        pendingCursorImg = MakeCursorImgMessage(shape, encoder.Width(), encoder.Height());
                     }
                 }
                 // Positions come from the cursor thread (refresh rate, not
@@ -1655,8 +1711,10 @@ std::thread reader([&] {
                 // while nv12 still holds the previous frame. Reconfiguring on
                 // that would encode the old buffer with the new stride — one
                 // skewed frame, exactly what this is here to prevent.
-                const uint32_t wantW = Align16Ceil(dup.Width());
-                const uint32_t wantH = Align16Ceil(dup.Height());
+                const uint32_t capW = EvenCeil(dup.Width());
+                const uint32_t capH = EvenCeil(dup.Height());
+                const uint32_t wantW = encodePadded ? Align16Ceil(capW) : capW;
+                const uint32_t wantH = encodePadded ? Align16Ceil(capH) : capH;
                 // Capture/encoder WxH mismatch (incl. portrait swap). Require a
                 // real desktop frame so Open() ModeDesc alone cannot fight the
                 // encode size we just forced (that was the quick-flash loop).
@@ -1682,9 +1740,9 @@ std::thread reader([&] {
                     waitFirstFrameSince = {};
                     firstFrameNudged = false;
                     firstFrameWaitLogged = false;
-                    const bool swappedHello = (wantW == height && wantH == width);
-                    uint32_t rebuildW = wantW;
-                    uint32_t rebuildH = wantH;
+                    const bool swappedHello = (capW == height && capH == width);
+                    uint32_t rebuildW = capW;
+                    uint32_t rebuildH = capH;
                     if (backend->KeepsHelloLandscape()) {
                         // MTT: a portrait capture of the landscape hello is
                         // forced back to landscape; any other size is adopted.
@@ -1697,8 +1755,8 @@ std::thread reader([&] {
                             else
                                 Logf(ip, "capture was portrait swap of hello - MTT mode force failed\n");
                         } else {
-                            width = wantW;
-                            height = wantH;
+                            width = capW;
+                            height = capH;
                         }
                     } else if (swappedHello) {
                         // Parsec (upstream): a rotation made in Windows is the
