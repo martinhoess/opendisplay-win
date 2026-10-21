@@ -952,8 +952,17 @@ void AddSelectedNearby(HWND dlg, SettingsDlgState* state)
     if (IsLoopbackHost(receiver.address) || !receiver.viaWifi)
         return; // Your iPads only accepts Wi-Fi Nearby discoveries
     for (size_t i = 0; i < state->devices.size(); ++i) {
-        if (SplitDevice(state->devices[i]).address == receiver.address)
-            return; // already listed
+        if (SplitDevice(state->devices[i]).address == receiver.address) {
+            // Already listed, typed in without an id: take the one Nearby
+            // reports, so USB can match this iPad. Saved with the dialog.
+            std::string& id = state->pendingIds[receiver.address];
+            if (id.empty() && !receiver.id.empty()) {
+                id = receiver.id;
+                RefreshSavedList(dlg, state);
+                SyncDevicesEdit(dlg, state);
+            }
+            return; // no duplicate
+        }
         if (!receiver.id.empty()) {
             auto it = state->pendingIds.find(SplitDevice(state->devices[i]).address);
             if (it != state->pendingIds.end() && it->second == receiver.id)
