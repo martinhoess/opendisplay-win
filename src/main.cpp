@@ -16,6 +16,7 @@
 #include "display/MttVddSettings.h"
 #include "display/PauseOverlay.h"
 #include "display/VirtualDisplay.h"
+#include "encode/H264Encoder.h"
 #include "net/Mdns.h"
 
 #include "parsec-vdd.h" // VDD_MAX_DISPLAYS, to range-check --remove-display
@@ -155,7 +156,8 @@ int main(int argc, char** argv)
                   command == "--ensure-mtt-resolutions" || command == "--ensure-mtt-edid" ||
                   command == "--dump-mtt-edid" ||
                   command == "--set-mtt-monitor-count" ||
-                  command == "--teardown-mtt-vdd" || command == "--ensure-mtt-vdd";
+                  command == "--teardown-mtt-vdd" || command == "--ensure-mtt-vdd" ||
+                  command == "--probe-encoder";
 
     // A one-off answers into the caller's terminal; a sender writes to the log,
     // and a headless one gets its own file so two of them don't truncate each
@@ -297,6 +299,34 @@ int main(int argc, char** argv)
             printf("remove display %d: %s\n", index, ok ? "sent" : "failed (driver handle?)");
             rc = ok ? 0 : 1;
         }
+    } else if (command == "--probe-encoder" && argc < 4) {
+        // Without this the size-less call would fall through to the headless
+        // sender and try to connect to "--probe-encoder" forever.
+        printf("usage: --probe-encoder <width> <height>\n");
+        rc = 2;
+    } else if (command == "--probe-encoder") {
+        // Picks the encoder for this size the way a connection would and feeds
+        // it gray frames until a keyframe comes out. Tells "no encoder takes
+        // this panel" apart from a capture or network problem, without an iPad.
+        auto w = static_cast<uint32_t>(strtoul(argv[2], nullptr, 10));
+        auto h = static_cast<uint32_t>(strtoul(argv[3], nullptr, 10));
+        bool keyframe = false;
+        od::H264Encoder encoder;
+        // NV12 needs even dimensions, and every iPad/iPhone panel has them.
+        if (w > 0 && h > 0 && w % 2 == 0 && h % 2 == 0 && encoder.Configure(w, h)) {
+            // Configure's own bind check already used up the first IDR.
+            encoder.RequestKeyFrame();
+            std::vector<uint8_t> gray(static_cast<size_t>(w) * h * 3 / 2, 128);
+            for (int i = 0; i < 30 && !keyframe; ++i) {
+                for (const od::EncodedFrame& frame : encoder.EncodeNv12(gray.data(), gray.size()))
+                    keyframe = keyframe || frame.isKeyFrame;
+                for (const od::EncodedFrame& frame : encoder.CollectPending()) // async MFTs finish later
+                    keyframe = keyframe || frame.isKeyFrame;
+            }
+        }
+        printf("probe %ux%u: %ls, %s\n", w, h, encoder.IsConfigured() ? encoder.MftName().c_str() : L"no encoder",
+               keyframe ? "keyframe out" : "no keyframe");
+        rc = keyframe ? 0 : 1;
     } else if (argc >= 2 && std::string(argv[1]) == "--cleanup-monitors") {
         // Explicit one-off: drop phantom virtual monitors from earlier runs.
         int n = od::VirtualDisplay::CleanupGhostMonitors();
