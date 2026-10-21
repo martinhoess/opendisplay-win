@@ -236,7 +236,8 @@ int main(int argc, char** argv)
             }
         }
     } else if (argc >= 3 && std::string(argv[1]) == "--set-mtt-monitor-count") {
-        // Elevated one-shot: set <monitors><count> in live MTT settings and reload.
+        // Elevated one-shot: set <monitors><count> in live MTT settings and reload
+        // (nothing to do when the count matches and the head is merely detached).
         // Elevated child of the MTT ensure/teardown path.
         auto n = static_cast<uint32_t>(strtoul(argv[2], nullptr, 10));
         od::MttEnsureResult r = od::SetMonitorCount(n);

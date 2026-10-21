@@ -271,13 +271,16 @@ void BackupOnce(const std::wstring& path, std::vector<std::string>& notes)
 // (Root\MttVDD, display class) restarts - bouncing the MTT1337 monitor is not
 // enough, and `pnputil /restart-device` returns ERROR_NOT_SUPPORTED (50) on
 // some installs. So, in order, each step logged with its result code:
-//   1. SetupAPI DIF_PROPERTYCHANGE / DICS_PROPCHANGE (Device Manager's restart)
+//   1. SetupAPI DIF_PROPERTYCHANGE / DICS_PROPCHANGE (Device Manager's restart),
+//      only when an MTT head is on the desktop and an expected mode is given:
+//      whether it re-reads the files is unproven, so it must show the mode.
 //   2. SetupAPI DICS_DISABLE + DICS_ENABLE (what VDD Control "Restart Driver" does)
 //   3. pnputil /restart-device "<instance id>" (fallback)
 // After a step the adapter must be DN_STARTED with no problem code. When an MTT
 // head is on the desktop and an expected mode is given, that mode must also be
 // offered (EnumDisplaySettings) before the step counts; otherwise the next step
-// runs. Needs admin (the --ensure-mtt-edid / --set-mtt-monitor-count helpers).
+// runs. Without a head, disable/enable counts once the adapter is started again.
+// Needs admin (the --ensure-mtt-edid / --set-mtt-monitor-count helpers).
 
 bool FindMttAdapterInstanceIdImpl(std::wstring& outId)
 {
@@ -405,7 +408,8 @@ std::string StepResult(const char* name, bool ok, DWORD err, bool needReboot)
 }
 
 // Expected mode check after a restart. "unverifiable" (no MTT head on the
-// desktop) counts as success here; the sender re-verifies after attach.
+// desktop) is only trusted after disable/enable, the restart known to make
+// MttVDD re-read its files; the sender re-verifies after attach.
 enum class ModeCheck { Offered, NotOffered, NoHead };
 
 ModeCheck WaitForModeOffered(uint32_t w, uint32_t h, int timeoutMs)
@@ -470,7 +474,10 @@ bool ReloadMttVddDevice(std::string& detail, const MttMode* expect)
 
     // A step "took" when the adapter is started again and (if checkable) the
     // expected mode is offered.
-    auto settle = [&](const char* step) -> bool {
+    // acceptNoHead: an unverifiable result (no head on the desktop) counts.
+    // Never for PROPCHANGE: a wrong "success" there left the files "current",
+    // so no later connect ever reloaded the driver.
+    auto settle = [&](const char* step, bool acceptNoHead) -> bool {
         const AdapterStatus st = WaitAdapterStarted(instanceId, 10000);
         detail += std::string(" [") + step + " -> " + DescribeAdapter(st);
         if (!st.started) {
@@ -488,16 +495,19 @@ bool ReloadMttVddDevice(std::string& detail, const MttMode* expect)
                  : mc == ModeCheck::NoHead     ? "unverified (no head on desktop yet)"
                                                : "NOT offered");
         detail += buf;
-        return mc != ModeCheck::NotOffered;
+        return mc == ModeCheck::Offered || (acceptNoHead && mc == ModeCheck::NoHead);
     };
 
-    // 1) DICS_PROPCHANGE: stop + restart the adapter in place.
-    {
+    // 1) DICS_PROPCHANGE: stop + restart the adapter in place. Skipped when
+    //    nothing could prove it worked (no head, or only a count change): it
+    //    would cost a restart and the full mode wait before disable/enable.
+    ExistingMonitor head{};
+    if (expect != nullptr && expect->width != 0 && FindMttVirtualMonitor(head)) {
         DWORD err = 0;
         bool reboot = false;
         const bool ok = AdapterPropertyChange(instanceId, DICS_PROPCHANGE, err, reboot);
         detail += " " + StepResult("propchange", ok, err, reboot);
-        if (ok && !reboot && settle("propchange"))
+        if (ok && !reboot && settle("propchange", false))
             return true;
     }
 
@@ -515,7 +525,7 @@ bool ReloadMttVddDevice(std::string& detail, const MttMode* expect)
             enabled = AdapterPropertyChange(instanceId, DICS_ENABLE, err, reboot);
         }
         detail += "; " + StepResult("enable", enabled, err, reboot);
-        if (disabled && enabled && !reboot && settle("disable/enable"))
+        if (disabled && enabled && !reboot && settle("disable/enable", true))
             return true;
     }
 
@@ -524,7 +534,7 @@ bool ReloadMttVddDevice(std::string& detail, const MttMode* expect)
         std::string step;
         const bool ok = RunPnputilRestart(instanceId, step);
         detail += "; " + step;
-        if (ok && settle("pnputil"))
+        if (ok && settle("pnputil", true))
             return true;
     }
 
@@ -1960,6 +1970,16 @@ MttEnsureResult SetMonitorCount(uint32_t count)
             r.ok = true;
             r.changed = false;
             r.detail = "already count=" + std::to_string(count) + " (MTT head present)";
+            return r;
+        }
+        // Detached after a teardown: the driver still exposes the head, so the
+        // caller only has to attach it. Reloading here restarted MttVDD on
+        // every attach although nothing had changed.
+        ExistingMonitor detached{};
+        if (count >= 1 && FindMttVirtualMonitorDevice(detached, /*requireAttached=*/false)) {
+            r.ok = true;
+            r.changed = false;
+            r.detail = "already count=" + std::to_string(count) + " (MTT head detached, attach only)";
             return r;
         }
     }
