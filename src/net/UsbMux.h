@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -34,5 +35,17 @@ bool UsbMuxForwardListening(uint16_t localPort);
 std::optional<SOCKET> ConnectUsbMux(uint32_t deviceId, uint16_t devicePort);
 
 constexpr uint16_t kUsbMuxLocalPort = 19000;
+
+// Attach/detach notifications from one shared usbmuxd "Listen" connection per
+// process (started on first use). The generation goes up on every Attached /
+// Detached message, when the listen connection opens or drops, and on
+// WakeUsbMuxWaiters(). If usbmuxd is not reachable the watcher waits, without
+// polling, until a later usbmux query succeeds (that query kicks it).
+uint64_t UsbMuxEventGeneration();
+// Blocks until the generation differs from `seen` or `deadline` passes.
+// Returns the current generation.
+uint64_t WaitUsbMuxEvent(uint64_t seen, std::chrono::steady_clock::time_point deadline);
+// Wake every WaitUsbMuxEvent caller (e.g. its session is ending).
+void WakeUsbMuxWaiters();
 
 } // namespace od

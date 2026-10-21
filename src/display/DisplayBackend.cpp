@@ -223,13 +223,6 @@ public:
             (void)SaveMttDisplayTopologyIfUserChange(tag_);
     }
 
-    void Poll() override
-    {
-        // Persist the user's MTT arrangement while streaming.
-        if (using_)
-            PollMttDisplayTopology(tag_, lastPos_);
-    }
-
     void OnSessionEnd(bool lastClient, bool userInitiated) override
     {
         if (!lastClient || !using_)
@@ -262,7 +255,6 @@ private:
     bool using_ = false;
     bool modesEnsured_ = false;    // once per connection; Ensure is idempotent too
     bool helloModeForced_ = false; // apply saved/preferred mode once; later honor Keep
-    POINT lastPos_{INT_MIN, INT_MIN};
     mutable std::mutex mu_; // deviceName_ / rect_: read by reader + cursor threads
     std::wstring deviceName_;
     RECT rect_{};

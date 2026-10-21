@@ -2,6 +2,7 @@
 
 #include "app/Config.h"
 #include "app/Log.h"
+#include "app/PauseSignals.h"
 #include "app/SenderApp.h"
 #include "app/resources.h"
 #include "display/MttVddSettings.h"
@@ -9,6 +10,7 @@
 
 #include <commctrl.h>
 #include <shellapi.h>
+#include <wtsapi32.h>
 
 #include <atomic>
 #include <chrono>
@@ -29,8 +31,9 @@ namespace {
 constexpr UINT WM_APP_TRAY = WM_APP + 1;
 // Sender thread -> tray: show a balloon. lParam = heap std::wstring (deleted here).
 constexpr UINT WM_APP_NOTIFY = WM_APP + 2;
-constexpr UINT kStatusTimerId = 1;
-constexpr UINT kStatusTimerMs = 1000;
+// A sender's state / transport / wait reason / pause changed (or discovery
+// renamed an iPad): refresh icon, tooltip and balloons. No periodic timer.
+constexpr UINT WM_APP_STATUS = WM_APP + 3;
 // WM_DISPLAYCHANGE debounce: a Display Settings Apply fires several changes.
 constexpr UINT kDisplayChangeTimerId = 2;
 constexpr UINT kDisplayChangeDebounceMs = 1500;
@@ -55,8 +58,13 @@ const wchar_t* const kWndClass = L"opendisplay-win-tray";
 constexpr int kSettingsWidth = 272;
 constexpr int kSettingsHeight = 294;
 
+// GUID_CONSOLE_DISPLAY_STATE, spelled out so no INITGUID / extra lib is needed.
+constexpr GUID kConsoleDisplayState = {0x6fe69556, 0x704a, 0x47a0, {0x8f, 0x24, 0xc2, 0x8d, 0x93, 0x6f, 0xda, 0x47}};
+
 struct TrayContext {
     HINSTANCE hInstance = nullptr;
+    HPOWERNOTIFY displayStateNotify = nullptr; // GUID_CONSOLE_DISPLAY_STATE
+    HWINEVENTHOOK desktopSwitchHook = nullptr; // EVENT_SYSTEM_DESKTOPSWITCH
     // One sender per configured iPad, index-aligned with cfg.devices: each
     // drives its own virtual monitor, capture, encoder and input injection.
     // unique_ptr because SenderApp owns a thread and can't be moved.
@@ -80,6 +88,9 @@ struct TrayContext {
     std::map<std::string, std::string> discoveredIdLabel; // TXT id -> label
     std::thread discovery;
     std::atomic<bool> discoveryRunning{false};
+    HANDLE discoveryStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);  // manual: quit
+    HANDLE discoveryWake = CreateEventW(nullptr, FALSE, FALSE, nullptr); // browse now
+    HWND hwnd = nullptr;
 };
 
 // One Nearby row = one Wi-Fi (mDNS) iPad candidate.
@@ -129,38 +140,54 @@ std::string ReceiverLabel(const MdnsReceiver& receiver)
     return host.empty() ? receiver.instance : host;
 }
 
+void MergeDiscovered(TrayContext* ctx, const std::vector<MdnsReceiver>& receivers)
+{
+    if (receivers.empty())
+        return;
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(ctx->discoveredMutex);
+        // Merged, not replaced: an iPad that is asleep doesn't answer, and
+        // dropping its name would make the menu flip back to a raw address.
+        for (const MdnsReceiver& receiver : receivers) {
+            const std::string label = ReceiverLabel(receiver);
+            std::string& name = ctx->discovered[receiver.address];
+            changed |= name != label;
+            name = label;
+            if (!receiver.id.empty()) {
+                std::string& addr = ctx->discoveredById[receiver.id];
+                changed |= addr != receiver.address;
+                addr = receiver.address;
+                ctx->discoveredIdLabel[receiver.id] = label;
+            }
+        }
+    }
+    if (changed && ctx->hwnd)
+        PostMessageW(ctx->hwnd, WM_APP_STATUS, 0, 0); // names show in the tooltip
+}
+
+// No query timer: one browse at start, then whatever the receivers announce
+// (they do on launch and on joining a network), a fresh browse when the
+// network changes, and one when the user opens the menu or Settings.
 void RunDiscovery(TrayContext* ctx)
 {
     constexpr int kBrowseMs = 800;
-    constexpr int kPauseMs = 60'000;
+    MergeDiscovered(ctx, BrowseReceivers(kBrowseMs));
 
+    MdnsListener listener;
+    std::vector<MdnsReceiver> heard;
     while (ctx->discoveryRunning) {
-        std::map<std::string, std::string> names;
-        std::map<std::string, std::string> byId;
-        std::map<std::string, std::string> idLabel;
-        for (const MdnsReceiver& receiver : BrowseReceivers(kBrowseMs)) {
-            const std::string label = ReceiverLabel(receiver);
-            names[receiver.address] = label;
-            if (!receiver.id.empty()) {
-                byId[receiver.id] = receiver.address;
-                idLabel[receiver.id] = label;
-            }
+        switch (listener.Wait(ctx->discoveryStop, ctx->discoveryWake, heard)) {
+            case MdnsListener::Event::Stop:
+                return;
+            case MdnsListener::Event::Heard:
+                MergeDiscovered(ctx, heard);
+                break;
+            case MdnsListener::Event::Wake:
+            case MdnsListener::Event::NetworkChanged:
+                MergeDiscovered(ctx, BrowseReceivers(kBrowseMs));
+                break;
         }
-
-        if (!names.empty() || !byId.empty()) {
-            std::lock_guard<std::mutex> lock(ctx->discoveredMutex);
-            // Merged, not replaced: an iPad that is asleep doesn't answer, and
-            // dropping its name would make the menu flip back to a raw address.
-            for (auto& name : names)
-                ctx->discovered[name.first] = name.second;
-            for (auto& entry : byId)
-                ctx->discoveredById[entry.first] = entry.second;
-            for (auto& entry : idLabel)
-                ctx->discoveredIdLabel[entry.first] = entry.second;
-        }
-
-        for (int waited = 0; waited < kPauseMs && ctx->discoveryRunning; waited += 250)
-            std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
 }
 
@@ -390,6 +417,33 @@ std::string EntryId(const TrayContext* ctx, size_t index)
     return index < ctx->cfg.deviceIds.size() ? ctx->cfg.deviceIds[index] : std::string{};
 }
 
+// Ids the senders learned from a Wi-Fi hello at a typed-in address: saved
+// once per change, so USB and the next start match on them.
+void SaveLearnedIds(TrayContext* ctx)
+{
+    Config& cfg = ctx->cfg;
+    cfg.deviceIds.resize(cfg.devices.size());
+    cfg.deviceIdFromHello.resize(cfg.devices.size());
+    bool changed = false;
+    for (size_t i = 0; i < ctx->apps.size() && i < cfg.devices.size(); ++i) {
+        if (!cfg.IdFollowsHello(i))
+            continue;
+        const std::string id = ctx->apps[i]->EntryId();
+        if (id.empty() || id == cfg.deviceIds[i])
+            continue;
+        cfg.deviceIds[i] = id;
+        cfg.deviceIdFromHello[i] = "1";
+        changed = true;
+    }
+    if (!changed)
+        return;
+    // Senders write USB bindings to the file: keep those, not the tray's copy.
+    const Config onDisk = Config::Load();
+    cfg.usbLinkSerials = onDisk.usbLinkSerials;
+    cfg.usbLinkIds = onDisk.usbLinkIds;
+    cfg.Save();
+}
+
 std::wstring DeviceLabel(const TrayContext* ctx, size_t index)
 {
     DeviceEntry entry = SplitDevice(ctx->cfg.devices[index]);
@@ -546,7 +600,7 @@ void ApplyAndRestart(TrayContext* ctx)
 {
     RebuildSenders(ctx);
     for (size_t i = 0; i < ctx->apps.size(); ++i)
-        ctx->apps[i]->Start(ResolveDeviceAddress(ctx, i), ctx->cfg.port, EntryId(ctx, i));
+        ctx->apps[i]->Start(ResolveDeviceAddress(ctx, i), ctx->cfg.port, EntryId(ctx, i), ctx->cfg.IdFollowsHello(i));
     UpdateStatus(ctx);
 }
 
@@ -898,8 +952,17 @@ void AddSelectedNearby(HWND dlg, SettingsDlgState* state)
     if (IsLoopbackHost(receiver.address) || !receiver.viaWifi)
         return; // Your iPads only accepts Wi-Fi Nearby discoveries
     for (size_t i = 0; i < state->devices.size(); ++i) {
-        if (SplitDevice(state->devices[i]).address == receiver.address)
-            return; // already listed
+        if (SplitDevice(state->devices[i]).address == receiver.address) {
+            // Already listed, typed in without an id: take the one Nearby
+            // reports, so USB can match this iPad. Saved with the dialog.
+            std::string& id = state->pendingIds[receiver.address];
+            if (id.empty() && !receiver.id.empty()) {
+                id = receiver.id;
+                RefreshSavedList(dlg, state);
+                SyncDevicesEdit(dlg, state);
+            }
+            return; // no duplicate
+        }
         if (!receiver.id.empty()) {
             auto it = state->pendingIds.find(SplitDevice(state->devices[i]).address);
             if (it != state->pendingIds.end() && it->second == receiver.id)
@@ -1037,14 +1100,32 @@ INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lPara
                 ReadDevicesEdit(dlg, state);
                 PruneUsbOnlyPlaceholders(state->devices, &state->pendingIds);
 
+                // Hello-learned ids stay hello-learned while the address and
+                // id are unchanged (also ones learned while this was open).
+                std::map<std::string, std::string> learned; // address -> id
+                cfg->deviceIds.resize(cfg->devices.size());
+                cfg->deviceIdFromHello.resize(cfg->devices.size());
+                for (size_t i = 0; i < cfg->devices.size(); ++i)
+                    if (cfg->deviceIdFromHello[i] == "1" && !cfg->deviceIds[i].empty())
+                        learned[SplitDevice(cfg->devices[i]).address] = cfg->deviceIds[i];
+
                 cfg->devices = state->devices;
                 std::vector<std::string> ids;
+                std::vector<std::string> fromHello;
                 ids.reserve(cfg->devices.size());
+                fromHello.reserve(cfg->devices.size());
                 for (const std::string& device : cfg->devices) {
-                    auto it = state->pendingIds.find(SplitDevice(device).address);
-                    ids.push_back(it != state->pendingIds.end() ? it->second : std::string{});
+                    const std::string address = SplitDevice(device).address;
+                    auto it = state->pendingIds.find(address);
+                    std::string id = it != state->pendingIds.end() ? it->second : std::string{};
+                    auto was = learned.find(address);
+                    if (id.empty() && was != learned.end())
+                        id = was->second;
+                    fromHello.push_back(was != learned.end() && was->second == id ? "1" : "");
+                    ids.push_back(std::move(id));
                 }
                 cfg->deviceIds = std::move(ids);
+                cfg->deviceIdFromHello = std::move(fromHello);
 
                 BOOL ok = FALSE;
                 UINT port = GetDlgItemInt(dlg, IDC_PORT, &ok, FALSE);
@@ -1074,6 +1155,7 @@ INT_PTR CALLBACK SettingsDlgProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lPara
 
 void ShowContextMenu(HWND hwnd, TrayContext* ctx)
 {
+    SetEvent(ctx->discoveryWake); // refresh names in the background for next time
     HMENU menu = CreatePopupMenu();
 
     bool several = ctx->cfg.devices.size() > 1;
@@ -1109,6 +1191,7 @@ void OpenSettingsAndApply(HWND hwnd, TrayContext* ctx)
     // Senders write to the config at runtime (USB serial->id bindings); start
     // from the file, not the tray's copy from launch.
     ctx->cfg = Config::Load();
+    SetEvent(ctx->discoveryWake);
     std::vector<std::string> oldDevices = ctx->cfg.devices;
     std::vector<std::string> oldIds = ctx->cfg.deviceIds;
     uint16_t oldPort = ctx->cfg.port;
@@ -1158,6 +1241,13 @@ void OpenSettingsAndApply(HWND hwnd, TrayContext* ctx)
         ApplyAndRestart(ctx);
 }
 
+// Input desktop switched (lock screen, UAC secure desktop, back to Default):
+// wake paused senders so they re-check at once.
+void CALLBACK OnDesktopSwitch(HWINEVENTHOOK, DWORD, HWND, LONG, LONG, DWORD, DWORD)
+{
+    PauseSignals::Notify();
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     auto* ctx = reinterpret_cast<TrayContext*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -1190,7 +1280,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 if (app.IsRunning())
                     app.Stop();
                 else
-                    app.Start(ResolveDeviceAddress(ctx, index), ctx->cfg.port, EntryId(ctx, index));
+                    app.Start(ResolveDeviceAddress(ctx, index), ctx->cfg.port, EntryId(ctx, index), ctx->cfg.IdFollowsHello(index));
                 UpdateStatus(ctx);
                 return 0;
             }
@@ -1198,7 +1288,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             switch (LOWORD(wParam)) {
                 case IDM_CONNECT:
                     for (size_t i = 0; i < ctx->apps.size(); ++i)
-                        ctx->apps[i]->Start(ResolveDeviceAddress(ctx, i), ctx->cfg.port, EntryId(ctx, i));
+                        ctx->apps[i]->Start(ResolveDeviceAddress(ctx, i), ctx->cfg.port, EntryId(ctx, i), ctx->cfg.IdFollowsHello(i));
                     UpdateStatus(ctx);
                     return 0;
                 case IDM_DISCONNECT:
@@ -1215,19 +1305,53 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             }
             return 0;
 
-        case WM_TIMER:
-            if (wParam == kStatusTimerId)
+        case WM_APP_STATUS:
+            SenderApp::StatusMessageHandled(); // before reading: a change during UpdateStatus posts again
+            if (ctx) {
+                SaveLearnedIds(ctx);
                 UpdateStatus(ctx);
-            else if (wParam == kDisplayChangeTimerId) {
-                KillTimer(hwnd, kDisplayChangeTimerId);
-                // User layout change while the MTT head is attached: persist it
-                // instead of reverting. No-op if MTT is inactive/absent or the
-                // change was one of our own applies.
-                (void)SaveMttDisplayTopologyIfUserChange("display");
             }
             return 0;
 
+        case WM_TIMER:
+            if (wParam == kDisplayChangeTimerId) {
+                KillTimer(hwnd, kDisplayChangeTimerId);
+                // User layout change while the MTT head is attached: persist it
+                // instead of reverting. No-op if MTT is inactive/absent or the
+                // change was one of our own applies. Inside the settle window
+                // after one of our applies, try once more when it has passed.
+                if (const uint32_t deferMs = MttTopologySaveDeferMs())
+                    SetTimer(hwnd, kDisplayChangeTimerId, deferMs, nullptr);
+                else
+                    (void)SaveMttDisplayTopologyIfUserChange("display");
+            }
+            return 0;
+
+        case WM_WTSSESSION_CHANGE:
+            if (wParam == WTS_SESSION_LOCK || wParam == WTS_SESSION_UNLOCK) {
+                PauseSignals::locked = wParam == WTS_SESSION_LOCK;
+                Logf("pause", "session %s\n", wParam == WTS_SESSION_LOCK ? "locked" : "unlocked");
+                PauseSignals::Notify();
+            }
+            return 0;
+
+        case WM_POWERBROADCAST:
+            if (wParam == PBT_POWERSETTINGCHANGE && lParam) {
+                const auto* ps = reinterpret_cast<const POWERBROADCAST_SETTING*>(lParam);
+                if (IsEqualGUID(ps->PowerSetting, kConsoleDisplayState) && ps->DataLength >= sizeof(DWORD)) {
+                    // 0 off, 1 on, 2 dimmed (still visible: not a pause).
+                    const DWORD state = *reinterpret_cast<const DWORD*>(ps->Data);
+                    const bool off = state == 0;
+                    if (PauseSignals::displayOff.exchange(off) != off) {
+                        Logf("pause", "console display %s\n", off ? "off" : "on");
+                        PauseSignals::Notify();
+                    }
+                }
+            }
+            return TRUE;
+
         case WM_DISPLAYCHANGE:
+            ++PauseSignals::displayChangeGen; // senders re-read the refresh rate
             SetTimer(hwnd, kDisplayChangeTimerId, kDisplayChangeDebounceMs, nullptr);
             return 0;
 
@@ -1240,7 +1364,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 // MTT head does not survive into the next session.
                 Logf("mtt", "session ending - tearing down\n");
                 BeginMttShutdown();
-                KillTimer(hwnd, kStatusTimerId);
                 KillTimer(hwnd, kDisplayChangeTimerId);
                 for (auto& app : ctx->apps)
                     app->Stop();
@@ -1249,8 +1372,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             return 0;
 
         case WM_DESTROY:
+            SenderApp::SetStatusWindow(nullptr, 0);
+            WTSUnRegisterSessionNotification(hwnd);
+            if (ctx->desktopSwitchHook) {
+                UnhookWinEvent(ctx->desktopSwitchHook);
+                ctx->desktopSwitchHook = nullptr;
+            }
+            if (ctx->displayStateNotify) {
+                UnregisterPowerSettingNotification(ctx->displayStateNotify);
+                ctx->displayStateNotify = nullptr;
+            }
             SetMttUserNotifier(nullptr);
-            KillTimer(hwnd, kStatusTimerId);
             KillTimer(hwnd, kDisplayChangeTimerId);
             Shell_NotifyIconW(NIM_DELETE, &ctx->nid);
             // Quit: block re-attach from any racing pipeline rebuild, stop the
@@ -1309,6 +1441,18 @@ int RunTray(HINSTANCE hInstance)
     if (hwnd == nullptr)
         return 1;
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&ctx));
+    // Pause mode inputs: lock/unlock and console display on/off.
+    if (!WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION))
+        Logf("pause", "WTSRegisterSessionNotification failed (%lu)\n", GetLastError());
+    ctx.displayStateNotify =
+        RegisterPowerSettingNotification(hwnd, &kConsoleDisplayState, DEVICE_NOTIFY_WINDOW_HANDLE);
+    if (!ctx.displayStateNotify)
+        Logf("pause", "RegisterPowerSettingNotification failed (%lu)\n", GetLastError());
+    // Out-of-context: delivered through this thread's message loop.
+    ctx.desktopSwitchHook = SetWinEventHook(EVENT_SYSTEM_DESKTOPSWITCH, EVENT_SYSTEM_DESKTOPSWITCH, nullptr,
+                                            OnDesktopSwitch, 0, 0, WINEVENT_OUTOFCONTEXT);
+    if (!ctx.desktopSwitchHook)
+        Logf("pause", "SetWinEventHook(DESKTOPSWITCH) failed (%lu)\n", GetLastError());
 
     ctx.iconGreen = MakeStatusIcon(RGB(40, 200, 80));
     ctx.iconRed = MakeStatusIcon(RGB(225, 65, 55));
@@ -1323,8 +1467,10 @@ int RunTray(HINSTANCE hInstance)
     wcsncpy_s(ctx.nid.szTip, L"OpenDisplay", _TRUNCATE);
     Shell_NotifyIconW(NIM_ADD, &ctx.nid);
 
-    SetTimer(hwnd, kStatusTimerId, kStatusTimerMs, nullptr);
+    SenderApp::SetStatusWindow(hwnd, WM_APP_STATUS);
+    PostMessageW(hwnd, WM_APP_STATUS, 0, 0); // first paint
 
+    ctx.hwnd = hwnd;
     ctx.discoveryRunning = true;
     ctx.discovery = std::thread([&ctx] { RunDiscovery(&ctx); });
 
@@ -1340,7 +1486,7 @@ int RunTray(HINSTANCE hInstance)
 
     if (ctx.cfg.autoReconnect)
         for (size_t i = 0; i < ctx.apps.size(); ++i)
-            ctx.apps[i]->Start(ResolveDeviceAddress(&ctx, i), ctx.cfg.port, EntryId(&ctx, i));
+            ctx.apps[i]->Start(ResolveDeviceAddress(&ctx, i), ctx.cfg.port, EntryId(&ctx, i), ctx.cfg.IdFollowsHello(i));
     UpdateStatus(&ctx);
 
     MSG msg;
@@ -1350,6 +1496,7 @@ int RunTray(HINSTANCE hInstance)
     }
 
     ctx.discoveryRunning = false;
+    SetEvent(ctx.discoveryStop);
     if (ctx.discovery.joinable())
         ctx.discovery.join();
 

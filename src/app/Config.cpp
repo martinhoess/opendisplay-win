@@ -195,6 +195,8 @@ Config Config::Load()
     cfg.deviceIds = ReadStringArray(json, "deviceIds");
     // Align length with devices (pad with empty, or trim extras).
     cfg.deviceIds.resize(cfg.devices.size());
+    cfg.deviceIdFromHello = ReadStringArray(json, "deviceIdFromHello");
+    cfg.deviceIdFromHello.resize(cfg.devices.size());
 
     cfg.usbLinkSerials = ReadStringArray(json, "usbLinkSerials");
     cfg.usbLinkIds = ReadStringArray(json, "usbLinkIds");
@@ -249,6 +251,7 @@ void Config::Save() const
     Config out = *this;
     out.SyncTransportsFromPicturePreset();
     out.deviceIds.resize(out.devices.size());
+    out.deviceIdFromHello.resize(out.devices.size());
 
     std::wstring dir = AppDataDir();
     CreateDirectoryW(dir.c_str(), nullptr); // no-op if it already exists
@@ -267,6 +270,8 @@ void Config::Save() const
     WriteStringArray(file, "devices", out.devices);
     file << ",\n";
     WriteStringArray(file, "deviceIds", out.deviceIds);
+    file << ",\n";
+    WriteStringArray(file, "deviceIdFromHello", out.deviceIdFromHello);
     file << ",\n";
     WriteStringArray(file, "usbLinkSerials", out.usbLinkSerials);
     file << ",\n";
@@ -291,8 +296,10 @@ void Config::Save() const
 size_t Config::PruneUsbOnlyDevices()
 {
     deviceIds.resize(devices.size());
+    deviceIdFromHello.resize(devices.size());
     std::vector<std::string> keptDevices;
     std::vector<std::string> keptIds;
+    std::vector<std::string> keptFromHello;
     keptDevices.reserve(devices.size());
     keptIds.reserve(devices.size());
     size_t removed = 0;
@@ -303,9 +310,11 @@ size_t Config::PruneUsbOnlyDevices()
         }
         keptDevices.push_back(devices[i]);
         keptIds.push_back(deviceIds[i]);
+        keptFromHello.push_back(deviceIdFromHello[i]);
     }
     devices = std::move(keptDevices);
     deviceIds = std::move(keptIds);
+    deviceIdFromHello = std::move(keptFromHello);
     return removed;
 }
 

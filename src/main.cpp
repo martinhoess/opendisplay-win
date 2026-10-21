@@ -14,6 +14,7 @@
 #include "app/SenderApp.h"
 #include "app/TrayApp.h"
 #include "display/MttVddSettings.h"
+#include "display/PauseOverlay.h"
 #include "display/VirtualDisplay.h"
 #include "net/Mdns.h"
 
@@ -250,6 +251,17 @@ int main(int argc, char** argv)
     } else if (argc >= 2 && std::string(argv[1]) == "--ensure-mtt-vdd") {
         bool ok = od::EnsureMttVddAttached("cli");
         printf("ensure-mtt-vdd: %s\n", ok ? "ok" : "failed");
+        rc = ok ? 0 : 1;
+    } else if (argc >= 3 && std::string(argv[1]) == "--render-pause-previews") {
+        // Test hook: the four pause overlays as PNGs over a sample desktop.
+        uint32_t w = 2360, h = 1640;
+        if (argc >= 4)
+            (void)ParseHelloSizeArgs(argc, argv, 3, w, h);
+        std::wstring dir;
+        for (const char* c = argv[2]; *c; ++c)
+            dir.push_back(static_cast<wchar_t>(static_cast<unsigned char>(*c)));
+        const bool ok = od::SavePauseOverlayPreviews(dir, w, h);
+        printf("render-pause-previews %ux%u: %s\n", w, h, ok ? "ok" : "failed");
         rc = ok ? 0 : 1;
     } else if (argc >= 2 && std::string(argv[1]) == "--browse-mdns") {
         // Checks the response parser against malformed packets, then shows what

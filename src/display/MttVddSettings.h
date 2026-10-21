@@ -153,7 +153,7 @@ bool SaveMttDisplayTopology(const std::string& logTag);
 
 // Same, but skipped within a short settle window after one of our own display
 // applies (see NoteSelfDisplayChange) so our applies are not treated as user
-// layout changes. Used by ACCESS_LOST, WM_DISPLAYCHANGE and the streaming poll.
+// layout changes. Used by ACCESS_LOST and the tray's debounced WM_DISPLAYCHANGE.
 bool SaveMttDisplayTopologyIfUserChange(const std::string& logTag);
 
 // True when mtt_display.json has a usable width x height that the current
@@ -167,9 +167,10 @@ bool QueryMttSavedMode(uint32_t& width, uint32_t& height, uint32_t& hz);
 // "mtt: restored position (x,y)" / "mtt: restoring saved mode WxH@hz".
 bool RestoreMttDisplayTopology(const std::string& logTag);
 
-// Save-only observer (never restores): persists Display Settings drags /
-// resolution picks while streaming so they survive the next reconnect / run.
-void PollMttDisplayTopology(const std::string& logTag, POINT& lastObserved);
+// Milliseconds until a display change would no longer count as one of our own
+// applies (0 = now). The tray re-arms its WM_DISPLAYCHANGE debounce for this
+// long so a user change that lands inside the settle window is still saved.
+uint32_t MttTopologySaveDeferMs();
 
 // Quit / session end: stop any later EnsureMttVddAttached from re-attaching.
 void BeginMttShutdown();

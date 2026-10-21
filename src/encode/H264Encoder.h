@@ -72,6 +72,14 @@ public:
     // (never blocks). Lets the capture loop drain a held frame instead of
     // re-encoding duplicates to push it out. Sync MFTs drain on input: empty.
     std::vector<EncodedFrame> CollectPending();
+
+    // Throws away everything the encoder holds: AUs already finished (counted
+    // in readyDiscarded, keyframes among them in keysDiscarded) and frames
+    // still inside the MFT (MFT_MESSAGE_COMMAND_FLUSH, counted in
+    // inMftDiscarded), then restarts the stream and forces the next AU to an
+    // IDR. Nothing submitted before this call can come out after it.
+    // False if the MFT refused the flush.
+    bool FlushDiscard(int& readyDiscarded, int& keysDiscarded, int& inMftDiscarded);
     void SetAllowHardware(bool allow);
 
     // Create an Intel D3D11 device + DXGI manager for QSV (not the capture /

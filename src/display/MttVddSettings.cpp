@@ -2431,8 +2431,8 @@ bool SaveMttDisplayTopology(const std::string& logTag)
 bool SaveMttDisplayTopologyIfUserChange(const std::string& logTag)
 {
     // A change that lands right after one of our own applies (attach / restore
-    // / mode fix) is ours, not the user's - the streaming poll picks up any
-    // genuine user change once the settle window has passed.
+    // / mode fix) is ours, not the user's - the tray re-arms its debounce
+    // (MttTopologySaveDeferMs) so a genuine user change is saved afterwards.
     if (RecentSelfDisplayChange(kSelfApplySettleMs))
         return false;
     return SaveMttDisplayTopology(logTag);
@@ -2516,16 +2516,10 @@ bool RestoreMttDisplayTopology(const std::string& logTag)
     return modeOk && posOk;
 }
 
-void PollMttDisplayTopology(const std::string& logTag, POINT& lastObserved)
+uint32_t MttTopologySaveDeferMs()
 {
-    // Save-only observer: never restores. SaveMttDisplayTopology no-ops when
-    // nothing changed vs mtt_display.json and refuses inactive/absent heads.
-    if (SaveMttDisplayTopologyIfUserChange(logTag)) {
-        ExistingMonitor mon{};
-        RECT r{};
-        if (FindMttVirtualMonitor(mon) && QueryMttActiveRect(mon.deviceName, r, nullptr))
-            lastObserved = {r.left, r.top};
-    }
+    const uint64_t since = MsSinceSelfDisplayChange();
+    return since < kSelfApplySettleMs ? static_cast<uint32_t>(kSelfApplySettleMs - since) + 50u : 0u;
 }
 
 void BeginMttShutdown()

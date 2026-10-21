@@ -34,6 +34,12 @@ bool RecentSelfDisplayChange(uint32_t withinMs)
     return t != 0 && GetTickCount64() - t < withinMs;
 }
 
+uint64_t MsSinceSelfDisplayChange()
+{
+    const uint64_t t = g_selfChangeTick.load();
+    return t == 0 ? UINT64_MAX : GetTickCount64() - t;
+}
+
 uint64_t SelfDisplayChangeGeneration()
 {
     return g_selfChangeGen.load();

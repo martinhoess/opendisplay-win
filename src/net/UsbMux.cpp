@@ -5,6 +5,7 @@
 #include "app/Log.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -169,6 +170,19 @@ std::string ConnectPlist(uint32_t deviceId, uint16_t devicePort)
     return buf;
 }
 
+std::string ListenPlist()
+{
+    return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+           "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
+           "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+           "<plist version=\"1.0\"><dict>"
+           "<key>ClientVersionString</key><string>opendisplay-win</string>"
+           "<key>MessageType</key><string>Listen</string>"
+           "<key>ProgName</key><string>opendisplay-win</string>"
+           "<key>kLibUSBMuxVersion</key><integer>3</integer>"
+           "</dict></plist>";
+}
+
 std::string ListDevicesPlist()
 {
     return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
@@ -246,7 +260,99 @@ void AcceptLoop()
     }
 }
 
+// Shared Listen watcher. Heap-allocated and never freed: its thread is
+// detached and may still sit in recv() while statics are torn down at exit.
+struct UsbMuxWatch {
+    std::mutex mu;
+    std::condition_variable cv;
+    uint64_t gen = 0;
+    std::atomic<bool> up{false};
+    HANDLE kick = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+
+    void Bump()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            ++gen;
+        }
+        cv.notify_all();
+    }
+};
+
+UsbMuxWatch* g_watch = nullptr;
+std::once_flag g_watchOnce;
+
+void WatchLoop(UsbMuxWatch* w)
+{
+    bool loggedDown = false;
+    for (;;) {
+        SOCKET s = ConnectLocal(kUsbmuxPort, 400);
+        std::string xml;
+        uint32_t number = 1;
+        if (s != INVALID_SOCKET) {
+            // Listen has no reply timeout: the connection stays open for events.
+            if (SendPlist(s, 1, ListenPlist()) && RecvPlist(s, xml) && ExtractKeyInteger(xml, "Number", number) &&
+                number == 0) {
+                w->up = true;
+                loggedDown = false;
+                Logf("usb", "usbmux: listening for attach/detach\n");
+                w->Bump();
+                while (RecvPlist(s, xml)) {
+                    if (xml.find("<string>Attached</string>") != std::string::npos ||
+                        xml.find("<string>Detached</string>") != std::string::npos)
+                        w->Bump();
+                }
+                w->up = false;
+                Logf("usb", "usbmux: listen connection dropped - reopening\n");
+                w->Bump();
+                closesocket(s);
+                continue; // reopen once right away; if that fails, wait below
+            }
+            closesocket(s);
+        }
+        if (!loggedDown) {
+            loggedDown = true;
+            Logf("usb", "usbmux: listen not available - waiting for usbmuxd to answer a query\n");
+        }
+        // No retry timer: the next successful usbmux query anywhere kicks us.
+        WaitForSingleObject(w->kick, INFINITE);
+    }
+}
+
+UsbMuxWatch* Watch()
+{
+    std::call_once(g_watchOnce, [] {
+        g_watch = new UsbMuxWatch();
+        std::thread(WatchLoop, g_watch).detach();
+    });
+    return g_watch;
+}
+
 } // namespace
+
+uint64_t UsbMuxEventGeneration()
+{
+    UsbMuxWatch* w = Watch();
+    std::lock_guard<std::mutex> lock(w->mu);
+    return w->gen;
+}
+
+uint64_t WaitUsbMuxEvent(uint64_t seen, std::chrono::steady_clock::time_point deadline)
+{
+    UsbMuxWatch* w = Watch();
+    std::unique_lock<std::mutex> lock(w->mu);
+    const auto changed = [&] { return w->gen != seen; };
+    if (deadline == std::chrono::steady_clock::time_point::max())
+        w->cv.wait(lock, changed); // wait_until(max) overflows on some STLs
+    else
+        w->cv.wait_until(lock, deadline, changed);
+    return w->gen;
+}
+
+void WakeUsbMuxWaiters()
+{
+    Watch()->Bump();
+}
 
 // What usbmuxd last reported, logged only when it changes (-1 = not reachable).
 static std::atomic<int> g_lastUsbMuxCount{-2};
@@ -317,6 +423,9 @@ bool ListUsbMuxDevices(std::vector<UsbMuxDevice>& out)
         out.push_back(std::move(d));
     }
     NoteUsbMuxCount(static_cast<int>(out.size()));
+    // usbmuxd answers: if the shared Listen is down, this is when to reopen it.
+    if (g_watch && !g_watch->up.load())
+        SetEvent(g_watch->kick);
     return true;
 }
 

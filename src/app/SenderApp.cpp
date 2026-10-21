@@ -3,6 +3,8 @@
 #include "app/Log.h"
 #include "app/Config.h"
 #include "app/EncodeProfile.h"
+#include "app/PauseSignals.h"
+#include "display/PauseOverlay.h"
 
 #include <atomic>
 #include <chrono>
@@ -331,16 +333,46 @@ bool PickUsbForEntry(const std::string& expectedId, const std::string& skipSeria
 
 } // namespace
 
+namespace {
+std::atomic<HWND> g_statusHwnd{nullptr};
+std::atomic<UINT> g_statusMsg{0};
+std::atomic<bool> g_statusPosted{false};
+} // namespace
+
+void SenderApp::SetStatusWindow(void* hwnd, unsigned msg)
+{
+    g_statusMsg = msg;
+    g_statusHwnd = static_cast<HWND>(hwnd);
+}
+
+void SenderApp::StatusMessageHandled()
+{
+    g_statusPosted = false;
+}
+
+void SenderApp::NotifyStatus()
+{
+    const HWND hwnd = g_statusHwnd.load();
+    if (!hwnd || g_statusPosted.exchange(true))
+        return;
+    if (!PostMessageW(hwnd, g_statusMsg.load(), 0, 0))
+        g_statusPosted = false;
+}
+
 SenderApp::~SenderApp()
 {
     Stop();
 }
 
-void SenderApp::Start(std::string ip, uint16_t port, std::string entryId)
+void SenderApp::Start(std::string ip, uint16_t port, std::string entryId, bool idFollowsHello)
 {
     if (running_.exchange(true))
         return; // already running
-    entryId_ = std::move(entryId);
+    {
+        std::lock_guard<std::mutex> lock(idMutex_);
+        entryId_ = std::move(entryId);
+    }
+    idFollowsHello_ = idFollowsHello;
 
     stopRequested_ = false;
     worker_ = std::thread([this, ip = std::move(ip), port] { RunLoop(ip, port); });
@@ -363,8 +395,8 @@ void SenderApp::Stop()
 
     running_ = false;
     stopRequested_ = false;
-    state_ = State::Idle;
-    transport_ = Transport::None;
+    SetState(State::Idle);
+    SetTransport(Transport::None);
 }
 
 void SenderApp::RunBlocking(std::string ip, uint16_t port)
@@ -395,7 +427,7 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
     if (ipLock != nullptr && GetLastError() == ERROR_ALREADY_EXISTS) {
         Logf(ip, "another opendisplay-win is already connected to this iPad\n");
         CloseHandle(ipLock);
-        state_ = State::Idle;
+        SetState(State::Idle);
         return;
     }
 
@@ -422,8 +454,11 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
     EncodeMode sessionEncodeMode = EncodeMode::Dynamic;
     EncodePreset sessionEncodePreset = EncodePreset::Speed;
 
+    // Bumped on every (re)build - duplication rebuilt, mode may have changed.
+    std::atomic<uint32_t> pipelineGen{0};
     auto buildPipeline = [&](uint32_t width, uint32_t height, BuildReason reason = BuildReason::Hello) {
         // Caller holds pipelineMutex.
+        ++pipelineGen;
         dup.Close();
         if (!backend || !backend->Prepare(width, height, reason))
             return false;
@@ -533,15 +568,16 @@ void SenderApp::RunLoop(std::string ip, uint16_t port)
     bool blockedLogged = false; // the wait message belongs in the log once, not every retry
     int noHelloFailures = 0;    // consecutive links that closed before a hello (backoff)
     // USB matching (see PickUsbForEntry): the id this entry's iPad presents.
-    std::string knownId = entryId_;
+    std::string knownId = EntryId();
     bool forceWifiOnce = false;           // last USB pick was the wrong iPad
     std::string rejectedSerial;           // ... and is skipped for a minute
     std::chrono::steady_clock::time_point rejectedSerialUntil{};
 
     bool stickToUsbAfterSession = false;
     // An entry without an id (typed-in IP) is Wi-Fi only: whatever iPad is on
-    // the cable is not necessarily the one at that address.
-    const bool usbAllowed = !entryId_.empty();
+    // the cable is not necessarily the one at that address. Its first Wi-Fi
+    // hello gives it one (below), and USB matches on that id from then on.
+    bool usbAllowed = !knownId.empty();
     // USB dial/hello failures on this iPad's cable: the connect path and
     // Back-to-USB skip USB until the backoff runs out, so a cable whose app is
     // not listening does not bounce the Wi-Fi session every few seconds.
@@ -561,7 +597,7 @@ while (!stopRequested_) {
         // alternate between "waiting for 2732x2048" and "connecting..." while
         // nothing about its situation changed.
         if (state_ != State::Blocked)
-            state_ = State::Connecting;
+            SetState(State::Connecting);
 
         // USB preferred while usbmux + a USB device are available.
         // usbWifiFailover (default ON) keeps today's behavior: if USB dial
@@ -580,12 +616,12 @@ while (!stopRequested_) {
                 if (state_ != State::DriverMissing)
                     Logf(ip, "display: %s - not connecting until it is installed or Settings change\n",
                          sel.problem.c_str());
-                state_ = State::DriverMissing;
+                SetState(State::DriverMissing);
                 InterruptibleSleep(kBlockedRetryMs);
                 continue;
             }
             if (state_ == State::DriverMissing)
-                state_ = State::Connecting;
+                SetState(State::Connecting);
             SetStatusDetail({});
             if (!backend || backend->Kind() != sel.kind) {
                 std::lock_guard<std::mutex> lock(pipelineMutex);
@@ -648,7 +684,7 @@ while (!stopRequested_) {
             continue;
         }
         ActiveConn activeConn(this, &*conn);
-        transport_ = usbSession ? Transport::Usb : Transport::Wifi;
+        SetTransport(usbSession ? Transport::Usb : Transport::Wifi);
         if (usbSession) {
             // Remember a successful USB session so a later cable-drop does not
             // silently move to Wi-Fi when the user turned failover off.
@@ -710,8 +746,24 @@ while (!stopRequested_) {
             forceWifiOnce = true;
             continue;
         }
-        if (entryId_.empty() && !hello.id.empty())
+        if (idFollowsHello_ && !usbSession && !hello.id.empty() && hello.id != knownId) {
+            // Typed-in address: the iPad answering there over Wi-Fi is this
+            // entry's iPad. The tray saves the id on the status message.
+            if (knownId.empty())
+                Logf(ip, "learned id %s for this entry from its Wi-Fi hello\n", hello.id.c_str());
+            else
+                Logf(ip, "id changed for this entry: %s (was %s) - another iPad has this address\n",
+                     hello.id.c_str(), knownId.c_str());
+            knownId = hello.id;
+            usbAllowed = true;
+            {
+                std::lock_guard<std::mutex> lock(idMutex_);
+                entryId_ = hello.id;
+            }
+            NotifyStatus();
+        } else if (EntryId().empty() && !hello.id.empty()) {
             knownId = hello.id; // no TXT id configured: follow the iPad we actually reached
+        }
 
         // Version handshake (receiver protocol 3+): the iPad only sends
         // `pencil`/`proximity` to a peer that announced protocol >= 3 —
@@ -744,7 +796,8 @@ while (!stopRequested_) {
             blockedByHeight_ = activeHeight;
             blockedByApp_ = holder;
             blockedExclusive_ = exclusiveHead;
-            state_ = State::Blocked;
+            NotifyStatus(); // the holder may change while we stay Blocked
+            SetState(State::Blocked);
             // Once per episode, not on every check: this comes back every few
             // seconds for as long as the other iPad streams.
             if (!blockedLogged) {
@@ -806,7 +859,7 @@ while (!stopRequested_) {
 
         width_ = width;
         height_ = height;
-        state_ = State::Streaming;
+        SetState(State::Streaming);
         backend->OnStreaming();
 
         std::atomic<bool> running{true};
@@ -1035,18 +1088,23 @@ std::thread reader([&] {
         // busy link). UDP when open; mirrored on TCP until cursorAck, or for
         // good on USB / when UDP never confirms. SendFrame is thread-safe.
         std::atomic<bool> cursorStop{false};
+        std::atomic<bool> cursorPaused{false}; // pause mode: no cursor updates
         std::thread cursorThread([&] {
             HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
                                                   TIMER_ALL_ACCESS);
+            // Refresh re-read only when the pipeline is rebuilt or the tray saw
+            // WM_DISPLAYCHANGE (same counters as the frame limiter).
             uint32_t hz = backend->RefreshHz();
-            auto lastHzCheck = std::chrono::steady_clock::now();
+            uint32_t seenPipelineGen = pipelineGen.load();
+            uint32_t seenDisplayGen = PauseSignals::displayChangeGen.load();
             bool haveLast = false;
             bool lastVisible = false;
             LONG lastX = 0, lastY = 0;
             while (!cursorStop && running && !stopRequested_) {
-                const auto now = std::chrono::steady_clock::now();
-                if (now - lastHzCheck > std::chrono::seconds(1)) {
-                    lastHzCheck = now;
+                if (pipelineGen.load() != seenPipelineGen ||
+                    PauseSignals::displayChangeGen.load() != seenDisplayGen) {
+                    seenPipelineGen = pipelineGen.load();
+                    seenDisplayGen = PauseSignals::displayChangeGen.load();
                     hz = backend->RefreshHz();
                 }
                 const uint32_t tickHz = (std::max)(30u, (std::min)(hz, 240u));
@@ -1063,7 +1121,7 @@ std::thread reader([&] {
                 const LONG x = inside ? ci.ptScreenPos.x - r.left : lastX;
                 const LONG y = inside ? ci.ptScreenPos.y - r.top : lastY;
                 const bool force = cursorForce.exchange(false);
-                if (gotInfo && (force || !haveLast || visible != lastVisible || (visible && (x != lastX || y != lastY)))) {
+                if (!cursorPaused && gotInfo && (force || !haveLast || visible != lastVisible || (visible && (x != lastX || y != lastY)))) {
                     haveLast = true;
                     lastVisible = visible;
                     lastX = x;
@@ -1112,33 +1170,40 @@ std::thread reader([&] {
                 CloseHandle(timer);
         });
 
-        // Back to USB: on a Wi-Fi session, look for this iPad's cable every
-        // few seconds (strict match on the learned serial->id only). When it
-        // shows up, end this session; the reconnect prefers USB and MTT keeps
-        // its head through the link-loss grace, so the picture comes back on
-        // the same display.
+        // Back to USB: on a Wi-Fi session, re-check for this iPad's cable when
+        // usbmuxd reports an attach/detach (strict match on the learned
+        // serial->id only), once at start, and when a USB dial backoff ends.
+        // When it shows up, end this session; the reconnect prefers USB and
+        // MTT keeps its head through the link-loss grace, so the picture comes
+        // back on the same display.
         std::atomic<bool> movedToUsb{false};
         std::thread usbWatch;
         if (!usbSession && !configuredLoopback && usbAllowed && !knownId.empty()) {
             usbWatch = std::thread([&] {
-                int ticks = 0;
+                uint64_t seen = UsbMuxEventGeneration();
+                // Set before this session started; read-only while it runs.
+                const bool backoff = usbFailCount > 0 && std::chrono::steady_clock::now() < usbFailUntil;
+                bool check = !backoff;
                 while (!cursorStop && running && !stopRequested_) {
-                    Sleep(100);
-                    if (++ticks % 30 != 0 || state_ != State::Streaming)
-                        continue;
-                    UsbMuxDevice d;
-                    bool verify = false;
-                    // Set before this session started; read-only while it runs.
-                    if (usbFailCount > 0 && std::chrono::steady_clock::now() < usbFailUntil)
-                        continue;
-                    if (PickUsbForEntry(knownId, {}, true, d, verify)) {
-                        Logf(ip, "USB cable for this iPad is back (%s) - moving the session from Wi-Fi to USB\n",
-                             d.serial.c_str());
-                        movedToUsb = true;
-                        running = false;
-                        conn->Close(); // unblock the reader
-                        break;
+                    if (check && state_ == State::Streaming &&
+                        !(usbFailCount > 0 && std::chrono::steady_clock::now() < usbFailUntil)) {
+                        UsbMuxDevice d;
+                        bool verify = false;
+                        if (PickUsbForEntry(knownId, {}, true, d, verify)) {
+                            Logf(ip, "USB cable for this iPad is back (%s) - moving the session from Wi-Fi to USB\n",
+                                 d.serial.c_str());
+                            movedToUsb = true;
+                            running = false;
+                            conn->Close(); // unblock the reader
+                            break;
+                        }
                     }
+                    const auto deadline = (usbFailCount > 0 && std::chrono::steady_clock::now() < usbFailUntil)
+                                              ? usbFailUntil
+                                              : std::chrono::steady_clock::time_point::max();
+                    const uint64_t now = WaitUsbMuxEvent(seen, deadline);
+                    check = now != seen || std::chrono::steady_clock::now() >= deadline;
+                    seen = now;
                 }
             });
         }
@@ -1146,7 +1211,6 @@ std::thread reader([&] {
         std::chrono::steady_clock::time_point wrongSizeSince{};
         bool sizeRebuildDone = false;
         bool sizeGiveUpLogged = false;
-        std::chrono::steady_clock::time_point lastBackendPoll{};
         std::chrono::steady_clock::time_point waitFirstFrameSince{};
         bool firstFrameNudged = false;
         bool firstFrameWaitLogged = false;
@@ -1166,8 +1230,12 @@ std::thread reader([&] {
         uint32_t fpsLimit = 60;
         uint32_t fpsLimitGen = 0;
         uint32_t fpsLimitW = 0, fpsLimitH = 0;
+        // Head refresh, read at stream start and again only when something says
+        // it may have changed: a pipeline rebuild (ACCESS_LOST, mode change,
+        // pause resume, rotation) or a WM_DISPLAYCHANGE from the tray.
         uint32_t fpsLimitHz = backend->RefreshHz();
-        Clock::time_point fpsHzCheck = Clock::now();
+        uint32_t hzSeenPipelineGen = pipelineGen.load();
+        uint32_t hzSeenDisplayGen = PauseSignals::displayChangeGen.load();
         Clock::duration slot = std::chrono::microseconds(1'000'000 / 60);
         Clock::duration earlyWindow = slot / 4;
         Clock::time_point nextSlot{};
@@ -1181,14 +1249,135 @@ std::thread reader([&] {
         uint32_t cadenceSends = 0;
         uint32_t cadenceTimeouts = 0;
 
+        // Pause mode: a locked PC, a dark console display or the secure desktop
+        // (UAC) stop capture, encode and cursor updates, but the connection,
+        // the MTT head and the session stay. The iPad gets one overlay frame
+        // (last picture dimmed + reason card), re-sent as the keepalive. Resume
+        // rebuilds duplication on the same output and starts on an IDR.
+        bool paused = false;
+        bool pauseFromSecureDesktop = false; // entered on ACCESS_LOST with the secure desktop up
+        PauseReason pauseReason = PauseReason::None;
+        std::vector<uint8_t> pauseBase;      // BGRA under the overlay
+        uint32_t pauseBaseW = 0, pauseBaseH = 0;
+        std::vector<uint8_t> pauseNv12;      // overlay at encoder size
+        // Locked / secure desktop: no desktop pixels in the overlay, no copy
+        // kept, and nothing encoded before the overlay IDR goes out. Sticky
+        // until resume, so Locked -> Paused never brings the picture back.
+        bool pauseHideDesktop = false;
+        bool pauseDropUntilKey = false;
+        int pauseDroppedAus = 0; // dropped in the pause loop before the blank IDR
+        // Encoder holds pre-lock frames: discard all of them (and nothing is
+        // queued on our side of the socket: SendFrame is synchronous).
+        auto flushForBlank = [&]() {
+            int ready = 0, keys = 0, inMft = 0;
+            const bool ok = encoder.FlushDiscard(ready, keys, inMft);
+            pauseDroppedAus = 0;
+            Logf(ip,
+                 "pause: encoder flushed%s - discarded %d finished AU(s) (%d keyframe) + %d in the MFT; send queue "
+                 "empty (synchronous sends)\n",
+                 ok ? "" : " (FLUSH refused, dropping until the blank IDR)", ready, keys, inMft);
+        };
+        auto wipe = [](std::vector<uint8_t>& v) {
+            std::fill(v.begin(), v.end(), uint8_t{0});
+            std::vector<uint8_t>().swap(v);
+        };
+        int pauseEncodesDue = 0;             // overlay encodes owed right now
+        Clock::time_point lastResumeTry{};
+        bool resumeFailLogged = false;
+
+        // Priority Locked > Admin > Asleep > Paused. Locked if ANY of: a WTS
+        // lock event with no unlock since, the session flags say locked, or
+        // the input desktop is not Default (Winlogon / not openable) with no
+        // UAC prompt running. Admin: not Default, consent.exe up, not locked.
+        auto pauseReasonNow = [&](InputDesktop desk) {
+            const SessionLock wts = QuerySessionLock();
+            const bool onDefault = desk == InputDesktop::Default;
+            // An unlock we never heard about: WTS says unlocked and the normal
+            // desktop is back, so the lock event is stale.
+            if (PauseSignals::locked.load() && wts == SessionLock::Unlocked && onDefault)
+                PauseSignals::locked = false;
+            const bool consent = !onDefault && IsConsentRunning();
+            const bool locked = PauseSignals::locked.load() || wts == SessionLock::Locked || (!onDefault && !consent);
+            if (locked)
+                return PauseReason::Locked;
+            if (consent)
+                return PauseReason::Admin;
+            if (PauseSignals::displayOff.load())
+                return PauseReason::Asleep;
+            return PauseReason::None;
+        };
+        // Overlay frame for `reason` from pauseBase, padded to the encoder size.
+        auto renderPauseFrame = [&](PauseReason reason) {
+            if (PauseHidesDesktop(reason) && !pauseHideDesktop) {
+                pauseHideDesktop = true;
+                pauseDropUntilKey = true;
+                flushForBlank();
+            }
+            if (pauseHideDesktop) {
+                wipe(pauseBase);
+                pauseBaseW = pauseBaseH = 0;
+                dup.DropLastFrame();
+            }
+            std::vector<uint8_t> img;
+            uint32_t w = pauseBaseW, h = pauseBaseH;
+            if (pauseHideDesktop || pauseBase.empty() || w > encoder.Width() || h > encoder.Height()) {
+                w = encoder.Width();
+                h = encoder.Height();
+                img.assign(static_cast<size_t>(w) * h * 4, 0);
+                FillPauseBackground(img.data(), w, h); // never the desktop
+            } else {
+                img = pauseBase;
+            }
+            if (!RenderPauseOverlay(img.data(), w, h, reason))
+                Logf(ip, "pause overlay draw failed - sending the dimmed-less picture\n");
+            std::vector<uint8_t> nv12Small;
+            ConvertBgraToNv12Cpu(img.data(), w * 4, w, h, nv12Small);
+            if (!PadNv12TopLeft(nv12Small, w, h, encoder.Width(), encoder.Height(), pauseNv12))
+                pauseNv12.clear();
+            pauseReason = reason;
+            pauseEncodesDue = 2; // the async MFT hands out an AU on the next input
+            encoder.RequestKeyFrame();
+        };
+        auto enterPause = [&](PauseReason reason, bool fromSecure) {
+            paused = true;
+            pauseFromSecureDesktop = fromSecure;
+            cursorPaused = true;
+            framePending = false;
+            tailPending = false;
+            // Lock detection can trail the lock: a lock event, the secure
+            // desktop or a locked session hides the picture whatever `reason`
+            // says, from the very first overlay frame.
+            pauseHideDesktop = PauseHidesDesktop(reason) || fromSecure || PauseSignals::locked.load() ||
+                               CurrentInputDesktop() != InputDesktop::Default ||
+                               QuerySessionLock() == SessionLock::Locked;
+            pauseDropUntilKey = pauseHideDesktop;
+            if (pauseHideDesktop) {
+                wipe(pauseBase);
+                pauseBaseW = pauseBaseH = 0;
+                dup.DropLastFrame();
+                wipe(nv12); // last captured desktop (CPU path)
+                flushForBlank();
+            } else if (!dup.LastFrameBgra(pauseBase, pauseBaseW, pauseBaseH)) {
+                pauseBase.clear();
+            }
+            renderPauseFrame(reason);
+            resumeFailLogged = false;
+            NotifyStatus();
+            Logf(ip, "paused (%s): capture/encode stopped, connection kept, overlay %s%s\n", PauseReasonName(reason),
+                 pauseNv12.empty() ? "unavailable" : "sent",
+                 pauseHideDesktop ? " on blank background (desktop hidden, snapshot dropped)" : "");
+        };
+
         while (running && !stopRequested_) {
             std::vector<EncodedFrame> encoded;
             int64_t capMs = 0;
             // Recompute the limit on a new hello, a new encoded raster or a
-            // new refresh rate on the head (polled once a second).
+            // new refresh rate on the head (re-read on rebuild / display change).
             bool hzChanged = false;
-            if (Clock::now() - fpsHzCheck > std::chrono::seconds(1)) {
-                fpsHzCheck = Clock::now();
+            if (pipelineGen.load() != hzSeenPipelineGen ||
+                PauseSignals::displayChangeGen.load() != hzSeenDisplayGen) {
+                hzSeenPipelineGen = pipelineGen.load();
+                hzSeenDisplayGen = PauseSignals::displayChangeGen.load();
                 const uint32_t hzNow = backend->RefreshHz();
                 hzChanged = hzNow != fpsLimitHz;
                 fpsLimitHz = hzNow;
@@ -1234,7 +1423,99 @@ std::thread reader([&] {
                 captureTimeoutMs = static_cast<int>((std::max)(0LL, (std::min)(static_cast<long long>(leftMs),
                                                                                static_cast<long long>(kIdleCaptureTimeoutMs))));
             }
-            {
+            if (!paused && (PauseSignals::locked.load() || PauseSignals::displayOff.load())) {
+                const PauseReason r = pauseReasonNow(CurrentInputDesktop());
+                if (r != PauseReason::None) {
+                    std::lock_guard<std::mutex> lock(pipelineMutex);
+                    enterPause(r, false);
+                }
+            }
+            if (paused) {
+                // No capture while paused: this replaces AcquireNextFrame's
+                // timeout as the loop's only wait, on the tray's wake event.
+                capMs = UnixEpochMs();
+                const InputDesktop desk = CurrentInputDesktop();
+                const PauseReason want = pauseReasonNow(desk);
+                const auto nowP = Clock::now();
+                if (want == PauseReason::None) {
+                    // One attempt per keepalive period, never a tight retry loop.
+                    if (lastResumeTry == Clock::time_point{} ||
+                        nowP - lastResumeTry >= std::chrono::milliseconds(kKeepaliveMs)) {
+                        lastResumeTry = nowP;
+                        std::lock_guard<std::mutex> lock(pipelineMutex);
+                        if (buildPipeline(width, height, BuildReason::CaptureRebuild)) {
+                            paused = false;
+                            pauseHideDesktop = false;
+                            pauseDropUntilKey = false;
+                            pauseFromSecureDesktop = false;
+                            cursorPaused = false;
+                            cursorForce = true;
+                            haveGpuDesktopFrame = false;
+                            waitFirstFrameSince = {};
+                            firstFrameNudged = false;
+                            firstFrameWaitLogged = false;
+                            framePending = true; // encode the first capture at once
+                            nextSlot = Clock::now();
+                            encoder.RequestKeyFrame();
+                            NotifyStatus();
+                            Logf(ip, "resumed after %s: duplication rebuilt, keyframe requested\n",
+                                 PauseReasonName(pauseReason));
+                            lastResumeTry = {};
+                            continue;
+                        }
+                        if (!resumeFailLogged) {
+                            resumeFailLogged = true;
+                            Logf(ip, "resume: duplication rebuild failed, still paused - retrying each second\n");
+                        }
+                    }
+                } else if (want != pauseReason) {
+                    std::lock_guard<std::mutex> lock(pipelineMutex);
+                    renderPauseFrame(want);
+                    Logf(ip, "pause reason now %s\n", PauseReasonName(want));
+                }
+                if (nowP - lastSend >= std::chrono::milliseconds(kKeepaliveMs) && pauseEncodesDue == 0)
+                {
+                    pauseEncodesDue = 1; // keepalive: the overlay again
+                    if (pauseDropUntilKey)
+                        encoder.RequestKeyFrame(); // the blank IDR has not made it out yet
+                }
+                {
+                    std::lock_guard<std::mutex> lock(pipelineMutex);
+                    if (pauseEncodesDue > 0 && !pauseNv12.empty()) {
+                        --pauseEncodesDue;
+                        encoded = encoder.EncodeNv12(pauseNv12.data(), pauseNv12.size());
+                        ++cadenceEncCalls;
+                    } else {
+                        pauseEncodesDue = 0;
+                        encoded = encoder.CollectPending();
+                    }
+                    cadenceAus += static_cast<uint32_t>(encoded.size());
+                }
+                if (pauseDropUntilKey) {
+                    // AUs still in the async MFT from desktop input come out
+                    // first: drop all up to the overlay's IDR.
+                    auto key = std::find_if(encoded.begin(), encoded.end(),
+                                            [](const EncodedFrame& f) { return f.isKeyFrame; });
+                    pauseDroppedAus += static_cast<int>(key - encoded.begin());
+                    if (key != encoded.end()) {
+                        pauseDropUntilKey = false;
+                        Logf(ip, "pause: first frame out is the blank keyframe (%d earlier AU(s) dropped)\n",
+                             pauseDroppedAus);
+                    }
+                    encoded.erase(encoded.begin(), key);
+                }
+                if (encoded.empty() && pauseEncodesDue == 0) {
+                    const auto untilKeepalive =
+                        std::chrono::ceil<std::chrono::milliseconds>(lastSend + std::chrono::milliseconds(kKeepaliveMs) -
+                                                                     Clock::now())
+                            .count();
+                    // Lock/unlock, display on/off and desktop switches (UAC
+                    // secure desktop) all set the wake event; otherwise only
+                    // the keepalive is due.
+                    const DWORD waitMs = static_cast<DWORD>((std::max)(1LL, static_cast<long long>(untilKeepalive)));
+                    WaitForSingleObject(PauseSignals::WakeEvent(), waitMs);
+                }
+            } else {
                 // Only capture+encode need the pipeline lock (they touch dup
                 // and encoder, which the reader thread may rebuild on
                 // rotation). The network send is deliberately outside the
@@ -1298,6 +1579,19 @@ std::thread reader([&] {
                 // QSV DXGI path shares the capture D3D device with the MFT, so a
                 // new capture device requires a full encoder rebuild.
                 if (cap.accessLost) {
+                    // Lock screen / UAC (secure desktop) or a dark display: pause
+                    // instead of rebuilding into a desktop we cannot capture.
+                    {
+                        const InputDesktop desk = CurrentInputDesktop();
+                        if (desk != InputDesktop::Default || PauseSignals::locked.load() ||
+                            PauseSignals::displayOff.load()) {
+                            enterPause(pauseReasonNow(desk) == PauseReason::None ? PauseReason::Paused
+                                                                                   : pauseReasonNow(desk),
+                                       desk != InputDesktop::Default);
+                            haveGpuDesktopFrame = false;
+                            continue;
+                        }
+                    }
                     haveGpuDesktopFrame = false;
                     waitFirstFrameSince = {};
                     firstFrameNudged = false;
@@ -1425,14 +1719,6 @@ std::thread reader([&] {
                 }
 
                 auto now = std::chrono::steady_clock::now();
-
-                // Backend housekeeping while streaming (MTT: persist the user's
-                // arrangement; DISPLAY index may change later).
-                if (lastBackendPoll == std::chrono::steady_clock::time_point{} ||
-                    now - lastBackendPoll > std::chrono::seconds(2)) {
-                    lastBackendPoll = now;
-                    backend->Poll();
-                }
 
                 // Only adopt rotation into session size from a real frame - not
                 // Open() ModeDesc, which can disagree with DXGI buffer orientation.
@@ -1693,8 +1979,10 @@ std::thread reader([&] {
 
         cursorStop = true;
         cursorThread.join();
-        if (usbWatch.joinable())
+        if (usbWatch.joinable()) {
+            WakeUsbMuxWaiters(); // it blocks on attach/detach events
             usbWatch.join();
+        }
         conn->Close();
         reader.join();
         // After the reader is gone, so nothing else touches the injector.
@@ -1712,14 +2000,14 @@ std::thread reader([&] {
         backend->OnSessionEnd(lastClient, stopRequested_.load());
         width_ = 0;
         height_ = 0;
-        transport_ = Transport::None;
+        SetTransport(Transport::None);
         Logf(ip, "disconnected%s\n",
              stopRequested_ ? "" : (movedToUsb ? ", reconnecting over USB" : ", reconnecting"));
     }
 
     if (ipLock != nullptr)
         CloseHandle(ipLock);
-    state_ = State::Idle;
+    SetState(State::Idle);
 }
 
 } // namespace od
